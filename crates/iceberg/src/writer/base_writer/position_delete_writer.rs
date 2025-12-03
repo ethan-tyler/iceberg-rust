@@ -456,7 +456,7 @@ mod test {
 
         // Verify parquet file contents
         let input_file = file_io
-            .new_input(data_file.file_path().to_string())
+            .new_input(data_file.file_path())
             .unwrap();
         let input_content = input_file.read().await.unwrap();
         let reader_builder =
@@ -1089,7 +1089,7 @@ mod test {
         assert_eq!(data_file.referenced_data_file(), None);
 
         // Verify we can read back the Unicode paths
-        let input_file = file_io.new_input(data_file.file_path().to_string())?;
+        let input_file = file_io.new_input(data_file.file_path())?;
         let input_content = input_file.read().await?;
         let reader_builder = ParquetRecordBatchReaderBuilder::try_new(input_content)?;
         let reader = reader_builder.build()?;
@@ -1168,7 +1168,7 @@ mod test {
         let data_file = &res[0];
 
         // Verify we can read back the max position
-        let input_file = file_io.new_input(data_file.file_path().to_string())?;
+        let input_file = file_io.new_input(data_file.file_path())?;
         let input_content = input_file.read().await?;
         let reader_builder = ParquetRecordBatchReaderBuilder::try_new(input_content)?;
         let reader = reader_builder.build()?;
@@ -1246,7 +1246,7 @@ mod test {
         let data_file = &res[0];
 
         // Verify Iceberg field IDs are written to Parquet schema
-        let input_file = file_io.new_input(data_file.file_path().to_string())?;
+        let input_file = file_io.new_input(data_file.file_path())?;
         let input_content = input_file.read().await?;
         let metadata = ArrowReaderMetadata::load(&input_content, Default::default())?;
 
