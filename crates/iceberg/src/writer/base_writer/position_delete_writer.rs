@@ -455,9 +455,7 @@ mod test {
         assert_eq!(data_file.record_count(), 3);
 
         // Verify parquet file contents
-        let input_file = file_io
-            .new_input(data_file.file_path())
-            .unwrap();
+        let input_file = file_io.new_input(data_file.file_path()).unwrap();
         let input_content = input_file.read().await.unwrap();
         let reader_builder =
             ParquetRecordBatchReaderBuilder::try_new(input_content.clone()).unwrap();
