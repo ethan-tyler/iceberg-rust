@@ -113,10 +113,10 @@ where
 {
     type R = PositionDeleteFileWriter<B, L, F>;
 
-    async fn build(self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
+    async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         Ok(PositionDeleteFileWriter {
             inner: Some(self.inner.clone().build()),
-            config: self.config,
+            config: self.config.clone(),
             partition_key,
             referenced_data_files: HashSet::new(),
         })

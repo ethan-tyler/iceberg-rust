@@ -25,6 +25,7 @@ use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use datafusion::prelude::{col, lit};
 use expect_test::expect;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
@@ -34,7 +35,7 @@ use iceberg::test_utils::check_record_batches;
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation, TableIdent,
 };
-use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_datafusion::{IcebergCatalogProvider, IcebergTableProvider};
 use tempfile::TempDir;
 
 fn temp_path() -> String {
@@ -943,6 +944,343 @@ async fn test_insert_into_partitioned() -> Result<()> {
         "Expected partition directory: {}",
         clothing_path
     );
+
+    Ok(())
+}
+
+// ============================================================================
+// DELETE OPERATION TESTS
+// ============================================================================
+// These tests validate DELETE SQL operations for Sprint 1.
+// They are marked #[ignore] until the delete-action feature is enabled
+// after rebasing feat/delete-action onto this branch.
+//
+// To run these tests after enabling the feature:
+//   cargo test -p iceberg-datafusion --features delete-action test_delete
+// ============================================================================
+
+/// Helper to create a table with test data for DELETE tests.
+/// Returns (catalog, namespace, ctx) so tests can use programmatic delete API.
+async fn setup_delete_test_table(
+    namespace_name: &str,
+) -> Result<(Arc<MemoryCatalog>, NamespaceIdent, SessionContext)> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new(namespace_name.to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "delete_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data: 5 rows
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{}.delete_table VALUES \
+         (1, 'alice'), (2, 'bob'), (3, 'charlie'), (4, 'diana'), (5, 'eve')",
+        namespace_name
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    Ok((client, namespace, ctx))
+}
+
+/// Test DELETE with a WHERE predicate.
+/// Verifies that only matching rows are deleted.
+#[tokio::test]
+async fn test_delete_with_predicate() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_predicate").await?;
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "delete_table",
+    )
+    .await?;
+
+    // Delete rows where foo1 > 3 (should delete diana and eve)
+    let deleted_count = provider
+        .delete(&ctx.state(), Some(col("foo1").gt(lit(3))))
+        .await
+        .unwrap();
+
+    assert_eq!(deleted_count, 2, "Expected 2 rows deleted");
+
+    // Verify remaining rows
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_delete_predicate.delete_table ORDER BY foo1")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    // Should have 3 rows remaining: alice, bob, charlie
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Expected 3 rows remaining after delete");
+
+    Ok(())
+}
+
+/// Test DELETE without a predicate (full table delete).
+/// Verifies that all rows are deleted.
+#[tokio::test]
+async fn test_delete_full_table() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_full").await?;
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "delete_table",
+    )
+    .await?;
+
+    // Delete all rows (no predicate)
+    let deleted_count = provider
+        .delete(&ctx.state(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted_count, 5, "Expected 5 rows deleted");
+
+    // Verify table is empty
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_delete_full.delete_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 0, "Expected 0 rows after full table delete");
+
+    Ok(())
+}
+
+/// Test DELETE with a predicate that matches no rows.
+/// Verifies zero count is returned and table is unchanged.
+#[tokio::test]
+async fn test_delete_no_match() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_nomatch").await?;
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "delete_table",
+    )
+    .await?;
+
+    // Delete rows that don't exist
+    let deleted_count = provider
+        .delete(&ctx.state(), Some(col("foo1").gt(lit(100))))
+        .await
+        .unwrap();
+
+    assert_eq!(deleted_count, 0, "Expected 0 rows deleted");
+
+    // Verify all rows still exist
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_delete_nomatch.delete_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 5, "Expected 5 rows unchanged");
+
+    Ok(())
+}
+
+/// Test that SELECT after DELETE properly excludes deleted rows.
+/// This validates read-side delete file application.
+#[tokio::test]
+async fn test_select_after_delete() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_delete_test_table("test_select_after_delete").await?;
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "delete_table",
+    )
+    .await?;
+
+    // Delete specific row (bob)
+    let deleted_count = provider
+        .delete(&ctx.state(), Some(col("foo2").eq(lit("bob"))))
+        .await
+        .unwrap();
+    assert_eq!(deleted_count, 1, "Expected 1 row deleted");
+
+    // SELECT should not return bob
+    let df = ctx
+        .sql("SELECT foo2 FROM catalog.test_select_after_delete.delete_table ORDER BY foo1")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    assert_eq!(names, vec!["alice", "charlie", "diana", "eve"]);
+    assert!(
+        !names.contains(&"bob".to_string()),
+        "bob should be deleted"
+    );
+
+    Ok(())
+}
+
+/// Test DELETE on a partitioned table.
+/// Currently, DELETE on partitioned tables returns NotImplemented error.
+/// This test verifies that the error is properly returned with a clear message.
+/// TODO: When partitioned table DELETE is implemented, update this test to verify actual behavior.
+#[tokio::test]
+async fn test_delete_partitioned_table() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_partitioned".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema with partition column
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("partitioned_delete_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across multiple partitions
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_partitioned.partitioned_delete_table VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel'), \
+         (4, 'books', 'textbook')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "partitioned_delete_table",
+    )
+    .await?;
+
+    // Attempt to delete from a partitioned table should return NotImplemented
+    let result = provider
+        .delete(&ctx.state(), Some(col("category").eq(lit("electronics"))))
+        .await;
+
+    assert!(result.is_err(), "Expected NotImplemented error for partitioned table DELETE");
+    let err = result.unwrap_err();
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("partitioned tables is not yet supported"),
+        "Expected error message about partitioned tables, got: {}",
+        err_msg
+    );
+
+    // Verify data is still intact (delete did not occur)
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_delete_partitioned.partitioned_delete_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 4, "All 4 rows should still exist since delete failed");
+
+    Ok(())
+}
+
+/// Test DELETE on an empty table.
+/// Verifies graceful handling with zero count.
+#[tokio::test]
+async fn test_delete_empty_table() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_empty".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "empty_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "empty_table",
+    )
+    .await?;
+
+    // DELETE from empty table
+    let deleted_count = provider
+        .delete(&ctx.state(), Some(col("foo1").gt(lit(0))))
+        .await
+        .unwrap();
+
+    // Verify zero count (graceful handling)
+    assert_eq!(deleted_count, 0, "Expected 0 rows deleted from empty table");
 
     Ok(())
 }

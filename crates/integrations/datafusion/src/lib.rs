@@ -18,6 +18,8 @@
 mod catalog;
 pub use catalog::*;
 
+pub mod delete;
+
 mod error;
 pub use error::*;
 
