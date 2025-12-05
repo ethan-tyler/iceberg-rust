@@ -19,6 +19,7 @@ mod catalog;
 pub use catalog::*;
 
 pub mod delete;
+pub mod update;
 
 mod error;
 pub use error::*;

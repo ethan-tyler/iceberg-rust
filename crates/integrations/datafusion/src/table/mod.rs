@@ -57,6 +57,7 @@ use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
 use crate::physical_plan::write::IcebergWriteExec;
+use crate::update::UpdateBuilder;
 
 /// Catalog-backed table provider with automatic metadata refresh.
 ///
@@ -189,6 +190,32 @@ impl IcebergTableProvider {
             })?;
 
         Ok(count_array.value(0))
+    }
+
+    /// Creates an UpdateBuilder for updating rows in the table.
+    ///
+    /// This method loads fresh table metadata and returns a builder that can be
+    /// configured with SET assignments and an optional WHERE predicate.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use datafusion::prelude::*;
+    ///
+    /// let updated_count = provider
+    ///     .update()
+    ///     .await?
+    ///     .set("status", lit("shipped"))
+    ///     .set("updated_at", current_timestamp())
+    ///     .filter(col("id").eq(lit(42)))
+    ///     .execute(&session_state)
+    ///     .await?;
+    /// println!("Updated {} rows", updated_count);
+    /// ```
+    pub async fn update(&self) -> Result<UpdateBuilder> {
+        // Load fresh table metadata from catalog
+        let table = self.catalog.load_table(&self.table_ident).await?;
+        Ok(UpdateBuilder::new(table, self.catalog.clone(), self.schema.clone()))
     }
 }
 

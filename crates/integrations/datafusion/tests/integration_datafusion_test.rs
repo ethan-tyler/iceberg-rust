@@ -1284,3 +1284,685 @@ async fn test_delete_empty_table() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// UPDATE TESTS
+// ============================================================================
+
+/// Helper to set up a test table with data for UPDATE tests.
+/// Creates a table with columns (foo1: Int, foo2: String) and inserts 5 rows.
+async fn setup_update_test_table(
+    namespace_name: &str,
+) -> Result<(Arc<MemoryCatalog>, NamespaceIdent, SessionContext)> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new(namespace_name.to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "update_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data: 5 rows
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{}.update_table VALUES \
+         (1, 'alice'), (2, 'bob'), (3, 'charlie'), (4, 'diana'), (5, 'eve')",
+        namespace_name
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    Ok((client, namespace, ctx))
+}
+
+/// Test UPDATE with a WHERE predicate.
+/// Verifies that only matching rows are updated.
+#[tokio::test]
+async fn test_update_with_predicate() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_update_test_table("test_update_predicate").await?;
+
+    // Create provider for programmatic update
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "update_table",
+    )
+    .await?;
+
+    // Update rows where foo1 > 3 (diana and eve) to have foo2 = 'updated'
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("foo2", lit("updated"))
+        .filter(col("foo1").gt(lit(3)))
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 2, "Expected 2 rows updated");
+
+    // Verify the updates
+    let df = ctx
+        .sql("SELECT foo1, foo2 FROM catalog.test_update_predicate.update_table ORDER BY foo1")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    // First 3 rows should be unchanged, last 2 should be 'updated'
+    assert_eq!(names, vec!["alice", "bob", "charlie", "updated", "updated"]);
+
+    Ok(())
+}
+
+/// Test UPDATE without a WHERE clause (full table update).
+/// All rows should be updated.
+#[tokio::test]
+async fn test_update_full_table() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_update_test_table("test_update_full").await?;
+
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "update_table",
+    )
+    .await?;
+
+    // Update all rows to have foo2 = 'all_updated'
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("foo2", lit("all_updated"))
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 5, "Expected 5 rows updated");
+
+    // Verify all rows have the new value
+    let df = ctx
+        .sql("SELECT foo2 FROM catalog.test_update_full.update_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    assert!(names.iter().all(|n| n == "all_updated"), "All rows should be 'all_updated'");
+    assert_eq!(names.len(), 5);
+
+    Ok(())
+}
+
+/// Test UPDATE with multiple columns being updated.
+#[tokio::test]
+async fn test_update_multiple_columns() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_multi".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create table with 3 columns
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "status", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let creation = get_table_creation(temp_path(), "multi_update_table", Some(schema))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql(
+        "INSERT INTO catalog.test_update_multi.multi_update_table VALUES \
+         (1, 'alice', 'active'), (2, 'bob', 'active')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "multi_update_table",
+    )
+    .await?;
+
+    // Update both name and status where id = 1
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("name", lit("alice_updated"))
+        .set("status", lit("inactive"))
+        .filter(col("id").eq(lit(1)))
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 1, "Expected 1 row updated");
+
+    // Verify the updates
+    let df = ctx
+        .sql("SELECT id, name, status FROM catalog.test_update_multi.multi_update_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    let statuses: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    assert_eq!(names, vec!["alice_updated", "bob"]);
+    assert_eq!(statuses, vec!["inactive", "active"]);
+
+    Ok(())
+}
+
+/// Test UPDATE with an expression (col = col + something).
+#[tokio::test]
+async fn test_update_with_expression() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_expr".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create table with numeric column
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    let creation = get_table_creation(temp_path(), "expr_update_table", Some(schema))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql(
+        "INSERT INTO catalog.test_update_expr.expr_update_table VALUES \
+         (1, 10), (2, 20), (3, 30)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "expr_update_table",
+    )
+    .await?;
+
+    // Update: value = value + 100 where value > 15
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("value", col("value") + lit(100))
+        .filter(col("value").gt(lit(15)))
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 2, "Expected 2 rows updated (value 20 and 30)");
+
+    // Verify the updates
+    let df = ctx
+        .sql("SELECT id, value FROM catalog.test_update_expr.expr_update_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let values: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .collect();
+
+    // value=10 stays at 10, value=20 becomes 120, value=30 becomes 130
+    assert_eq!(values, vec![10, 120, 130]);
+
+    Ok(())
+}
+
+/// Test UPDATE where no rows match the predicate.
+/// Should return count of 0.
+#[tokio::test]
+async fn test_update_no_match() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_update_test_table("test_update_no_match").await?;
+
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "update_table",
+    )
+    .await?;
+
+    // Update with predicate that matches nothing
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("foo2", lit("never_seen"))
+        .filter(col("foo1").gt(lit(100)))  // No rows have foo1 > 100
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 0, "Expected 0 rows updated");
+
+    // Verify data unchanged
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_update_no_match.update_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 5, "All 5 rows should still exist");
+
+    Ok(())
+}
+
+/// Test that SELECT after UPDATE properly shows the updated values.
+/// This validates end-to-end update and read path.
+#[tokio::test]
+async fn test_select_after_update() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_update_test_table("test_select_after_update").await?;
+
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "update_table",
+    )
+    .await?;
+
+    // Update bob's name to 'robert'
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("foo2", lit("robert"))
+        .filter(col("foo2").eq(lit("bob")))
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 1, "Expected 1 row updated");
+
+    // SELECT should show 'robert' instead of 'bob'
+    let df = ctx
+        .sql("SELECT foo2 FROM catalog.test_select_after_update.update_table ORDER BY foo1")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    assert_eq!(names, vec!["alice", "robert", "charlie", "diana", "eve"]);
+    assert!(!names.contains(&"bob".to_string()), "bob should be replaced with robert");
+
+    Ok(())
+}
+
+/// Test UPDATE on a partitioned table.
+/// Currently, UPDATE on partitioned tables returns NotImplemented error.
+#[tokio::test]
+async fn test_update_partitioned_table() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_partitioned".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema with partition column
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("partitioned_update_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across partitions
+    ctx.sql(
+        "INSERT INTO catalog.test_update_partitioned.partitioned_update_table VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "partitioned_update_table",
+    )
+    .await?;
+
+    // Attempt to update a partitioned table should return NotImplemented
+    let result = provider
+        .update()
+        .await
+        .unwrap()
+        .set("value", lit("updated"))
+        .filter(col("id").eq(lit(1)))
+        .execute(&ctx.state())
+        .await;
+
+    assert!(result.is_err(), "Expected NotImplemented error for partitioned table UPDATE");
+    let err = result.unwrap_err();
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("partitioned tables is not yet supported"),
+        "Expected error message about partitioned tables, got: {}",
+        err_msg
+    );
+
+    // Verify data is still intact
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_update_partitioned.partitioned_update_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2, "All 2 rows should still exist since update failed");
+
+    Ok(())
+}
+
+/// Test UPDATE with self-reference (SET col = col).
+/// This should be a valid no-op operation.
+#[tokio::test]
+async fn test_update_self_reference() -> Result<()> {
+    let (catalog, namespace, ctx) = setup_update_test_table("test_update_self_ref").await?;
+
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "update_table",
+    )
+    .await?;
+
+    // Update foo2 = foo2 (self-reference, effectively no change in values)
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("foo2", col("foo2"))
+        .filter(col("foo1").eq(lit(1)))
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 1, "Expected 1 row updated (even though value is same)");
+
+    // Verify data is unchanged
+    let df = ctx
+        .sql("SELECT foo2 FROM catalog.test_update_self_ref.update_table WHERE foo1 = 1")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let name = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+
+    assert_eq!(name, "alice", "Value should remain 'alice' after self-reference update");
+
+    Ok(())
+}
+
+/// Test UPDATE on an empty table.
+/// Should return count of 0 gracefully.
+#[tokio::test]
+async fn test_update_empty_table() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_empty".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "empty_update_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "empty_update_table",
+    )
+    .await?;
+
+    // UPDATE on empty table
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("foo2", lit("value"))
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 0, "Expected 0 rows updated on empty table");
+
+    Ok(())
+}
+
+/// Test UPDATE with cross-column swap (SET a = b, b = a).
+/// This verifies that all expressions are evaluated against the ORIGINAL batch,
+/// not the partially-updated batch.
+#[tokio::test]
+async fn test_update_cross_column_swap() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_swap".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create table with two string columns
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "first", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "second", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let creation = get_table_creation(temp_path(), "swap_table", Some(schema))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql(
+        "INSERT INTO catalog.test_update_swap.swap_table VALUES \
+         (1, 'A', 'B')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "swap_table",
+    )
+    .await?;
+
+    // Swap: SET first = second, second = first
+    // If evaluated incorrectly (first updated, then second reads updated first),
+    // we'd get (1, 'B', 'B') instead of (1, 'B', 'A')
+    let updated_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("first", col("second"))
+        .set("second", col("first"))
+        .filter(col("id").eq(lit(1)))
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_count, 1, "Expected 1 row updated");
+
+    // Verify the swap worked correctly
+    let df = ctx
+        .sql("SELECT id, first, second FROM catalog.test_update_swap.swap_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let first_val = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+
+    let second_val = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+
+    // After swap: first should be 'B' (original second), second should be 'A' (original first)
+    assert_eq!(first_val, "B", "first should be swapped to original second value");
+    assert_eq!(second_val, "A", "second should be swapped to original first value");
+
+    Ok(())
+}
