@@ -51,6 +51,11 @@ pub enum Operation {
     Overwrite,
     /// Data files were removed and their contents logically deleted and/or delete files were added to delete rows.
     Delete,
+    /// Data and delete files were added in an atomic row-level operation.
+    /// Used for UPDATE and MERGE operations where both new data and delete files
+    /// must be committed together atomically.
+    #[serde(rename = "row_delta")]
+    RowDelta,
 }
 
 impl Operation {
@@ -61,6 +66,7 @@ impl Operation {
             Operation::Replace => "replace",
             Operation::Overwrite => "overwrite",
             Operation::Delete => "delete",
+            Operation::RowDelta => "row_delta",
         }
     }
 }

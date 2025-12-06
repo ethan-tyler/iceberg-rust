@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod delete;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -73,6 +74,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::delete::DeleteAction;
+use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -150,6 +152,30 @@ impl Transaction {
     /// `EqualityDeleteFileWriter`.
     pub fn delete(&self) -> DeleteAction {
         DeleteAction::new()
+    }
+
+    /// Creates a row delta action for atomic row-level operations.
+    ///
+    /// This action enables atomic commits that combine data file additions and
+    /// delete file additions in a single snapshot. Use this for:
+    /// - UPDATE operations (delete old rows + insert updated rows)
+    /// - MERGE operations (combined inserts, updates, deletes)
+    ///
+    /// Unlike separate `fast_append()` and `delete()` operations, `row_delta()`
+    /// ensures atomicity - either all changes are committed or none are.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.row_delta()
+    ///     .add_data_files(new_rows)
+    ///     .add_position_delete_files(deleted_rows);
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
     }
 
     /// Creates replace sort order action.
