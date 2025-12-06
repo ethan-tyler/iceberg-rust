@@ -19,7 +19,7 @@
 //!
 //! This module provides `IcebergUpdateCommitExec`, which collects serialized
 //! data file and delete file JSON from `IcebergUpdateExec` and commits them
-//! atomically using `Transaction::fast_append()` and `Transaction::delete()`.
+//! atomically using `Transaction::row_delta()`.
 
 use std::any::Any;
 use std::fmt::Formatter;
@@ -50,7 +50,7 @@ pub const UPDATE_RESULT_COUNT_COL: &str = "count";
 /// Execution plan for committing UPDATE files to an Iceberg table.
 ///
 /// Collects serialized data file and delete file JSON from input and commits them
-/// atomically using a single transaction with both `fast_append()` and `delete()` actions.
+/// atomically using a single `row_delta()` transaction.
 /// Returns a count of the updated rows.
 #[derive(Debug)]
 pub struct IcebergUpdateCommitExec {
@@ -60,10 +60,16 @@ pub struct IcebergUpdateCommitExec {
     input_schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
     plan_properties: PlanProperties,
+    /// Baseline snapshot ID for conflict detection during commit.
+    /// If set, the commit will validate that no conflicting changes were made
+    /// since this snapshot.
+    baseline_snapshot_id: Option<i64>,
 }
 
 impl IcebergUpdateCommitExec {
     /// Creates a new `IcebergUpdateCommitExec`.
+    ///
+    /// Captures the current snapshot ID as the baseline for conflict detection.
     pub fn new(
         table: Table,
         catalog: Arc<dyn Catalog>,
@@ -72,6 +78,7 @@ impl IcebergUpdateCommitExec {
     ) -> Self {
         let count_schema = Self::make_count_schema();
         let plan_properties = Self::compute_properties(count_schema.clone());
+        let baseline_snapshot_id = table.metadata().current_snapshot_id();
 
         Self {
             table,
@@ -80,6 +87,7 @@ impl IcebergUpdateCommitExec {
             input_schema,
             count_schema,
             plan_properties,
+            baseline_snapshot_id,
         }
     }
 
@@ -173,12 +181,16 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
             )));
         }
 
-        Ok(Arc::new(Self::new(
-            self.table.clone(),
-            self.catalog.clone(),
-            children[0].clone(),
-            self.input_schema.clone(),
-        )))
+        // Preserve all existing fields including baseline_snapshot_id
+        Ok(Arc::new(Self {
+            table: self.table.clone(),
+            catalog: self.catalog.clone(),
+            input: children[0].clone(),
+            input_schema: self.input_schema.clone(),
+            count_schema: self.count_schema.clone(),
+            plan_properties: self.plan_properties.clone(),
+            baseline_snapshot_id: self.baseline_snapshot_id,
+        }))
     }
 
     fn execute(
@@ -197,6 +209,7 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
         let catalog = self.catalog.clone();
         let input_plan = self.input.clone();
         let count_schema = self.count_schema.clone();
+        let baseline_snapshot_id = self.baseline_snapshot_id;
 
         let spec_id = self.table.metadata().default_partition_spec_id();
         let partition_type = self.table.metadata().default_partition_type().clone();
@@ -311,43 +324,26 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                 return Self::make_count_batch(0);
             }
 
-            // NOTE: The iceberg-rust Transaction API doesn't yet support combining
-            // fast_append and delete actions in a single atomic commit (each action
-            // generates conflicting snapshot requirements). Until RowDelta is implemented,
-            // we commit in two separate transactions:
-            // 1. First: commit position delete files (marks original rows as deleted)
-            // 2. Second: commit new data files (the updated rows)
-            //
-            // This is NOT fully atomic - if the first commit succeeds but the second
-            // fails, the table will be in an inconsistent state (original rows deleted
-            // but no updated rows). However, the data can be recovered from the previous
-            // snapshot using time travel.
-            //
-            // TODO: Replace with single atomic commit using RowDelta action when available.
+            // Commit data files and delete files atomically using RowDelta
+            let tx = Transaction::new(&table);
+            let mut action = tx
+                .row_delta()
+                .add_data_files(data_files)
+                .add_position_delete_files(delete_files);
 
-            // Step 1: Commit position delete files first (mark original rows as deleted)
-            // This must happen first to ensure readers see deletions before new data
-            let table = if !delete_files.is_empty() {
-                let tx = Transaction::new(&table);
-                let action = tx.delete().add_delete_files(delete_files);
-                let tx = action.apply(tx).map_err(to_datafusion_error)?;
-                tx.commit(catalog.as_ref())
-                    .await
-                    .map_err(to_datafusion_error)?
-            } else {
-                table
-            };
-
-            // Step 2: Commit new data files (the updated rows)
-            if !data_files.is_empty() {
-                let tx = Transaction::new(&table);
-                let action = tx.fast_append().add_data_files(data_files);
-                let tx = action.apply(tx).map_err(to_datafusion_error)?;
-                let _updated_table = tx
-                    .commit(catalog.as_ref())
-                    .await
-                    .map_err(to_datafusion_error)?;
+            // Enable conflict detection if we have a baseline snapshot
+            if let Some(baseline_id) = baseline_snapshot_id {
+                action = action
+                    .validate_from_snapshot(baseline_id)
+                    .validate_no_conflicting_data_files()
+                    .validate_no_conflicting_delete_files();
             }
+
+            let tx = action.apply(tx).map_err(to_datafusion_error)?;
+            let _updated_table = tx
+                .commit(catalog.as_ref())
+                .await
+                .map_err(to_datafusion_error)?;
 
             Self::make_count_batch(total_update_count)
         })
