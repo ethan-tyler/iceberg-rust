@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod delete;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -71,6 +72,7 @@ use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
+use crate::transaction::delete::DeleteAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -139,6 +141,15 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Creates a delete action for committing delete files.
+    ///
+    /// This action supports both position delete files and equality delete files.
+    /// Use this to commit delete files produced by `PositionDeleteFileWriter` or
+    /// `EqualityDeleteFileWriter`.
+    pub fn delete(&self) -> DeleteAction {
+        DeleteAction::new()
     }
 
     /// Creates replace sort order action.
@@ -218,6 +229,12 @@ impl Transaction {
                 &mut existing_updates,
                 &mut existing_requirements,
             )?;
+        }
+
+        // If there are no updates, skip the catalog write to avoid metadata churn.
+        // This can happen when actions are no-ops (e.g., empty delete action).
+        if existing_updates.is_empty() {
+            return Ok(current_table);
         }
 
         let table_commit = TableCommit::builder()

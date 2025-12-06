@@ -16,15 +16,25 @@
 // under the License.
 
 pub(crate) mod commit;
+pub(crate) mod delete_commit;
+pub(crate) mod delete_scan;
+pub(crate) mod delete_write;
 pub(crate) mod expr_to_predicate;
 pub(crate) mod metadata_scan;
 pub(crate) mod project;
 pub(crate) mod repartition;
 pub(crate) mod scan;
 pub(crate) mod sort;
+pub(crate) mod update;
+pub(crate) mod update_commit;
 pub(crate) mod write;
 
 pub(crate) const DATA_FILES_COL_NAME: &str = "data_files";
 
+pub use delete_commit::IcebergDeleteCommitExec;
+pub use delete_scan::IcebergDeleteScanExec;
+pub use delete_write::IcebergDeleteWriteExec;
 pub use project::project_with_partition;
 pub use scan::IcebergTableScan;
+pub use update::IcebergUpdateExec;
+pub use update_commit::IcebergUpdateCommitExec;

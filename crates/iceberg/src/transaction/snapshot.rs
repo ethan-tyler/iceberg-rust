@@ -23,10 +23,10 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
-    TableProperties, update_snapshot_summaries,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
+    ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
+    Operation, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
+    StructType, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -114,6 +114,7 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -127,6 +128,7 @@ impl<'a> SnapshotProducer<'a> {
         key_metadata: Option<Vec<u8>>,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -135,13 +137,14 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            added_delete_files,
             manifest_counter: (0..),
         }
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
         for data_file in &self.added_data_files {
-            if data_file.content_type() != crate::spec::DataContentType::Data {
+            if data_file.content_type() != DataContentType::Data {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Only data content type is allowed for fast append",
@@ -163,14 +166,105 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    pub(crate) async fn validate_duplicate_files(&self) -> Result<()> {
-        let new_files: HashSet<&str> = self
-            .added_data_files
-            .iter()
-            .map(|df| df.file_path.as_str())
-            .collect();
+    pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
+        if self.table.metadata().format_version() == FormatVersion::V1
+            && !self.added_delete_files.is_empty()
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Delete files are not supported in format version 1. Upgrade the table to format version 2 or later.",
+            ));
+        }
 
-        let mut referenced_files = Vec::new();
+        for delete_file in &self.added_delete_files {
+            match delete_file.content_type() {
+                DataContentType::PositionDeletes => {}
+                DataContentType::EqualityDeletes => {
+                    if delete_file.equality_ids().is_none_or(|ids| ids.is_empty()) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Equality delete files must have equality_ids set",
+                        ));
+                    }
+                }
+                DataContentType::Data => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Data content type is not allowed for delete files",
+                    ));
+                }
+            }
+            let partition_spec = self
+                .table
+                .metadata()
+                .partition_spec_by_id(delete_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Delete file references unknown partition spec id: {}",
+                            delete_file.partition_spec_id
+                        ),
+                    )
+                })?;
+            let partition_type = self
+                .find_compatible_partition_type(partition_spec)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Failed to compute partition type for spec {}: {}",
+                            delete_file.partition_spec_id, e
+                        ),
+                    )
+                })?;
+            Self::validate_partition_value(delete_file.partition(), &partition_type)?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn validate_duplicate_files(&self) -> Result<()> {
+        let mut seen_data_files: HashSet<&str> = HashSet::new();
+        let mut intra_batch_data_duplicates = Vec::new();
+        for data_file in &self.added_data_files {
+            if !seen_data_files.insert(data_file.file_path.as_str()) {
+                intra_batch_data_duplicates.push(data_file.file_path.clone());
+            }
+        }
+        if !intra_batch_data_duplicates.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot add duplicate data files in the same batch: {}",
+                    intra_batch_data_duplicates.join(", ")
+                ),
+            ));
+        }
+
+        let mut seen_delete_files: HashSet<&str> = HashSet::new();
+        let mut intra_batch_delete_duplicates = Vec::new();
+        for delete_file in &self.added_delete_files {
+            if !seen_delete_files.insert(delete_file.file_path.as_str()) {
+                intra_batch_delete_duplicates.push(delete_file.file_path.clone());
+            }
+        }
+        if !intra_batch_delete_duplicates.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot add duplicate delete files in the same batch: {}",
+                    intra_batch_delete_duplicates.join(", ")
+                ),
+            ));
+        }
+
+        let new_data_files = seen_data_files;
+        let new_delete_files = seen_delete_files;
+
+        let mut duplicate_data_files = Vec::new();
+        let mut duplicate_delete_files = Vec::new();
+
         if let Some(current_snapshot) = self.table.metadata().current_snapshot() {
             let manifest_list = current_snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
@@ -181,19 +275,34 @@ impl<'a> SnapshotProducer<'a> {
                     .await?;
                 for entry in manifest.entries() {
                     let file_path = entry.file_path();
-                    if new_files.contains(file_path) && entry.is_alive() {
-                        referenced_files.push(file_path.to_string());
+                    if entry.is_alive() {
+                        if new_data_files.contains(file_path) {
+                            duplicate_data_files.push(file_path.to_string());
+                        }
+                        if new_delete_files.contains(file_path) {
+                            duplicate_delete_files.push(file_path.to_string());
+                        }
                     }
                 }
             }
         }
 
-        if !referenced_files.is_empty() {
+        if !duplicate_data_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Cannot add files that are already referenced by table, files: {}",
-                    referenced_files.join(", ")
+                    "Cannot add data files that are already referenced by table, files: {}",
+                    duplicate_data_files.join(", ")
+                ),
+            ));
+        }
+
+        if !duplicate_delete_files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot add delete files that are already referenced by table, files: {}",
+                    duplicate_delete_files.join(", ")
                 ),
             ));
         }
@@ -288,6 +397,30 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
+    fn find_compatible_partition_type(
+        &self,
+        partition_spec: &crate::spec::PartitionSpecRef,
+    ) -> Result<StructType> {
+        let current_schema = self.table.metadata().current_schema();
+        if let Ok(partition_type) = partition_spec.partition_type(current_schema) {
+            return Ok(partition_type);
+        }
+
+        for schema in self.table.metadata().schemas_iter() {
+            if let Ok(partition_type) = partition_spec.partition_type(schema) {
+                return Ok(partition_type);
+            }
+        }
+
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot compute partition type for spec {}: no schema contains all referenced fields",
+                partition_spec.spec_id()
+            ),
+        ))
+    }
+
     // Write manifest file for added data files and return the ManifestFile for ManifestList.
     async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
         let added_data_files = std::mem::take(&mut self.added_data_files);
@@ -319,6 +452,35 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    // Write manifest file for added delete files and return the ManifestFile for ManifestList.
+    async fn write_delete_manifest(&mut self) -> Result<ManifestFile> {
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        if added_delete_files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added delete files found when write a delete manifest file",
+            ));
+        }
+
+        let snapshot_id = self.snapshot_id;
+        let format_version = self.table.metadata().format_version();
+        let manifest_entries = added_delete_files.into_iter().map(|delete_file| {
+            let builder = ManifestEntry::builder()
+                .status(crate::spec::ManifestStatus::Added)
+                .data_file(delete_file);
+            if format_version == FormatVersion::V1 {
+                builder.snapshot_id(snapshot_id).build()
+            } else {
+                builder.build()
+            }
+        });
+        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
+        for entry in manifest_entries {
+            writer.add_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -329,24 +491,31 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        let has_data_files = !self.added_data_files.is_empty();
+        let has_delete_files = !self.added_delete_files.is_empty();
+        let has_properties = !self.snapshot_properties.is_empty();
+
+        if !has_data_files && !has_delete_files && !has_properties {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files or added snapshot properties found when write a manifest file",
+                "No added data files, delete files, or snapshot properties found when write a manifest file",
             ));
         }
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
 
-        // Process added entries.
-        if !self.added_data_files.is_empty() {
+        // Process added data file entries.
+        if has_data_files {
             let added_manifest = self.write_added_manifest().await?;
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
+        // Process added delete file entries.
+        if has_delete_files {
+            let delete_manifest = self.write_delete_manifest().await?;
+            manifest_files.push(delete_manifest);
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -378,6 +547,15 @@ impl<'a> SnapshotProducer<'a> {
         for data_file in &self.added_data_files {
             summary_collector.add_file(
                 data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        // Add delete files to summary collector
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );

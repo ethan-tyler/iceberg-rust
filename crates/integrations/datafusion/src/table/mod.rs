@@ -50,10 +50,14 @@ use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
+use crate::physical_plan::delete_commit::IcebergDeleteCommitExec;
+use crate::physical_plan::delete_scan::IcebergDeleteScanExec;
+use crate::physical_plan::delete_write::IcebergDeleteWriteExec;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
 use crate::physical_plan::write::IcebergWriteExec;
+use crate::update::UpdateBuilder;
 
 /// Catalog-backed table provider with automatic metadata refresh.
 ///
@@ -78,7 +82,7 @@ impl IcebergTableProvider {
     ///
     /// Loads the table once to get the initial schema, then stores the catalog
     /// reference for future metadata refreshes on each operation.
-    pub(crate) async fn try_new(
+    pub async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
@@ -103,6 +107,115 @@ impl IcebergTableProvider {
         // Load fresh table metadata for metadata table access
         let table = self.catalog.load_table(&self.table_ident).await?;
         Ok(IcebergMetadataTableProvider { table, r#type })
+    }
+
+    /// Deletes rows matching the given predicate from the table.
+    ///
+    /// This method creates position delete files for all rows matching the predicate
+    /// and commits them to the table using the DeleteAction transaction.
+    ///
+    /// # Arguments
+    /// * `state` - The DataFusion session state
+    /// * `predicate` - Optional filter expression. If None, deletes all rows.
+    ///
+    /// # Returns
+    /// The number of rows deleted.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use datafusion::prelude::*;
+    ///
+    /// let deleted_count = provider
+    ///     .delete(&session_state, Some(col("id").eq(lit(42))))
+    ///     .await?;
+    /// println!("Deleted {} rows", deleted_count);
+    /// ```
+    pub async fn delete(
+        &self,
+        _state: &dyn Session,
+        predicate: Option<Expr>,
+    ) -> DFResult<u64> {
+        use datafusion::execution::context::TaskContext;
+        use datafusion::physical_plan::collect;
+
+        // Load fresh table metadata from catalog
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // Build the delete execution plan chain
+        let filters: Vec<Expr> = predicate.into_iter().collect();
+
+        // Step 1: Scan for rows to delete
+        let delete_scan = Arc::new(IcebergDeleteScanExec::new(
+            table.clone(),
+            None, // Use current snapshot
+            &filters,
+        ));
+
+        // Step 2: Write position delete files
+        let delete_write = Arc::new(IcebergDeleteWriteExec::new(
+            table.clone(),
+            delete_scan,
+        ));
+
+        // Step 3: Coalesce partitions for single commit
+        let coalesce = Arc::new(CoalescePartitionsExec::new(delete_write));
+
+        // Step 4: Commit delete files
+        let delete_commit = Arc::new(IcebergDeleteCommitExec::new(
+            table,
+            self.catalog.clone(),
+            coalesce.clone(),
+            coalesce.schema(),
+        ));
+
+        // Execute the plan
+        let task_ctx = Arc::new(TaskContext::default());
+        let batches = collect(delete_commit, task_ctx).await?;
+
+        // Extract the count from the result
+        if batches.is_empty() || batches[0].num_rows() == 0 {
+            return Ok(0);
+        }
+
+        let count_array = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected UInt64Array for delete count".to_string())
+            })?;
+
+        Ok(count_array.value(0))
+    }
+
+    /// Creates an UpdateBuilder for updating rows in the table.
+    ///
+    /// This method loads fresh table metadata and returns a builder that can be
+    /// configured with SET assignments and an optional WHERE predicate.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use datafusion::prelude::*;
+    ///
+    /// let updated_count = provider
+    ///     .update()
+    ///     .await?
+    ///     .set("status", lit("shipped"))
+    ///     .set("updated_at", current_timestamp())
+    ///     .filter(col("id").eq(lit(42)))
+    ///     .execute(&session_state)
+    ///     .await?;
+    /// println!("Updated {} rows", updated_count);
+    /// ```
+    pub async fn update(&self) -> Result<UpdateBuilder> {
+        // Load fresh table metadata from catalog
+        let table = self.catalog.load_table(&self.table_ident).await?;
+        Ok(UpdateBuilder::new(table, self.catalog.clone(), self.schema.clone()))
     }
 }
 
