@@ -131,6 +131,10 @@ impl ManifestEntryContext {
 
             // Include partition data and spec from manifest entry
             partition: Some(self.manifest_entry.data_file.partition.clone()),
+            // Include partition_spec_id for partition evolution support.
+            // This enables UPDATE/DELETE operations to serialize files with the correct
+            // partition type even when the table has evolved partition specs.
+            partition_spec_id: Some(self.partition_spec_id),
             // TODO: Pass actual PartitionSpec through context chain for native flow
             partition_spec: None,
             // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"

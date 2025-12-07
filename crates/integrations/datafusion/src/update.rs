@@ -21,6 +21,14 @@
 //! Copy-on-Write (CoW) semantics. Updated rows are written to new data files while
 //! original rows are marked as deleted via position delete files.
 //!
+//! # Documentation
+//!
+//! For comprehensive documentation, see:
+//! - **Architecture**: [`docs/datafusion-update/DESIGN.md`](../../../../docs/datafusion-update/DESIGN.md)
+//! - **ADR-001**: [Copy-on-Write Decision](../../../../docs/datafusion-update/adr/ADR-001-cow-semantics.md)
+//! - **ADR-002**: [Partition Evolution](../../../../docs/datafusion-update/adr/ADR-002-partition-evolution.md)
+//! - **ADR-003**: [Atomic Commit](../../../../docs/datafusion-update/adr/ADR-003-atomic-commit.md)
+//!
 //! # Architecture
 //!
 //! The UPDATE operation is implemented as a four-stage execution plan:
@@ -81,9 +89,26 @@
 //!
 //! # Current Limitations
 //!
-//! - Partitioned tables are not yet supported (returns `NotImplemented` error)
+//! - Copy-on-Write only (no Merge-on-Read support)
 //! - Type coercion is strict (expression type must exactly match column type)
 //! - Only works with Iceberg format version 2 tables (position deletes require v2)
+//!
+//! # Partitioned Table Support
+//!
+//! UPDATE operations support partitioned tables with:
+//! - Identity partitions (e.g., `category`)
+//! - Transform partitions (e.g., `year(timestamp)`, `month(date)`)
+//!
+//! Position delete files are written with correct partition values from the
+//! source data files, ensuring proper Iceberg spec compliance.
+//!
+//! ## Partition Evolution Support
+//!
+//! UPDATE operations support partition evolution. Each data file carries its original
+//! `partition_spec_id` from the scan, which is used to:
+//! - Look up the correct partition type for data file serialization
+//! - Construct the correct PartitionKey for position delete file writes
+//! - Ensure position delete files inherit the spec_id from their source data file
 
 use std::sync::Arc;
 
@@ -238,17 +263,6 @@ impl UpdateBuilder {
 
         // Validate first
         self.validate()?;
-
-        // Check if table is partitioned
-        let partition_spec = self.table.metadata().default_partition_spec();
-        if !partition_spec.is_unpartitioned() {
-            return Err(DataFusionError::NotImplemented(
-                "UPDATE on partitioned tables is not yet supported. \
-                 Position delete files must include partition values, which requires \
-                 grouping updates by partition. This will be added in a future release."
-                    .to_string(),
-            ));
-        }
 
         // Build the update execution plan chain
         let filters: Vec<Expr> = self.filter.into_iter().collect();

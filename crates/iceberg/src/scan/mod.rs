@@ -1778,6 +1778,7 @@ pub mod tests {
             data_file_format: DataFileFormat::Parquet,
             deletes: vec![],
             partition: None,
+            partition_spec_id: None,
             partition_spec: None,
             name_mapping: None,
         };
@@ -1795,6 +1796,7 @@ pub mod tests {
             data_file_format: DataFileFormat::Avro,
             deletes: vec![],
             partition: None,
+            partition_spec_id: None,
             partition_spec: None,
             name_mapping: None,
         };

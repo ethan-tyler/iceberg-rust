@@ -124,6 +124,33 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         schema: SchemaRef,
         partition_spec: PartitionSpecRef,
     ) -> Result<Self> {
+        Self::try_new_internal(writer_builder, fanout_enabled, schema, partition_spec, false)
+    }
+
+    /// Create a new TaskWriter with computed partition values.
+    ///
+    /// Unlike `try_new` which expects a pre-computed `_partition` column in the input,
+    /// this constructor creates a TaskWriter that computes partition values from
+    /// source columns (like "category" for an identity partition on that column).
+    ///
+    /// Use this for UPDATE operations where the data comes from reading existing files
+    /// that don't have a `_partition` column.
+    pub fn try_new_with_computed_partitions(
+        writer_builder: B,
+        fanout_enabled: bool,
+        schema: SchemaRef,
+        partition_spec: PartitionSpecRef,
+    ) -> Result<Self> {
+        Self::try_new_internal(writer_builder, fanout_enabled, schema, partition_spec, true)
+    }
+
+    fn try_new_internal(
+        writer_builder: B,
+        fanout_enabled: bool,
+        schema: SchemaRef,
+        partition_spec: PartitionSpecRef,
+        compute_partitions: bool,
+    ) -> Result<Self> {
         let writer = if partition_spec.is_unpartitioned() {
             SupportedWriter::Unpartitioned(UnpartitionedWriter::new(writer_builder))
         } else if fanout_enabled {
@@ -134,12 +161,17 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
 
         // Initialize partition splitter in constructor for partitioned tables
         let partition_splitter = if !partition_spec.is_unpartitioned() {
-            Some(
+            Some(if compute_partitions {
+                RecordBatchPartitionSplitter::try_new_with_computed_values(
+                    schema.clone(),
+                    partition_spec.clone(),
+                )?
+            } else {
                 RecordBatchPartitionSplitter::try_new_with_precomputed_values(
                     schema.clone(),
                     partition_spec.clone(),
-                )?,
-            )
+                )?
+            })
         } else {
             None
         };

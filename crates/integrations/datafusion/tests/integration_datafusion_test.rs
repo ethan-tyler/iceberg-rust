@@ -1700,7 +1700,7 @@ async fn test_select_after_update() -> Result<()> {
 }
 
 /// Test UPDATE on a partitioned table.
-/// Currently, UPDATE on partitioned tables returns NotImplemented error.
+/// Position delete files should include partition values from the data files.
 #[tokio::test]
 async fn test_update_partitioned_table() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -1757,38 +1757,53 @@ async fn test_update_partitioned_table() -> Result<()> {
     )
     .await?;
 
-    // Attempt to update a partitioned table should return NotImplemented
-    let result = provider
+    // Update a row in the partitioned table
+    let update_count = provider
         .update()
         .await
         .unwrap()
-        .set("value", lit("updated"))
+        .set("value", lit("updated_laptop"))
         .filter(col("id").eq(lit(1)))
         .execute(&ctx.state())
-        .await;
+        .await
+        .expect("UPDATE on partitioned table should succeed");
 
-    assert!(result.is_err(), "Expected NotImplemented error for partitioned table UPDATE");
-    let err = result.unwrap_err();
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("partitioned tables is not yet supported"),
-        "Expected error message about partitioned tables, got: {}",
-        err_msg
-    );
+    assert_eq!(update_count, 1, "Should have updated 1 row");
 
-    // Verify data is still intact
+    // Re-register catalog to pick up changes
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Verify the update was applied correctly
     let df = ctx
-        .sql("SELECT COUNT(*) as cnt FROM catalog.test_update_partitioned.partitioned_update_table")
+        .sql("SELECT id, category, value FROM catalog.test_update_partitioned.partitioned_update_table ORDER BY id")
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let count = batches[0]
+
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 2);
+
+    let id_array = batch
         .column(0)
         .as_any()
-        .downcast_ref::<datafusion::arrow::array::Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(count, 2, "All 2 rows should still exist since update failed");
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let value_array = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StringArray>()
+        .unwrap();
+
+    // Row 1 should be updated
+    assert_eq!(id_array.value(0), 1);
+    assert_eq!(value_array.value(0), "updated_laptop");
+
+    // Row 2 should be unchanged
+    assert_eq!(id_array.value(1), 2);
+    assert_eq!(value_array.value(1), "phone");
 
     Ok(())
 }
@@ -1963,6 +1978,452 @@ async fn test_update_cross_column_swap() -> Result<()> {
     // After swap: first should be 'B' (original second), second should be 'A' (original first)
     assert_eq!(first_val, "B", "first should be swapped to original second value");
     assert_eq!(second_val, "A", "second should be swapped to original first value");
+
+    Ok(())
+}
+
+/// Test UPDATE affecting rows across multiple partitions.
+/// Verifies that delete files are created per-partition and updates work correctly
+/// across partition boundaries.
+#[tokio::test]
+async fn test_update_partitioned_cross_partition() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_cross_part".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema with partition column
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "region", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("cross_partition_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across 3 different partitions
+    ctx.sql(
+        "INSERT INTO catalog.test_update_cross_part.cross_partition_table VALUES \
+         (1, 'US', 100), \
+         (2, 'US', 200), \
+         (3, 'EU', 150), \
+         (4, 'EU', 250), \
+         (5, 'ASIA', 300)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "cross_partition_table",
+    )
+    .await?;
+
+    // Update rows across multiple partitions (value > 150 touches US(id=2), EU(id=4), ASIA(id=5))
+    let update_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("value", lit(999))
+        .filter(col("value").gt(lit(150)))
+        .execute(&ctx.state())
+        .await
+        .expect("UPDATE across partitions should succeed");
+
+    assert_eq!(update_count, 3, "Should have updated 3 rows across partitions");
+
+    // Re-register catalog to pick up changes
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Verify all rows have correct values
+    let df = ctx
+        .sql("SELECT id, region, value FROM catalog.test_update_cross_part.cross_partition_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 5);
+
+    let id_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let value_array = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+
+    // Verify each row
+    // id=1 (US, 100): NOT updated
+    assert_eq!(id_array.value(0), 1);
+    assert_eq!(value_array.value(0), 100, "id=1 should NOT be updated");
+
+    // id=2 (US, 200): updated to 999
+    assert_eq!(id_array.value(1), 2);
+    assert_eq!(value_array.value(1), 999, "id=2 should be updated to 999");
+
+    // id=3 (EU, 150): NOT updated (150 is not > 150)
+    assert_eq!(id_array.value(2), 3);
+    assert_eq!(value_array.value(2), 150, "id=3 should NOT be updated");
+
+    // id=4 (EU, 250): updated to 999
+    assert_eq!(id_array.value(3), 4);
+    assert_eq!(value_array.value(3), 999, "id=4 should be updated to 999");
+
+    // id=5 (ASIA, 300): updated to 999
+    assert_eq!(id_array.value(4), 5);
+    assert_eq!(value_array.value(4), 999, "id=5 should be updated to 999");
+
+    Ok(())
+}
+
+/// Test UPDATE on table with year partition transform.
+/// Verifies that time-based partition transforms work correctly.
+#[tokio::test]
+async fn test_update_partitioned_year_transform() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_year".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema with date column for year partitioning
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "event_date", Type::Primitive(PrimitiveType::Date)).into(),
+            NestedField::required(3, "status", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    // Partition by year(event_date)
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "event_year", Transform::Year)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("year_partitioned_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across multiple years using DATE literals
+    // Days since epoch: 2022-01-15 = 19007, 2022-06-20 = 19163, 2023-03-10 = 19426, 2024-01-01 = 19723
+    ctx.sql(
+        "INSERT INTO catalog.test_update_year.year_partitioned_table VALUES \
+         (1, DATE '2022-01-15', 'pending'), \
+         (2, DATE '2022-06-20', 'pending'), \
+         (3, DATE '2023-03-10', 'pending'), \
+         (4, DATE '2024-01-01', 'pending')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "year_partitioned_table",
+    )
+    .await?;
+
+    // Update all rows to 'processed'
+    let update_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("status", lit("processed"))
+        .execute(&ctx.state())
+        .await
+        .expect("UPDATE on year-partitioned table should succeed");
+
+    assert_eq!(update_count, 4, "Should have updated 4 rows");
+
+    // Re-register catalog to pick up changes
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Verify all rows have 'processed' status
+    let df = ctx
+        .sql("SELECT id, status FROM catalog.test_update_year.year_partitioned_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 4);
+
+    let status_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    for i in 0..4 {
+        assert_eq!(
+            status_array.value(i),
+            "processed",
+            "Row {} should have status 'processed'",
+            i + 1
+        );
+    }
+
+    Ok(())
+}
+
+/// Test UPDATE with multiple partitions in a single file (data inserted together).
+/// This verifies the FanoutWriter correctly routes deletes to separate partition delete files.
+#[tokio::test]
+async fn test_update_partitioned_multiple_in_single_insert() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_multi_part".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "amount", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("multi_part_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert first batch: category A and B
+    ctx.sql(
+        "INSERT INTO catalog.test_update_multi_part.multi_part_table VALUES \
+         (1, 'A', 10), \
+         (2, 'B', 20)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Insert second batch: category A and C (A appears in both batches)
+    ctx.sql(
+        "INSERT INTO catalog.test_update_multi_part.multi_part_table VALUES \
+         (3, 'A', 30), \
+         (4, 'C', 40)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "multi_part_table",
+    )
+    .await?;
+
+    // Update all category 'A' rows (spans two different data files)
+    let update_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("amount", lit(999))
+        .filter(col("category").eq(lit("A")))
+        .execute(&ctx.state())
+        .await
+        .expect("UPDATE should succeed");
+
+    assert_eq!(update_count, 2, "Should have updated 2 rows in category A");
+
+    // Verify the updates
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    let df = ctx
+        .sql("SELECT id, category, amount FROM catalog.test_update_multi_part.multi_part_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let batch = &batches[0];
+    let amount_array = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+
+    // id=1 (A): updated to 999
+    assert_eq!(amount_array.value(0), 999, "id=1 should be updated");
+    // id=2 (B): NOT updated
+    assert_eq!(amount_array.value(1), 20, "id=2 should NOT be updated");
+    // id=3 (A): updated to 999
+    assert_eq!(amount_array.value(2), 999, "id=3 should be updated");
+    // id=4 (C): NOT updated
+    assert_eq!(amount_array.value(3), 40, "id=4 should NOT be updated");
+
+    Ok(())
+}
+
+/// Test UPDATE affecting all rows in a partitioned table (full table update).
+/// This stresses the FanoutWriter with all partitions being modified.
+#[tokio::test]
+async fn test_update_partitioned_full_table() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_part_full".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "processed", Type::Primitive(PrimitiveType::Boolean)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "region", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("full_part_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data into multiple partitions
+    ctx.sql(
+        "INSERT INTO catalog.test_update_part_full.full_part_table VALUES \
+         (1, 'US', false), \
+         (2, 'EU', false), \
+         (3, 'ASIA', false), \
+         (4, 'US', false)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "full_part_table",
+    )
+    .await?;
+
+    // Full table UPDATE (no filter) - all partitions affected
+    let update_count = provider
+        .update()
+        .await
+        .unwrap()
+        .set("processed", lit(true))
+        .execute(&ctx.state())
+        .await
+        .expect("Full table UPDATE should succeed");
+
+    assert_eq!(update_count, 4, "Should have updated all 4 rows");
+
+    // Verify
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Query all rows and verify processed column values directly
+    let df = ctx
+        .sql("SELECT id, processed FROM catalog.test_update_part_full.full_part_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 4);
+
+    let processed_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+        .unwrap();
+
+    for i in 0..4 {
+        assert!(processed_array.value(i), "Row {} should have processed=true", i + 1);
+    }
 
     Ok(())
 }

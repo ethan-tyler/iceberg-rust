@@ -890,6 +890,7 @@ mod tests {
             predicate: None,
             deletes: vec![pos_del, eq_del],
             partition: None,
+            partition_spec_id: None,
             partition_spec: None,
             name_mapping: None,
         };

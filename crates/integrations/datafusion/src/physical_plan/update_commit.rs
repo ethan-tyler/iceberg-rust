@@ -36,10 +36,13 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
-use iceberg::spec::{DataFile, deserialize_data_file_from_json};
+use iceberg::spec::{
+    DataFile, PartitionSpec, deserialize_data_file_from_json, extract_spec_id_from_data_file_json,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::Catalog;
+use std::collections::HashMap;
 
 use super::update::{UPDATE_COUNT_COL, UPDATE_DATA_FILES_COL, UPDATE_DELETE_FILES_COL};
 use crate::to_datafusion_error;
@@ -211,9 +214,17 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
         let count_schema = self.count_schema.clone();
         let baseline_snapshot_id = self.baseline_snapshot_id;
 
-        let spec_id = self.table.metadata().default_partition_spec_id();
-        let partition_type = self.table.metadata().default_partition_type().clone();
+        let default_spec_id = self.table.metadata().default_partition_spec_id();
         let current_schema = self.table.metadata().current_schema().clone();
+
+        // Build spec_id -> PartitionSpec lookup for partition evolution support.
+        // This allows deserialization of files written with different partition specs.
+        let partition_specs: HashMap<i32, Arc<PartitionSpec>> = self
+            .table
+            .metadata()
+            .partition_specs_iter()
+            .map(|spec| (spec.spec_id(), spec.clone()))
+            .collect();
 
         // Process the input and commit files
         let stream = futures::stream::once(async move {
@@ -281,10 +292,34 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                         ))
                     })?;
 
-                // Parse data files from newline-delimited JSON
+                // Parse data files from newline-delimited JSON with per-file partition type
                 for data_files_str in data_files_array.iter().flatten() {
                     for json_line in data_files_str.lines() {
                         if !json_line.trim().is_empty() {
+                            // Extract spec_id from JSON for partition evolution support
+                            let spec_id = extract_spec_id_from_data_file_json(
+                                json_line,
+                                default_spec_id,
+                            )
+                            .map_err(to_datafusion_error)?;
+
+                            // Look up partition type for this file's spec
+                            let partition_type = partition_specs
+                                .get(&spec_id)
+                                .ok_or_else(|| {
+                                    DataFusionError::External(Box::new(iceberg::Error::new(
+                                        iceberg::ErrorKind::DataInvalid,
+                                        format!(
+                                            "Partition spec {} not found for data file during commit. \
+                                             Available specs: {:?}",
+                                            spec_id,
+                                            partition_specs.keys().collect::<Vec<_>>()
+                                        ),
+                                    )))
+                                })?
+                                .partition_type(&current_schema)
+                                .map_err(to_datafusion_error)?;
+
                             let df = deserialize_data_file_from_json(
                                 json_line,
                                 spec_id,
@@ -297,10 +332,34 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     }
                 }
 
-                // Parse delete files from newline-delimited JSON
+                // Parse delete files from newline-delimited JSON with per-file partition type
                 for delete_files_str in delete_files_array.iter().flatten() {
                     for json_line in delete_files_str.lines() {
                         if !json_line.trim().is_empty() {
+                            // Extract spec_id from JSON for partition evolution support
+                            let spec_id = extract_spec_id_from_data_file_json(
+                                json_line,
+                                default_spec_id,
+                            )
+                            .map_err(to_datafusion_error)?;
+
+                            // Look up partition type for this file's spec
+                            let partition_type = partition_specs
+                                .get(&spec_id)
+                                .ok_or_else(|| {
+                                    DataFusionError::External(Box::new(iceberg::Error::new(
+                                        iceberg::ErrorKind::DataInvalid,
+                                        format!(
+                                            "Partition spec {} not found for delete file during commit. \
+                                             Available specs: {:?}",
+                                            spec_id,
+                                            partition_specs.keys().collect::<Vec<_>>()
+                                        ),
+                                    )))
+                                })?
+                                .partition_type(&current_schema)
+                                .map_err(to_datafusion_error)?;
+
                             let df = deserialize_data_file_from_json(
                                 json_line,
                                 spec_id,
@@ -339,11 +398,22 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     .validate_no_conflicting_delete_files();
             }
 
-            let tx = action.apply(tx).map_err(to_datafusion_error)?;
+            let table_ident = table.identifier().to_string();
+            let tx = action.apply(tx).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "UPDATE failed on table '{}': failed to apply row delta action: {}",
+                    table_ident, e
+                ))
+            })?;
             let _updated_table = tx
                 .commit(catalog.as_ref())
                 .await
-                .map_err(to_datafusion_error)?;
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "UPDATE commit failed for table '{}' (baseline snapshot: {:?}): {}",
+                        table_ident, baseline_snapshot_id, e
+                    ))
+                })?;
 
             Self::make_count_batch(total_update_count)
         })
