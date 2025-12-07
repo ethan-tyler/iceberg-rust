@@ -30,4 +30,5 @@ pub mod table;
 pub use table::table_provider_factory::IcebergTableProviderFactory;
 pub use table::*;
 
+pub(crate) mod position_delete_task_writer;
 pub(crate) mod task_writer;

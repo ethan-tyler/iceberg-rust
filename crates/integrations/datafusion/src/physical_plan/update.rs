@@ -25,15 +25,29 @@
 //!
 //! The output is serialized JSON for both data files and delete files, which are
 //! then committed atomically by `IcebergUpdateCommitExec`.
+//!
+//! # Documentation
+//!
+//! See [`docs/datafusion-update/DESIGN.md`](../../../../../docs/datafusion-update/DESIGN.md)
+//! for architecture diagrams and detailed technical documentation.
+//!
+//! # Partition Evolution
+//!
+//! UPDATE operations support partition evolution. Each data file carries its original
+//! `partition_spec_id`, which is used to:
+//! 1. Look up the correct partition type for data file serialization
+//! 2. Construct the correct PartitionKey for position delete file writes
+//! 3. Ensure position delete files inherit the spec_id from their source data file
+//!
+//! See [ADR-002](../../../../../docs/datafusion-update/adr/ADR-002-partition-evolution.md)
+//! for the design rationale and implementation details.
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray,
-};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -50,7 +64,7 @@ use datafusion::prelude::{Expr, SessionContext};
 use futures::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataFileFormat, TableProperties, serialize_data_file_to_json};
+use iceberg::spec::{DataFileFormat, PartitionKey, Struct, TableProperties, serialize_data_file_to_json};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
@@ -61,11 +75,12 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use crate::position_delete_task_writer::PositionDeleteTaskWriter;
+use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
 
 /// Column name for serialized data files in output
@@ -298,7 +313,6 @@ async fn execute_update(
     }
 
     // Set up writers
-    let partition_type = table.metadata().default_partition_type().clone();
     let format_version = table.metadata().format_version();
     let file_io = table.file_io().clone();
 
@@ -309,7 +323,7 @@ async fn execute_update(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
 
-    // Create data file writer
+    // Create data file task writer (supports partitioned tables)
     let location_generator =
         DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
     let data_file_name_generator = DefaultFileNameGenerator::new(
@@ -329,14 +343,22 @@ async fn execute_update(
         data_file_name_generator,
     );
     let data_file_builder = DataFileWriterBuilder::new(data_rolling_writer);
-    let mut data_file_writer = data_file_builder
-        .build(None)
-        .await
-        .map_err(to_datafusion_error)?;
 
-    // Create position delete file writer
+    // Use TaskWriter for partition-aware data file writing
+    // Use computed partitions mode since UPDATE reads existing files without a _partition column
+    let iceberg_schema = table.metadata().current_schema().clone();
+    let data_partition_spec = table.metadata().default_partition_spec().clone();
+    let fanout_enabled = true; // Use fanout for unsorted partition data
+    let mut data_file_writer = TaskWriter::try_new_with_computed_partitions(
+        data_file_builder,
+        fanout_enabled,
+        iceberg_schema,
+        data_partition_spec,
+    )
+    .map_err(to_datafusion_error)?;
+
+    // Create position delete task writer (supports partitioned tables)
     let delete_config = PositionDeleteWriterConfig::new();
-    let delete_schema = delete_config.delete_schema().clone();
 
     // Build the Iceberg schema for position deletes
     let iceberg_delete_schema = Arc::new(
@@ -361,7 +383,7 @@ async fn execute_update(
     );
 
     let delete_parquet_writer =
-        ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema);
+        ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema.clone());
     let delete_file_name_generator = DefaultFileNameGenerator::new(
         format!("update-delete-{}", Uuid::now_v7()),
         None,
@@ -376,16 +398,64 @@ async fn execute_update(
     );
     let delete_file_builder =
         PositionDeleteFileWriterBuilder::new(delete_rolling_writer, delete_config.clone());
-    let mut delete_file_writer = delete_file_builder
-        .build(None)
-        .await
-        .map_err(to_datafusion_error)?;
+
+    // Get default partition spec for constructing partition keys
+    let default_partition_spec = table.metadata().default_partition_spec().clone();
+
+    // Build spec_id -> PartitionSpec lookup for partition evolution support.
+    // This allows us to serialize each file's partition data using its correct partition type,
+    // even when the table has evolved partition specs.
+    let partition_specs: std::collections::HashMap<i32, std::sync::Arc<iceberg::spec::PartitionSpec>> =
+        table.metadata().partition_specs_iter()
+            .map(|spec| (spec.spec_id(), spec.clone()))
+            .collect();
+
+    let mut delete_task_writer = PositionDeleteTaskWriter::try_new(
+        delete_file_builder,
+        iceberg_delete_schema,
+        default_partition_spec.clone(),
+    )
+    .await
+    .map_err(to_datafusion_error)?;
 
     let mut total_count = 0u64;
+
+    // Get the current schema for PartitionKey construction
+    let current_schema = table.metadata().current_schema().clone();
 
     // Process each file
     for task in file_scan_tasks {
         let file_path = task.data_file_path().to_string();
+
+        // Construct partition key for this file using its original partition spec.
+        // This is critical for partition evolution: position delete files must inherit
+        // the spec_id from their source data file, not the table's current default spec.
+        let partition_key = {
+            let spec_id = task.partition_spec_id().unwrap_or(0);
+            let file_spec = partition_specs.get(&spec_id).ok_or_else(|| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    format!(
+                        "Partition spec {} not found for file '{}'. Available specs: {:?}. \
+                         This may indicate table metadata corruption or an unsupported partition evolution scenario.",
+                        spec_id,
+                        task.data_file_path(),
+                        partition_specs.keys().collect::<Vec<_>>()
+                    ),
+                )
+            }).map_err(to_datafusion_error)?;
+
+            if !file_spec.is_unpartitioned() {
+                let partition_data = task.partition.clone().unwrap_or_else(Struct::empty);
+                Some(PartitionKey::new(
+                    (**file_spec).clone(),
+                    current_schema.clone(),
+                    partition_data,
+                ))
+            } else {
+                None
+            }
+        };
 
         // Clear task predicate to read ALL rows for position tracking
         let mut task_without_predicate = task;
@@ -444,13 +514,8 @@ async fn execute_update(
                     .map_err(to_datafusion_error)?;
 
                 // Write position deletes for original rows
-                let delete_batch = make_position_delete_batch(
-                    &file_path,
-                    &positions,
-                    delete_schema.clone(),
-                )?;
-                delete_file_writer
-                    .write(delete_batch)
+                delete_task_writer
+                    .write(&file_path, &positions, partition_key.clone())
                     .await
                     .map_err(to_datafusion_error)?;
 
@@ -491,13 +556,8 @@ async fn execute_update(
                     .map_err(to_datafusion_error)?;
 
                 // Write position deletes for original rows
-                let delete_batch = make_position_delete_batch(
-                    &file_path,
-                    &positions,
-                    delete_schema.clone(),
-                )?;
-                delete_file_writer
-                    .write(delete_batch)
+                delete_task_writer
+                    .write(&file_path, &positions, partition_key.clone())
                     .await
                     .map_err(to_datafusion_error)?;
 
@@ -513,21 +573,66 @@ async fn execute_update(
         .close()
         .await
         .map_err(to_datafusion_error)?;
-    let delete_files = delete_file_writer
+    let delete_files = delete_task_writer
         .close()
         .await
         .map_err(to_datafusion_error)?;
 
-    // Serialize to JSON
+    // Serialize to JSON with per-file partition type lookup for partition evolution support.
+    // Each file may have been written with a different partition spec, so we look up the
+    // correct partition type based on the file's partition_spec_id.
+    //
+    // Note: We derive partition_type using current_schema. This is correct because:
+    // 1. Iceberg guarantees field IDs are stable across schema evolution
+    // 2. Partition specs reference source_id which must exist in the current schema
+    // 3. If a field was dropped from the schema but is still referenced by an old spec,
+    //    partition_type() will return an error (which is the correct behavior)
     let data_files_json: Vec<String> = data_files
         .into_iter()
-        .map(|df| serialize_data_file_to_json(df, &partition_type, format_version))
+        .map(|df| {
+            let spec_id = df.partition_spec_id_or_default();
+            let ptype = partition_specs
+                .get(&spec_id)
+                .ok_or_else(|| {
+                    iceberg::Error::new(
+                        iceberg::ErrorKind::DataInvalid,
+                        format!(
+                            "Partition spec {} not found in table metadata. \
+                             Available specs: {:?}. This may indicate corrupted \
+                             table metadata or a file written with an incompatible version.",
+                            spec_id,
+                            partition_specs.keys().collect::<Vec<_>>()
+                        ),
+                    )
+                })?
+                .partition_type(&current_schema)?;
+            serialize_data_file_to_json(df, &ptype, format_version)
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_datafusion_error)?;
 
+    // Delete files inherit partition spec from their source data file.
+    // The position delete writer sets the correct partition_spec_id on each delete file.
     let delete_files_json: Vec<String> = delete_files
         .into_iter()
-        .map(|df| serialize_data_file_to_json(df, &partition_type, format_version))
+        .map(|df| {
+            let spec_id = df.partition_spec_id_or_default();
+            let ptype = partition_specs
+                .get(&spec_id)
+                .ok_or_else(|| {
+                    iceberg::Error::new(
+                        iceberg::ErrorKind::DataInvalid,
+                        format!(
+                            "Partition spec {} not found in table metadata for delete file. \
+                             Available specs: {:?}.",
+                            spec_id,
+                            partition_specs.keys().collect::<Vec<_>>()
+                        ),
+                    )
+                })?
+                .partition_type(&current_schema)?;
+            serialize_data_file_to_json(df, &ptype, format_version)
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_datafusion_error)?;
 
@@ -651,26 +756,6 @@ fn transform_batch(
         DataFusionError::ArrowError(
             Box::new(e),
             Some("Failed to create transformed batch".to_string()),
-        )
-    })
-}
-
-/// Creates a position delete batch for the given file path and positions.
-fn make_position_delete_batch(
-    file_path: &str,
-    positions: &[i64],
-    schema: ArrowSchemaRef,
-) -> DFResult<RecordBatch> {
-    use datafusion::error::DataFusionError;
-
-    let file_paths: Vec<&str> = vec![file_path; positions.len()];
-    let file_path_array = Arc::new(StringArray::from(file_paths)) as ArrayRef;
-    let pos_array = Arc::new(Int64Array::from(positions.to_vec())) as ArrayRef;
-
-    RecordBatch::try_new(schema, vec![file_path_array, pos_array]).map_err(|e| {
-        DataFusionError::ArrowError(
-            Box::new(e),
-            Some("Failed to create position delete batch".to_string()),
         )
     })
 }

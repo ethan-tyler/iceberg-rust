@@ -188,8 +188,15 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let table = self.table.clone();
-        let partition_type = table.metadata().default_partition_type().clone();
         let format_version = table.metadata().format_version();
+        // Build spec_id -> PartitionSpec lookup for partition evolution support.
+        // Currently DELETE only supports unpartitioned tables, but this prepares
+        // for future support and maintains consistency with UPDATE.
+        let partition_specs: std::collections::HashMap<i32, std::sync::Arc<iceberg::spec::PartitionSpec>> =
+            table.metadata().partition_specs_iter()
+                .map(|spec| (spec.spec_id(), spec.clone()))
+                .collect();
+        let current_schema = table.metadata().current_schema().clone();
         let result_schema = self.result_schema.clone();
 
         // Get input stream of (file_path, pos) tuples
@@ -339,11 +346,32 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             // Close the writer and get the delete files
             let delete_files = delete_writer.close().await.map_err(to_datafusion_error)?;
 
-            // Serialize delete files to JSON
+            // Serialize delete files to JSON with per-file partition type lookup.
+            // Each file may have been written with a different partition spec.
+            //
+            // Note: We derive partition_type using current_schema. This is correct because
+            // Iceberg guarantees field IDs are stable across schema evolution.
             let delete_files_json: Vec<String> = delete_files
                 .into_iter()
                 .map(|df| {
-                    serialize_data_file_to_json(df, &partition_type, format_version)
+                    let spec_id = df.partition_spec_id_or_default();
+                    let ptype = partition_specs
+                        .get(&spec_id)
+                        .ok_or_else(|| {
+                            iceberg::Error::new(
+                                iceberg::ErrorKind::DataInvalid,
+                                format!(
+                                    "Partition spec {} not found in table metadata for delete file. \
+                                     Available specs: {:?}.",
+                                    spec_id,
+                                    partition_specs.keys().collect::<Vec<_>>()
+                                ),
+                            )
+                        })
+                        .map_err(to_datafusion_error)?
+                        .partition_type(&current_schema)
+                        .map_err(to_datafusion_error)?;
+                    serialize_data_file_to_json(df, &ptype, format_version)
                         .map_err(to_datafusion_error)
                 })
                 .collect::<DFResult<Vec<String>>>()?;

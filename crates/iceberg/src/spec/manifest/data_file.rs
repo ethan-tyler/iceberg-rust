@@ -284,6 +284,34 @@ impl DataFile {
     pub fn content_size_in_bytes(&self) -> Option<i64> {
         self.content_size_in_bytes
     }
+
+    /// Get the partition spec ID for this data file.
+    ///
+    /// Returns `Some(spec_id)` indicating which partition spec was used when
+    /// this file was written. This is critical for partition evolution scenarios
+    /// where different files may use different partition specs.
+    ///
+    /// # Notes
+    ///
+    /// - For files read from manifests, this returns the manifest-level spec ID
+    ///   (V1) or per-entry spec ID (V2+).
+    /// - For programmatically constructed DataFiles, defaults to 0 if not set.
+    /// - This method always returns `Some` since the internal field defaults to 0.
+    ///   Use [`partition_spec_id_or_default`] if you prefer a direct `i32`.
+    #[must_use]
+    pub fn partition_spec_id(&self) -> Option<i32> {
+        Some(self.partition_spec_id)
+    }
+
+    /// Get the partition spec ID, defaulting to 0 if not explicitly set.
+    ///
+    /// This is equivalent to `partition_spec_id().unwrap_or(0)` but more direct.
+    /// For unpartitioned tables or files written before partition evolution,
+    /// spec ID 0 is the standard default.
+    #[must_use]
+    pub fn partition_spec_id_or_default(&self) -> i32 {
+        self.partition_spec_id
+    }
 }
 
 /// Convert data files to avro bytes and write to writer.
@@ -413,7 +441,8 @@ impl std::fmt::Display for DataFileFormat {
 
 #[cfg(test)]
 mod test {
-    use crate::spec::DataContentType;
+    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, DEFAULT_PARTITION_SPEC_ID};
+
     #[test]
     fn test_data_content_type_default() {
         assert_eq!(DataContentType::default(), DataContentType::Data);
@@ -422,5 +451,84 @@ mod test {
     #[test]
     fn test_data_content_type_default_value() {
         assert_eq!(DataContentType::default() as i32, 0);
+    }
+
+    #[test]
+    fn test_partition_spec_id_returns_default_when_not_set() {
+        // DataFile with default partition_spec_id (not explicitly set)
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/table/data/file.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .build()
+            .unwrap();
+
+        // partition_spec_id() should return Some(0) as default
+        assert_eq!(data_file.partition_spec_id(), Some(DEFAULT_PARTITION_SPEC_ID));
+        assert_eq!(data_file.partition_spec_id_or_default(), DEFAULT_PARTITION_SPEC_ID);
+    }
+
+    #[test]
+    fn test_partition_spec_id_returns_explicit_value() {
+        // DataFile with explicitly set partition_spec_id
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/table/data/file.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .partition_spec_id(42)
+            .build()
+            .unwrap();
+
+        assert_eq!(data_file.partition_spec_id(), Some(42));
+        assert_eq!(data_file.partition_spec_id_or_default(), 42);
+    }
+
+    #[test]
+    fn test_partition_spec_id_explicit_zero() {
+        // DataFile with explicitly set partition_spec_id = 0
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/table/data/file.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(100)
+            .file_size_in_bytes(1024)
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        // Even when explicitly set to 0, it should return Some(0)
+        assert_eq!(data_file.partition_spec_id(), Some(0));
+        assert_eq!(data_file.partition_spec_id_or_default(), 0);
+    }
+
+    #[test]
+    fn test_partition_spec_id_different_values() {
+        // Test multiple spec IDs to ensure correct propagation
+        for spec_id in [0, 1, 5, 100, i32::MAX] {
+            let data_file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("s3://bucket/table/data/file.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .record_count(100)
+                .file_size_in_bytes(1024)
+                .partition_spec_id(spec_id)
+                .build()
+                .unwrap();
+
+            assert_eq!(
+                data_file.partition_spec_id(),
+                Some(spec_id),
+                "partition_spec_id should return {spec_id}"
+            );
+            assert_eq!(
+                data_file.partition_spec_id_or_default(),
+                spec_id,
+                "partition_spec_id_or_default should return {spec_id}"
+            );
+        }
     }
 }

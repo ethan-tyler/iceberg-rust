@@ -87,6 +87,16 @@ pub struct FileScanTask {
     #[serde(deserialize_with = "deserialize_not_implemented")]
     pub partition: Option<Struct>,
 
+    /// The partition spec ID for this file's partition data.
+    ///
+    /// Used to look up the correct partition type when serializing data files
+    /// in tables with partition evolution. This enables UPDATE/DELETE operations
+    /// to correctly serialize position delete files with the same partition spec
+    /// as the source data file.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_spec_id: Option<i32>,
+
     /// The partition spec for this file, used to distinguish identity transforms
     /// (which use partition metadata constants) from non-identity transforms like
     /// bucket/truncate (which must read source columns from the data file).
@@ -131,6 +141,14 @@ impl FileScanTask {
     pub fn schema_ref(&self) -> SchemaRef {
         self.schema.clone()
     }
+
+    /// Returns the partition spec ID for this file, if available.
+    ///
+    /// This is used in partition evolution scenarios to look up the correct
+    /// partition type when serializing data files.
+    pub fn partition_spec_id(&self) -> Option<i32> {
+        self.partition_spec_id
+    }
 }
 
 #[derive(Debug)]
@@ -164,4 +182,91 @@ pub struct FileScanTaskDeleteFile {
 
     /// equality ids for equality deletes (null for anything other than equality-deletes)
     pub equality_ids: Option<Vec<i32>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )
+                .into()])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_file_scan_task_partition_spec_id_none() {
+        let task = FileScanTask {
+            start: 0,
+            length: 1024,
+            record_count: Some(100),
+            data_file_path: "s3://bucket/table/data/file.parquet".to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: test_schema(),
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec_id: None,
+            partition_spec: None,
+            name_mapping: None,
+        };
+
+        assert_eq!(task.partition_spec_id(), None);
+    }
+
+    #[test]
+    fn test_file_scan_task_partition_spec_id_some() {
+        let task = FileScanTask {
+            start: 0,
+            length: 1024,
+            record_count: Some(100),
+            data_file_path: "s3://bucket/table/data/file.parquet".to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: test_schema(),
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec_id: Some(5),
+            partition_spec: None,
+            name_mapping: None,
+        };
+
+        assert_eq!(task.partition_spec_id(), Some(5));
+    }
+
+    #[test]
+    fn test_file_scan_task_partition_spec_id_zero() {
+        // Test that spec_id 0 is properly preserved
+        let task = FileScanTask {
+            start: 0,
+            length: 1024,
+            record_count: Some(100),
+            data_file_path: "s3://bucket/table/data/file.parquet".to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: test_schema(),
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec_id: Some(0),
+            partition_spec: None,
+            name_mapping: None,
+        };
+
+        assert_eq!(task.partition_spec_id(), Some(0));
+    }
 }

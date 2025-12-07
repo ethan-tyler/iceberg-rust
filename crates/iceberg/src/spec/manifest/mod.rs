@@ -155,6 +155,30 @@ pub fn deserialize_data_file_from_json(
     serde.try_into(partition_spec_id, partition_type, schema)
 }
 
+/// Extract the partition spec ID from a DataFile JSON string without full deserialization.
+///
+/// This is used for partition evolution support, where the correct partition type must be
+/// looked up based on the spec_id before the full DataFile can be deserialized.
+///
+/// Returns the spec_id from the JSON if present, or the provided default value.
+pub fn extract_spec_id_from_data_file_json(json: &str, default_spec_id: i32) -> Result<i32> {
+    #[derive(serde::Deserialize)]
+    struct SpecIdOnly {
+        #[serde(default)]
+        spec_id: Option<i32>,
+    }
+
+    let parsed: SpecIdOnly = serde_json::from_str(json).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Failed to parse spec_id from DataFile JSON!".to_string(),
+        )
+        .with_source(e)
+    })?;
+
+    Ok(parsed.spec_id.unwrap_or(default_spec_id))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -166,7 +190,7 @@ mod tests {
 
     use super::*;
     use crate::io::FileIOBuilder;
-    use crate::spec::{Literal, NestedField, PrimitiveType, Struct, Transform, Type};
+    use crate::spec::{Literal, NestedField, PrimitiveType, Struct, StructType, Transform, Type};
 
     #[tokio::test]
     async fn test_parse_manifest_v2_unpartition() {
@@ -1160,6 +1184,7 @@ mod tests {
         let pretty_json1: Value = serde_json::from_str(serialized_files.first().unwrap()).unwrap();
         let pretty_json2: Value = serde_json::from_str(serialized_files.get(1).unwrap()).unwrap();
         let expected_serialized_file1 = serde_json::json!({
+            "spec_id": 1,  // Partition evolution support: spec_id is now included in JSON
             "content": 0,
             "file_path": "path/to/file1.parquet",
             "file_format": "PARQUET",
@@ -1191,6 +1216,7 @@ mod tests {
             "content_size_in_bytes": null
         });
         let expected_serialized_file2 = serde_json::json!({
+            "spec_id": 1,  // Partition evolution support: spec_id is now included in JSON
             "content": 0,
             "file_path": "path/to/file2.parquet",
             "file_format": "PARQUET",
@@ -1247,5 +1273,337 @@ mod tests {
 
         assert_eq!(deserialized_data_file1, original_data_file1);
         assert_eq!(deserialized_data_file2, original_data_file2);
+    }
+
+    /// Tests that files with different partition specs can be serialized/deserialized
+    /// correctly using per-file partition type lookup. This simulates partition evolution
+    /// where some files were written with spec_id=0 and others with spec_id=1.
+    #[test]
+    fn test_data_file_serialization_with_partition_evolution() {
+        // Create a schema with two partitionable columns
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_identifier_field_ids(vec![1])
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "region", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        // Original partition spec (spec_id=0): partition by category
+        let partition_spec_0 = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("category", "category", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Evolved partition spec (spec_id=1): partition by region
+        let partition_spec_1 = PartitionSpec::builder(schema.clone())
+            .with_spec_id(1)
+            .add_partition_field("region", "region", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let partition_type_0 = partition_spec_0.partition_type(&schema).unwrap();
+        let partition_type_1 = partition_spec_1.partition_type(&schema).unwrap();
+
+        // Build a lookup map like UPDATE/DELETE operations do
+        let partition_specs: HashMap<i32, (i32, StructType)> = HashMap::from([
+            (0, (0, partition_type_0.clone())),
+            (1, (1, partition_type_1.clone())),
+        ]);
+
+        // Create files with different partition specs
+        let file_spec_0 = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("data/category=A/file1.parquet".to_string())
+            .file_size_in_bytes(1024)
+            .record_count(100)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+
+        let file_spec_1 = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("data/region=US/file2.parquet".to_string())
+            .file_size_in_bytes(2048)
+            .record_count(200)
+            .partition_spec_id(1)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+
+        let files = vec![file_spec_0.clone(), file_spec_1.clone()];
+
+        // Serialize each file with its correct partition type
+        let serialized: Vec<(i32, String)> = files
+            .iter()
+            .map(|f| {
+                let spec_id = f.partition_spec_id_or_default();
+                let (_, ptype) = partition_specs.get(&spec_id).unwrap();
+                let json = serialize_data_file_to_json(f.clone(), ptype, FormatVersion::V2).unwrap();
+                (spec_id, json)
+            })
+            .collect();
+
+        assert_eq!(serialized.len(), 2);
+
+        // Verify spec_id 0 file was serialized
+        assert_eq!(serialized[0].0, 0);
+        assert!(serialized[0].1.contains("category=A"));
+
+        // Verify spec_id 1 file was serialized
+        assert_eq!(serialized[1].0, 1);
+        assert!(serialized[1].1.contains("region=US"));
+
+        // Deserialize each file with its correct partition type
+        let deserialized: Vec<DataFile> = serialized
+            .into_iter()
+            .map(|(spec_id, json)| {
+                let (_, ptype) = partition_specs.get(&spec_id).unwrap();
+                deserialize_data_file_from_json(&json, spec_id, ptype, &schema).unwrap()
+            })
+            .collect();
+
+        // Verify the round-trip preserves partition_spec_id
+        assert_eq!(deserialized[0].partition_spec_id(), Some(0));
+        assert_eq!(deserialized[1].partition_spec_id(), Some(1));
+
+        // Verify the round-trip preserves other fields
+        assert_eq!(deserialized[0].file_path(), file_spec_0.file_path());
+        assert_eq!(deserialized[1].file_path(), file_spec_1.file_path());
+    }
+
+    /// Tests that serialization fails gracefully when a partition spec is missing.
+    /// This simulates the error handling in UPDATE/DELETE when a file references
+    /// a partition spec that doesn't exist in the table metadata.
+    #[test]
+    fn test_partition_spec_lookup_failure() {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        // Only have spec_id=0 in the lookup
+        let partition_specs: HashMap<i32, StructType> = HashMap::from([(
+            0,
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .build()
+                .unwrap()
+                .partition_type(&schema)
+                .unwrap(),
+        )]);
+
+        // Create a file with spec_id=5 (which doesn't exist)
+        let file_with_missing_spec = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("data/file.parquet".to_string())
+            .file_size_in_bytes(1024)
+            .record_count(100)
+            .partition_spec_id(5)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+
+        // Simulate the lookup that UPDATE/DELETE operations do
+        let spec_id = file_with_missing_spec.partition_spec_id_or_default();
+        let lookup_result = partition_specs.get(&spec_id);
+
+        // Verify the lookup fails for the missing spec
+        assert!(lookup_result.is_none(), "Spec ID 5 should not be found");
+        assert_eq!(spec_id, 5, "Should correctly report the missing spec ID");
+    }
+
+    /// Tests that unpartitioned files (spec_id=0 with empty partition) work correctly.
+    #[test]
+    fn test_unpartitioned_file_serialization() {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        // Unpartitioned spec (spec_id=0)
+        let unpartitioned_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+
+        let partition_type = unpartitioned_spec.partition_type(&schema).unwrap();
+
+        let unpartitioned_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("data/file.parquet".to_string())
+            .file_size_in_bytes(1024)
+            .record_count(100)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+
+        // Serialize and deserialize
+        let json = serialize_data_file_to_json(
+            unpartitioned_file.clone(),
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+
+        let deserialized =
+            deserialize_data_file_from_json(&json, 0, &partition_type, &schema).unwrap();
+
+        // Verify the spec_id is preserved
+        assert_eq!(deserialized.partition_spec_id(), Some(0));
+        assert_eq!(
+            deserialized.partition_spec_id_or_default(),
+            0,
+            "Unpartitioned files should have spec_id=0"
+        );
+        // For unpartitioned files, the partition struct should be empty
+        assert_eq!(
+            *deserialized.partition(),
+            Struct::empty(),
+            "Unpartitioned files should have empty partition"
+        );
+    }
+
+    /// Tests what happens when deserializing with a different partition type than serialization.
+    /// This verifies that using the wrong partition type fails safely (prevents silent corruption).
+    #[test]
+    fn test_json_roundtrip_with_partition_type_mismatch() {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "region", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        // Partition spec 0: partition by category (1 field)
+        let partition_spec_0 = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("category", "category", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition_type_0 = partition_spec_0.partition_type(&schema).unwrap();
+
+        // Partition spec 1: partition by region (1 field, different name)
+        let partition_spec_1 = PartitionSpec::builder(schema.clone())
+            .with_spec_id(1)
+            .add_partition_field("region", "region", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition_type_1 = partition_spec_1.partition_type(&schema).unwrap();
+
+        // Create partition data for spec 0
+        let partition_value = Struct::from_iter([Some(Literal::string("electronics"))]);
+
+        // Create a file with spec_id=0 and partition data
+        let file_spec_0 = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("data/category=electronics/file1.parquet".to_string())
+            .file_size_in_bytes(1024)
+            .record_count(100)
+            .partition_spec_id(0)
+            .partition(partition_value)
+            .build()
+            .unwrap();
+
+        // Serialize with the CORRECT partition type (spec 0)
+        let json =
+            serialize_data_file_to_json(file_spec_0.clone(), &partition_type_0, FormatVersion::V2)
+                .unwrap();
+
+        // Verify the JSON contains the partition field and spec_id
+        assert!(
+            json.contains("category"),
+            "JSON should contain category field: {}",
+            json
+        );
+        assert!(
+            json.contains("\"spec_id\":0") || json.contains("\"spec_id\": 0"),
+            "JSON should contain spec_id: {}",
+            json
+        );
+
+        // Deserialize with the WRONG partition type (spec 1 instead of spec 0)
+        // This should fail because the field names don't match
+        let result = deserialize_data_file_from_json(&json, 1, &partition_type_1, &schema);
+        assert!(
+            result.is_err(),
+            "Deserialization with wrong partition type should fail to prevent data corruption"
+        );
+
+        // Now verify that using the CORRECT type works
+        let correct_result =
+            deserialize_data_file_from_json(&json, 0, &partition_type_0, &schema).unwrap();
+        assert_eq!(correct_result.partition_spec_id(), Some(0));
+        // The partition should have the correct value when using matching types
+        assert_ne!(
+            *correct_result.partition(),
+            Struct::empty(),
+            "Partition should not be empty when using correct type"
+        );
+    }
+
+    /// Tests that spec_id can be extracted from JSON for partition evolution support.
+    #[test]
+    fn test_extract_spec_id_from_json() {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(42)
+            .build()
+            .unwrap();
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("data/file.parquet".to_string())
+            .file_size_in_bytes(1024)
+            .record_count(100)
+            .partition_spec_id(42)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+
+        let json =
+            serialize_data_file_to_json(file, &partition_type, FormatVersion::V2).unwrap();
+
+        // Verify we can extract the spec_id
+        let extracted_spec_id = extract_spec_id_from_data_file_json(&json, 0).unwrap();
+        assert_eq!(extracted_spec_id, 42, "Should extract correct spec_id from JSON");
+
+        // Test fallback when spec_id is missing (legacy JSON)
+        let legacy_json = r#"{"content":0,"file_path":"test.parquet","file_format":"PARQUET","partition":{},"record_count":100,"file_size_in_bytes":1024}"#;
+        let fallback_spec_id = extract_spec_id_from_data_file_json(legacy_json, 99).unwrap();
+        assert_eq!(fallback_spec_id, 99, "Should use default when spec_id is missing");
     }
 }

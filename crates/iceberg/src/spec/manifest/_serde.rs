@@ -99,6 +99,11 @@ impl ManifestEntryV1 {
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub(super) struct DataFileSerde {
+    /// Partition spec ID for this file. Used during deserialization to look up the correct
+    /// partition type in tables with partition evolution.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec_id: Option<i32>,
     #[serde(default)]
     content: i32,
     file_path: String,
@@ -136,6 +141,8 @@ impl DataFileSerde {
             None
         };
         Ok(Self {
+            // Include spec_id for partition evolution support during deserialization
+            spec_id: value.partition_spec_id(),
             content: value.content as i32,
             file_path: value.file_path,
             file_format: value.file_format.to_string().to_ascii_uppercase(),
@@ -225,7 +232,9 @@ impl DataFileSerde {
             split_offsets: self.split_offsets.unwrap_or_default(),
             equality_ids: self.equality_ids,
             sort_order_id: self.sort_order_id,
-            partition_spec_id,
+            // Prefer spec_id from JSON if present (partition evolution support),
+            // fall back to parameter for backward compatibility with older JSON format
+            partition_spec_id: self.spec_id.unwrap_or(partition_spec_id),
             first_row_id: self.first_row_id,
             referenced_data_file: self.referenced_data_file,
             content_offset: self.content_offset,
@@ -459,6 +468,7 @@ mod tests {
             status: 1, // Added
             snapshot_id: 12345,
             data_file: DataFileSerde {
+                spec_id: None, // V1 doesn't have spec_id in JSON
                 content: 0, // DataFileSerde is shared between V1/V2
                 file_path: "test/path.parquet".to_string(),
                 file_format: "PARQUET".to_string(),
@@ -540,6 +550,7 @@ mod tests {
         // Create a DataFileSerde that simulates V1 deserialization behavior
         // (missing V2 fields would be None due to #[serde(default)])
         let v1_style_data_file = DataFileSerde {
+            spec_id: None, // V1 doesn't have spec_id in JSON
             content: 0, // V1 doesn't have this field, defaults to 0 via #[serde(default)]
             file_path: "test/data.parquet".to_string(),
             file_format: "PARQUET".to_string(),
