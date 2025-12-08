@@ -17,15 +17,23 @@
 
 //! DELETE operation support for Iceberg tables in DataFusion.
 //!
-//! This module provides programmatic DELETE operations for Iceberg tables. Note that
-//! direct SQL DELETE statements (`DELETE FROM table WHERE ...`) are not yet supported
-//! by DataFusion's TableProvider interface.
+//! This module provides both programmatic and SQL DELETE operations for Iceberg tables.
 //!
-//! # Current Limitations
+//! # SQL DELETE Support
 //!
-//! DataFusion does not currently have a `delete_from` method in the `TableProvider` trait,
-//! so DELETE SQL statements cannot be intercepted at the table provider level. This is
-//! tracked in [DataFusion issue #12406](https://github.com/apache/datafusion/issues/12406).
+//! SQL DELETE statements are supported via `IcebergTableProvider`:
+//!
+//! ```sql
+//! DELETE FROM catalog.namespace.table WHERE id = 42;
+//! DELETE FROM catalog.namespace.table; -- deletes all rows
+//! ```
+//!
+//! # Known Limitations
+//!
+//! - **Partition evolution**: DELETE on tables with multiple partition specs (partition
+//!   evolution) returns `NotImplemented`. This guard prevents producing incorrect delete
+//!   files that would use the wrong partition spec.
+//! - **V1 tables**: Position deletes require Iceberg format version 2.
 //!
 //! # Usage
 //!
@@ -79,12 +87,6 @@
 //!
 //! 3. **IcebergDeleteCommitExec**: Commits the delete files to the table using
 //!    the `DeleteAction` transaction.
-//!
-//! # Future Work
-//!
-//! When DataFusion adds native DELETE support (likely via a `delete_from` method on
-//! `TableProvider`), this module can be updated to intercept SQL DELETE statements
-//! and route them through the existing execution plan infrastructure.
 
 use std::sync::Arc;
 
@@ -154,31 +156,41 @@ pub async fn delete_from_table(
 
 /// Parses a SQL WHERE clause string into a DataFusion expression.
 ///
-/// This is a helper function for cases where you have a predicate as a string
-/// rather than a constructed expression. Note that this requires the expression
-/// to be compatible with the table's schema.
+/// # Deprecation Notice
+///
+/// **This function is deprecated** and always returns `NotImplemented`.
+/// It will be removed in a future release.
+///
+/// **Use instead**: Construct predicates programmatically using DataFusion's
+/// `col()` and `lit()` functions from `datafusion::prelude`:
+///
+/// ```rust,ignore
+/// use datafusion::prelude::{col, lit};
+///
+/// // Instead of: parse_predicate("id = 42")
+/// let predicate = col("id").eq(lit(42));
+///
+/// // Instead of: parse_predicate("status = 'active' AND age > 18")
+/// let predicate = col("status").eq(lit("active")).and(col("age").gt(lit(18)));
+/// ```
+///
+/// # Why Deprecated?
+///
+/// Proper SQL parsing requires schema context which is not available at parse time.
+/// The programmatic approach with `col()` and `lit()` is type-safe and doesn't
+/// require schema resolution.
 ///
 /// # Arguments
 ///
 /// * `where_clause` - The WHERE clause without the "WHERE" keyword
-///   (e.g., "id = 42" not "WHERE id = 42")
 ///
 /// # Returns
 ///
-/// A parsed `Expr` that can be passed to `delete_from_table()`.
-///
-/// # Errors
-///
-/// Returns an error if the expression cannot be parsed.
-///
-/// # Example
-///
-/// ```ignore
-/// use iceberg_datafusion::delete::{parse_predicate, delete_from_table};
-///
-/// let predicate = parse_predicate("status = 'deleted' AND updated_at < '2024-01-01'")?;
-/// let deleted = delete_from_table(&catalog, &table_ident, &session, Some(predicate)).await?;
-/// ```
+/// Always returns `Err(DataFusionError::NotImplemented(...))`.
+#[deprecated(
+    since = "0.5.0",
+    note = "Use DataFusion's col() and lit() functions to construct predicates. Example: col(\"id\").eq(lit(42))"
+)]
 pub fn parse_predicate(where_clause: &str) -> DFResult<Expr> {
     use datafusion::sql::parser::DFParser;
     use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -226,8 +238,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
     fn test_parse_predicate_not_implemented() {
         // This tests that parse_predicate correctly returns NotImplemented
+        // Note: parse_predicate is deprecated; use col() and lit() instead
         let result = parse_predicate("id = 42");
         assert!(result.is_err());
 

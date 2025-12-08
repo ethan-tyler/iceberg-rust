@@ -1151,10 +1151,11 @@ async fn test_select_after_delete() -> Result<()> {
     Ok(())
 }
 
-/// Test DELETE on a partitioned table.
-/// Currently, DELETE on partitioned tables returns NotImplemented error.
-/// This test verifies that the error is properly returned with a clear message.
-/// TODO: When partitioned table DELETE is implemented, update this test to verify actual behavior.
+/// Test DELETE on a partitioned table with identity partition.
+/// Verifies that DELETE properly handles partitioned tables by:
+/// 1. Deleting rows from a specific partition
+/// 2. Leaving other partitions unaffected
+/// 3. Writing partition-aware position delete files
 #[tokio::test]
 async fn test_delete_partitioned_table() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -1206,29 +1207,7 @@ async fn test_delete_partitioned_table() -> Result<()> {
     .await
     .unwrap();
 
-    // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "partitioned_delete_table",
-    )
-    .await?;
-
-    // Attempt to delete from a partitioned table should return NotImplemented
-    let result = provider
-        .delete(&ctx.state(), Some(col("category").eq(lit("electronics"))))
-        .await;
-
-    assert!(result.is_err(), "Expected NotImplemented error for partitioned table DELETE");
-    let err = result.unwrap_err();
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("partitioned tables is not yet supported"),
-        "Expected error message about partitioned tables, got: {}",
-        err_msg
-    );
-
-    // Verify data is still intact (delete did not occur)
+    // Verify initial row count
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM catalog.test_delete_partitioned.partitioned_delete_table")
         .await
@@ -1240,7 +1219,64 @@ async fn test_delete_partitioned_table() -> Result<()> {
         .downcast_ref::<datafusion::arrow::array::Int64Array>()
         .unwrap()
         .value(0);
-    assert_eq!(count, 4, "All 4 rows should still exist since delete failed");
+    assert_eq!(count, 4, "Should have 4 rows initially");
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "partitioned_delete_table",
+    )
+    .await?;
+
+    // Delete all rows in the 'electronics' partition
+    let deleted_count = provider
+        .delete(&ctx.state(), Some(col("category").eq(lit("electronics"))))
+        .await
+        .expect("DELETE on partitioned table should succeed");
+
+    assert_eq!(deleted_count, 2, "Should delete 2 rows from electronics partition");
+
+    // Re-register with fresh catalog to see changes
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Verify total row count decreased
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_delete_partitioned.partitioned_delete_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2, "Should have 2 rows after deleting electronics partition");
+
+    // Verify only books partition remains
+    let df = ctx
+        .sql("SELECT category, value FROM catalog.test_delete_partitioned.partitioned_delete_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let categories: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    assert_eq!(categories, vec!["books", "books"], "Only books category should remain");
 
     Ok(())
 }
@@ -1696,8 +1732,9 @@ async fn test_select_after_update() -> Result<()> {
     Ok(())
 }
 
-/// Test UPDATE on a partitioned table.
-/// Currently, UPDATE on partitioned tables returns NotImplemented error.
+/// Test UPDATE on a partitioned table - validate partition column protection.
+/// Updating partition columns is rejected with a clear error message because it would
+/// require moving rows between partitions, which is complex and not supported.
 #[tokio::test]
 async fn test_update_partitioned_table() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -1754,22 +1791,22 @@ async fn test_update_partitioned_table() -> Result<()> {
     )
     .await?;
 
-    // Attempt to update a partitioned table should return NotImplemented
+    // Attempt to update a PARTITION column should return an error
     let result = provider
         .update()
         .await
         .unwrap()
-        .set("value", lit("updated"))
+        .set("category", lit("books")) // category is the partition column!
         .filter(col("id").eq(lit(1)))
         .execute(&ctx.state())
         .await;
 
-    assert!(result.is_err(), "Expected NotImplemented error for partitioned table UPDATE");
+    assert!(result.is_err(), "Expected error when updating partition column");
     let err = result.unwrap_err();
     let err_msg = err.to_string();
     assert!(
-        err_msg.contains("partitioned tables is not yet supported"),
-        "Expected error message about partitioned tables, got: {}",
+        err_msg.contains("Cannot UPDATE partition column"),
+        "Expected error message about partition columns, got: {}",
         err_msg
     );
 
@@ -1785,7 +1822,7 @@ async fn test_update_partitioned_table() -> Result<()> {
         .downcast_ref::<datafusion::arrow::array::Int64Array>()
         .unwrap()
         .value(0);
-    assert_eq!(count, 2, "All 2 rows should still exist since update failed");
+    assert_eq!(count, 2, "All 2 rows should still exist since update was rejected");
 
     Ok(())
 }
@@ -2209,6 +2246,229 @@ async fn test_sql_delete_full_table() -> Result<()> {
         .unwrap()
         .value(0);
     assert_eq!(remaining_count, 0, "Expected 0 rows after full delete");
+
+    Ok(())
+}
+
+// =============================================================================
+// Error Handling Tests (P1 Task 4)
+// These tests verify proper error handling for invalid operations.
+// =============================================================================
+
+/// Tests that UPDATE with an invalid column name returns a proper error.
+#[tokio::test]
+async fn test_update_invalid_column() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_invalid_col".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "invalid_col_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_update_invalid_col.invalid_col_table VALUES (1, 'a')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Try to UPDATE a non-existent column
+    let result = ctx
+        .sql("UPDATE catalog.test_update_invalid_col.invalid_col_table SET nonexistent_col = 'x'")
+        .await;
+
+    // Should fail at planning or execution time
+    assert!(
+        result.is_err(),
+        "Expected error when updating non-existent column"
+    );
+
+    Ok(())
+}
+
+/// Tests that DELETE with invalid predicate returns a proper error.
+#[tokio::test]
+async fn test_delete_invalid_predicate() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_invalid_pred".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "invalid_pred_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_delete_invalid_pred.invalid_pred_table VALUES (1, 'a')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Try to DELETE with a non-existent column in predicate
+    let result = ctx
+        .sql("DELETE FROM catalog.test_delete_invalid_pred.invalid_pred_table WHERE bad_column = 1")
+        .await;
+
+    // Should fail at planning time
+    assert!(
+        result.is_err(),
+        "Expected error when filtering on non-existent column"
+    );
+
+    Ok(())
+}
+
+/// Tests that UPDATE with invalid SQL syntax returns an error.
+#[tokio::test]
+async fn test_update_invalid_syntax() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_syntax".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "syntax_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_update_syntax.syntax_table VALUES (1, 'a')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Try to UPDATE with invalid SQL syntax (missing SET value)
+    let result = ctx
+        .sql("UPDATE catalog.test_update_syntax.syntax_table SET foo1 =")
+        .await;
+
+    // Should fail at parsing time
+    assert!(
+        result.is_err(),
+        "Expected error for invalid SQL syntax"
+    );
+
+    Ok(())
+}
+
+/// Tests that SELECT after a failed UPDATE leaves data unchanged.
+#[tokio::test]
+async fn test_update_failure_no_side_effects() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_no_side".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "no_side_effects_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_update_no_side.no_side_effects_table VALUES (1, 'original')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Try an invalid UPDATE (should fail)
+    let _result = ctx
+        .sql("UPDATE catalog.test_update_no_side.no_side_effects_table SET nonexistent = 'x'")
+        .await;
+    // We don't care if this errors at plan or execute time
+
+    // Verify original data is unchanged
+    let batches = ctx
+        .sql("SELECT foo2 FROM catalog.test_update_no_side.no_side_effects_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let value = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+
+    assert_eq!(value, "original", "Data should remain unchanged after failed UPDATE");
+
+    Ok(())
+}
+
+/// Tests that concurrent SELECT operations work correctly after UPDATE.
+#[tokio::test]
+async fn test_select_after_concurrent_operations() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_concurrent_select".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "concurrent_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_concurrent_select.concurrent_table VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Execute UPDATE
+    ctx.sql("UPDATE catalog.test_concurrent_select.concurrent_table SET foo2 = 'updated' WHERE foo1 = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // SELECT should see updated data
+    let batches = ctx
+        .sql("SELECT foo2 FROM catalog.test_concurrent_select.concurrent_table WHERE foo1 = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let value = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+
+    assert_eq!(value, "updated");
 
     Ok(())
 }

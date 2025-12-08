@@ -22,7 +22,9 @@
 //! the `PositionDeleteFileWriter`.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
@@ -38,18 +40,21 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, execute_input_stream,
 };
-use futures::StreamExt;
-use iceberg::spec::{DataFileFormat, TableProperties, serialize_data_file_to_json};
+use futures::{StreamExt, TryStreamExt};
+use iceberg::spec::{
+    DataFileFormat, PartitionSpec, SchemaRef as IcebergSchemaRef, Struct, TableProperties,
+    serialize_data_file_to_json,
+};
 use iceberg::table::Table;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    PositionDeleteFileWriter, PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
@@ -58,6 +63,264 @@ use crate::to_datafusion_error;
 
 /// Column name for serialized delete files in output
 pub const DELETE_FILES_COL_NAME: &str = "delete_files";
+
+// ============================================================================
+// Partition Grouping Types
+// ============================================================================
+
+/// Key for grouping position deletes by partition.
+///
+/// Position delete files in Iceberg must be associated with the same partition
+/// as the data files they reference. This key combines the partition spec ID
+/// (to handle partition evolution) with the partition values.
+#[derive(Clone, Debug)]
+struct PartitionGroupKey {
+    /// The partition spec ID from the data file's manifest
+    spec_id: i32,
+    /// The partition values (struct of partition field values)
+    partition: Struct,
+}
+
+impl PartitionGroupKey {
+    fn new(spec_id: i32, partition: Struct) -> Self {
+        Self { spec_id, partition }
+    }
+
+    /// Creates a key for unpartitioned tables.
+    fn unpartitioned() -> Self {
+        Self {
+            spec_id: 0,
+            partition: Struct::empty(),
+        }
+    }
+}
+
+impl PartialEq for PartitionGroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec_id == other.spec_id && self.partition == other.partition
+    }
+}
+
+impl Eq for PartitionGroupKey {}
+
+impl Hash for PartitionGroupKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.spec_id.hash(state);
+        self.partition.hash(state);
+    }
+}
+
+/// Information about a data file's partition, used to route deletes to the correct writer.
+#[derive(Clone, Debug)]
+struct FilePartitionInfo {
+    /// The partition spec ID
+    spec_id: i32,
+    /// The partition values
+    partition: Struct,
+    /// The partition spec (needed to build PartitionKey for writer)
+    partition_spec: Arc<PartitionSpec>,
+}
+
+/// Type alias for the position delete writer builder.
+type DeleteWriterBuilder =
+    PositionDeleteFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+/// Type alias for the position delete writer used in partitioned delete collection.
+type PartitionDeleteWriter =
+    PositionDeleteFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+/// Collects position deletes grouped by partition and manages writers.
+///
+/// This collector maintains a HashMap of partition keys to writers, creating
+/// new writers on-demand as deletes for new partitions are encountered.
+struct PartitionedDeleteCollector {
+    /// Map from partition key to position delete writer
+    writers: HashMap<PartitionGroupKey, PartitionDeleteWriter>,
+    /// Map from file path to partition info (built from manifest scan)
+    file_partitions: HashMap<String, FilePartitionInfo>,
+    /// Writer builder factory closure
+    writer_builder: DeleteWriterBuilder,
+    /// Delete config for creating writers
+    delete_config: PositionDeleteWriterConfig,
+    /// Table schema for building partition keys
+    table_schema: IcebergSchemaRef,
+    /// Whether the table is unpartitioned
+    is_unpartitioned: bool,
+}
+
+impl PartitionedDeleteCollector {
+    /// Creates a new collector with the given file-to-partition mapping.
+    fn new(
+        file_partitions: HashMap<String, FilePartitionInfo>,
+        writer_builder: DeleteWriterBuilder,
+        delete_config: PositionDeleteWriterConfig,
+        table_schema: IcebergSchemaRef,
+        is_unpartitioned: bool,
+    ) -> Self {
+        Self {
+            writers: HashMap::new(),
+            file_partitions,
+            writer_builder,
+            delete_config,
+            table_schema,
+            is_unpartitioned,
+        }
+    }
+
+    /// Gets the partition key for a given file path.
+    ///
+    /// For unpartitioned tables, returns the unpartitioned key.
+    /// For partitioned tables, looks up the partition from the file mapping.
+    fn get_partition_key(&self, file_path: &str) -> DFResult<PartitionGroupKey> {
+        if self.is_unpartitioned {
+            return Ok(PartitionGroupKey::unpartitioned());
+        }
+
+        self.file_partitions
+            .get(file_path)
+            .map(|info| PartitionGroupKey::new(info.spec_id, info.partition.clone()))
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "No partition info found for file '{}'. This may indicate a consistency issue \
+                     between the scan and write phases.",
+                    file_path
+                ))
+            })
+    }
+
+    /// Gets or creates a writer for the given partition key.
+    async fn get_or_create_writer(
+        &mut self,
+        key: &PartitionGroupKey,
+    ) -> DFResult<&mut PartitionDeleteWriter> {
+        use iceberg::spec::PartitionKey;
+
+        if !self.writers.contains_key(key) {
+            // Build partition key for the writer
+            let partition_key = if self.is_unpartitioned {
+                None
+            } else {
+                // Look up the partition spec from any file with this partition
+                let file_info = self
+                    .file_partitions
+                    .values()
+                    .find(|info| info.spec_id == key.spec_id && info.partition == key.partition)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Cannot find partition spec for partition key {:?}",
+                            key
+                        ))
+                    })?;
+
+                Some(PartitionKey::new(
+                    file_info.partition_spec.as_ref().clone(),
+                    self.table_schema.clone(),
+                    key.partition.clone(),
+                ))
+            };
+
+            let writer = self
+                .writer_builder
+                .clone()
+                .build(partition_key)
+                .await
+                .map_err(to_datafusion_error)?;
+
+            self.writers.insert(key.clone(), writer);
+        }
+
+        Ok(self.writers.get_mut(key).unwrap())
+    }
+
+    /// Writes a batch of deletes, routing each row to the appropriate partition writer.
+    async fn write_batch(&mut self, batch: &RecordBatch) -> DFResult<()> {
+        use datafusion::arrow::array::{Int64Array, StringArray as ArrowStringArray};
+
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        // Extract columns
+        let file_path_col = batch
+            .column_by_name(DELETE_FILE_PATH_COL)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Expected '{}' column in delete scan output",
+                    DELETE_FILE_PATH_COL
+                ))
+            })?
+            .as_any()
+            .downcast_ref::<ArrowStringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected StringArray for file_path column".to_string())
+            })?;
+
+        let pos_col = batch
+            .column_by_name(DELETE_POS_COL)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Expected '{}' column in delete scan output",
+                    DELETE_POS_COL
+                ))
+            })?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected Int64Array for pos column".to_string())
+            })?;
+
+        // Group rows by partition
+        let delete_schema = self.delete_config.delete_schema().clone();
+        let mut partition_batches: HashMap<PartitionGroupKey, (Vec<String>, Vec<i64>)> =
+            HashMap::new();
+
+        for row_idx in 0..batch.num_rows() {
+            let file_path = file_path_col.value(row_idx);
+            let pos = pos_col.value(row_idx);
+
+            let key = self.get_partition_key(file_path)?;
+            let entry = partition_batches
+                .entry(key)
+                .or_insert_with(|| (Vec::new(), Vec::new()));
+            entry.0.push(file_path.to_string());
+            entry.1.push(pos);
+        }
+
+        // Write to each partition's writer
+        for (key, (file_paths, positions)) in partition_batches {
+            let file_path_array =
+                Arc::new(datafusion::arrow::array::StringArray::from(file_paths)) as ArrayRef;
+            let pos_array =
+                Arc::new(datafusion::arrow::array::Int64Array::from(positions)) as ArrayRef;
+
+            let delete_batch =
+                RecordBatch::try_new(delete_schema.clone(), vec![file_path_array, pos_array])
+                    .map_err(|e| {
+                        DataFusionError::ArrowError(
+                            Box::new(e),
+                            Some("Failed to create delete batch".to_string()),
+                        )
+                    })?;
+
+            let writer = self.get_or_create_writer(&key).await?;
+            writer.write(delete_batch).await.map_err(to_datafusion_error)?;
+        }
+
+        Ok(())
+    }
+
+    /// Closes all writers and returns the generated delete files.
+    async fn close(self) -> DFResult<Vec<iceberg::spec::DataFile>> {
+        let mut all_delete_files = Vec::new();
+
+        for (_key, mut writer) in self.writers {
+            let delete_files = writer.close().await.map_err(to_datafusion_error)?;
+            all_delete_files.extend(delete_files);
+        }
+
+        Ok(all_delete_files)
+    }
+}
 
 /// Execution plan for writing position delete files.
 ///
@@ -202,25 +465,34 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
 
         // Create the write stream
         let stream = futures::stream::once(async move {
-            // Check if table is partitioned - DELETE on partitioned tables not yet supported
-            // TODO: For partitioned tables, we need to:
-            //   1. Track which partition each data file belongs to
-            //   2. Group position deletes by partition
-            //   3. Write separate delete files per partition with correct partition values
-            // See: https://iceberg.apache.org/spec/#position-delete-files
             let partition_spec = table.metadata().default_partition_spec();
-            if !partition_spec.is_unpartitioned() {
-                return Err(DataFusionError::NotImplemented(
-                    "DELETE on partitioned tables is not yet supported. \
-                     Position delete files must include partition values, which requires \
-                     grouping deletes by partition. This will be added in a future release."
-                        .to_string(),
-                ));
+            let is_unpartitioned = partition_spec.is_unpartitioned();
+
+            // Check for partition evolution - reject tables with multiple partition specs
+            // because we currently use the default partition spec for all files, which would
+            // produce incorrect delete files for files written with older partition specs.
+            if !is_unpartitioned {
+                let partition_spec_count = table.metadata().partition_specs_iter().count();
+                if partition_spec_count > 1 {
+                    return Err(DataFusionError::NotImplemented(
+                        "DELETE on tables with partition evolution (multiple partition specs) \
+                         is not yet supported. The current implementation uses the default \
+                         partition spec for all files, which would produce incorrect delete \
+                         files for files written with older partition specs."
+                            .to_string(),
+                    ));
+                }
             }
+
+            // Build file-to-partition mapping for partitioned tables
+            let file_partitions = if is_unpartitioned {
+                HashMap::new()
+            } else {
+                build_file_partition_map(&table).await?
+            };
 
             // Set up position delete writer config
             let delete_config = PositionDeleteWriterConfig::new();
-            let delete_schema = delete_config.delete_schema().clone();
 
             let file_io = table.file_io().clone();
             let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
@@ -281,63 +553,25 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             let delete_writer_builder =
                 PositionDeleteFileWriterBuilder::new(rolling_writer_builder, delete_config.clone());
 
-            // Get partition value for partitioned tables
-            // For position deletes, we use None (unpartitioned) since position deletes
-            // reference rows across potentially different partitions via file_path.
-            // The partition spec ID is recorded in the DataFile metadata.
-            // TODO: For better locality, could group deletes by partition and write
-            // separate delete files per partition.
-            let mut delete_writer = delete_writer_builder
-                .build(None)
-                .await
-                .map_err(to_datafusion_error)?;
+            // Create partitioned delete collector
+            let table_schema = table.metadata().current_schema().clone();
+            let mut collector = PartitionedDeleteCollector::new(
+                file_partitions,
+                delete_writer_builder,
+                delete_config,
+                table_schema,
+                is_unpartitioned,
+            );
 
             // Process input batches
             let mut input = input_stream;
             while let Some(batch_result) = input.next().await {
                 let batch = batch_result?;
-
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-
-                // Extract file_path and pos columns
-                let file_path_col = batch
-                    .column_by_name(DELETE_FILE_PATH_COL)
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(format!(
-                            "Expected '{}' column in delete scan output",
-                            DELETE_FILE_PATH_COL
-                        ))
-                    })?;
-
-                let pos_col = batch.column_by_name(DELETE_POS_COL).ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "Expected '{}' column in delete scan output",
-                        DELETE_POS_COL
-                    ))
-                })?;
-
-                // Create a batch with just file_path and pos for the position delete writer
-                let delete_batch = RecordBatch::try_new(
-                    delete_schema.clone(),
-                    vec![file_path_col.clone(), pos_col.clone()],
-                )
-                .map_err(|e| {
-                    DataFusionError::ArrowError(
-                        Box::new(e),
-                        Some("Failed to create delete batch".to_string()),
-                    )
-                })?;
-
-                delete_writer
-                    .write(delete_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                collector.write_batch(&batch).await?;
             }
 
-            // Close the writer and get the delete files
-            let delete_files = delete_writer.close().await.map_err(to_datafusion_error)?;
+            // Close all writers and get the delete files
+            let delete_files = collector.close().await?;
 
             // Serialize delete files to JSON
             let delete_files_json: Vec<String> = delete_files
@@ -354,6 +588,61 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(result_schema, stream)))
     }
+}
+
+/// Builds a mapping from file path to partition info by scanning all manifests.
+///
+/// This function scans the table's current snapshot to get all data files and their
+/// associated partition information. This mapping is used during delete writing to
+/// route position deletes to the correct partition-specific delete file.
+///
+/// # Note
+///
+/// This function assumes the table has only one partition spec (no partition evolution).
+/// The caller should validate this before calling. Currently uses the default partition
+/// spec for all files - see the guard in `IcebergDeleteWriteExec::execute()`.
+async fn build_file_partition_map(table: &Table) -> DFResult<HashMap<String, FilePartitionInfo>> {
+    use iceberg::scan::FileScanTask;
+
+    let mut file_partitions = HashMap::new();
+
+    // Build a scan to get all files in the current snapshot
+    let scan = table
+        .scan()
+        .select_all()
+        .build()
+        .map_err(to_datafusion_error)?;
+
+    // Get all file scan tasks
+    let file_tasks: Vec<FileScanTask> = scan
+        .plan_files()
+        .await
+        .map_err(to_datafusion_error)?
+        .try_collect()
+        .await
+        .map_err(to_datafusion_error)?;
+
+    // Build mapping from file path to partition info
+    for task in file_tasks {
+        if let Some(partition) = task.partition {
+            // Get the partition spec for this file
+            // Note: FileScanTask.partition_spec is currently always None (TODO in context.rs)
+            // For now, we use the default partition spec. This works for tables without
+            // partition evolution. For tables with partition evolution, we'll need to
+            // enhance FileScanTask to carry the actual partition spec ID.
+            let partition_spec = table.metadata().default_partition_spec();
+
+            let info = FilePartitionInfo {
+                spec_id: partition_spec.spec_id(),
+                partition,
+                partition_spec: partition_spec.clone(),
+            };
+
+            file_partitions.insert(task.data_file_path, info);
+        }
+    }
+
+    Ok(file_partitions)
 }
 
 #[cfg(test)]
