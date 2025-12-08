@@ -471,6 +471,11 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             // Check for partition evolution - reject tables with multiple partition specs
             // because we currently use the default partition spec for all files, which would
             // produce incorrect delete files for files written with older partition specs.
+            //
+            // TODO: To support partition evolution, FileScanTask needs to carry the actual
+            // partition_spec_id from the manifest entry. Once that's fixed in the iceberg crate
+            // (see crates/iceberg/src/scan/context.rs), this guard can be removed and
+            // build_file_partition_map() can use the per-file partition spec.
             if !is_unpartitioned {
                 let partition_spec_count = table.metadata().partition_specs_iter().count();
                 if partition_spec_count > 1 {
@@ -625,11 +630,14 @@ async fn build_file_partition_map(table: &Table) -> DFResult<HashMap<String, Fil
     // Build mapping from file path to partition info
     for task in file_tasks {
         if let Some(partition) = task.partition {
-            // Get the partition spec for this file
-            // Note: FileScanTask.partition_spec is currently always None (TODO in context.rs)
-            // For now, we use the default partition spec. This works for tables without
-            // partition evolution. For tables with partition evolution, we'll need to
-            // enhance FileScanTask to carry the actual partition spec ID.
+            // Get the partition spec for this file.
+            //
+            // Note: FileScanTask doesn't currently carry the partition_spec_id from the
+            // manifest entry. We use the default partition spec, which is safe because
+            // IcebergDeleteWriteExec::execute() guards against tables with partition
+            // evolution (multiple specs). Once FileScanTask is enhanced to carry the
+            // actual spec ID (see crates/iceberg/src/scan/context.rs), that guard can
+            // be removed and we can use task.partition_spec_id here.
             let partition_spec = table.metadata().default_partition_spec();
 
             let info = FilePartitionInfo {
