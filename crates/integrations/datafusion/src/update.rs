@@ -260,6 +260,9 @@ impl UpdateBuilder {
         // Validate first (includes check for partition column updates)
         self.validate()?;
 
+        // Capture baseline snapshot ID for concurrency validation
+        let baseline_snapshot_id = self.table.metadata().current_snapshot_id();
+
         // Build the update execution plan chain
         let filters: Vec<Expr> = self.filter.into_iter().collect();
 
@@ -274,12 +277,13 @@ impl UpdateBuilder {
         // Step 4: Coalesce partitions for single commit
         let coalesce = Arc::new(CoalescePartitionsExec::new(update_exec));
 
-        // Step 5: Commit both data files and delete files
+        // Step 5: Commit both data files and delete files with baseline validation
         let update_commit = Arc::new(IcebergUpdateCommitExec::new(
             self.table,
             self.catalog,
             coalesce.clone(),
             coalesce.schema(),
+            baseline_snapshot_id,
         ));
 
         // Execute the plan

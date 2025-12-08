@@ -36,6 +36,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::DataFusionError;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::{DmlCapabilities, InsertOp};
@@ -49,6 +50,7 @@ use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
+use crate::merge::MergeBuilder;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::delete_commit::IcebergDeleteCommitExec;
 use crate::physical_plan::delete_scan::IcebergDeleteScanExec;
@@ -147,6 +149,9 @@ impl IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
+        // Capture baseline snapshot ID for concurrency validation
+        let baseline_snapshot_id = table.metadata().current_snapshot_id();
+
         // Build the delete execution plan chain
         let filters: Vec<Expr> = predicate.into_iter().collect();
 
@@ -166,12 +171,13 @@ impl IcebergTableProvider {
         // Step 3: Coalesce partitions for single commit
         let coalesce = Arc::new(CoalescePartitionsExec::new(delete_write));
 
-        // Step 4: Commit delete files
+        // Step 4: Commit delete files with baseline validation
         let delete_commit = Arc::new(IcebergDeleteCommitExec::new(
             table,
             self.catalog.clone(),
             coalesce.clone(),
             coalesce.schema(),
+            baseline_snapshot_id,
         ));
 
         // Execute the plan
@@ -218,6 +224,49 @@ impl IcebergTableProvider {
         // Load fresh table metadata from catalog
         let table = self.catalog.load_table(&self.table_ident).await?;
         Ok(UpdateBuilder::new(table, self.catalog.clone(), self.schema.clone()))
+    }
+
+    /// Creates a MergeBuilder for MERGE (UPSERT) operations on the table.
+    ///
+    /// MERGE combines INSERT, UPDATE, and DELETE operations into a single atomic
+    /// transaction. This is essential for CDC (Change Data Capture) patterns where
+    /// you need to synchronize a target table with a source dataset.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The source DataFrame to merge into this table
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use datafusion::prelude::*;
+    ///
+    /// // CDC-style merge: update existing, insert new, delete missing
+    /// let stats = provider
+    ///     .merge(source_df)
+    ///     .await?
+    ///     .on(col("target.id").eq(col("source.id")))
+    ///     .when_matched(None)
+    ///         .update_all()
+    ///     .when_not_matched(None)
+    ///         .insert_all()
+    ///     .when_not_matched_by_source(None)
+    ///         .delete()
+    ///     .execute(&session_state)
+    ///     .await?;
+    ///
+    /// println!("Inserted: {}, Updated: {}, Deleted: {}",
+    ///     stats.rows_inserted, stats.rows_updated, stats.rows_deleted);
+    /// ```
+    pub async fn merge(&self, source: DataFrame) -> Result<MergeBuilder> {
+        // Load fresh table metadata from catalog
+        let table = self.catalog.load_table(&self.table_ident).await?;
+        Ok(MergeBuilder::new(
+            table,
+            self.catalog.clone(),
+            self.schema.clone(),
+            source,
+        ))
     }
 }
 
@@ -349,6 +398,11 @@ impl TableProvider for IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
+        // Capture baseline snapshot ID for concurrency validation.
+        // If another transaction commits between our scan and commit,
+        // we'll detect it and fail rather than apply stale position deletes.
+        let baseline_snapshot_id = table.metadata().current_snapshot_id();
+
         // Note: IcebergDeleteScanExec uses the table's current schema internally,
         // so schema evolution is handled correctly within the scan operator.
 
@@ -365,12 +419,13 @@ impl TableProvider for IcebergTableProvider {
         // Step 3: Coalesce partitions for single commit
         let coalesce = Arc::new(CoalescePartitionsExec::new(delete_write));
 
-        // Step 4: Commit delete files
+        // Step 4: Commit delete files with baseline validation
         Ok(Arc::new(IcebergDeleteCommitExec::new(
             table,
             self.catalog.clone(),
             coalesce.clone(),
             coalesce.schema(),
+            baseline_snapshot_id,
         )))
     }
 
@@ -417,6 +472,11 @@ impl TableProvider for IcebergTableProvider {
             }
         }
 
+        // Capture baseline snapshot ID for concurrency validation.
+        // If another transaction commits between our scan and commit,
+        // we'll detect it and fail rather than apply stale position deletes.
+        let baseline_snapshot_id = table.metadata().current_snapshot_id();
+
         // Build the UPDATE execution plan with fresh schema
         let update_exec = Arc::new(IcebergUpdateExec::new(
             table.clone(),
@@ -434,6 +494,7 @@ impl TableProvider for IcebergTableProvider {
             self.catalog.clone(),
             coalesce.clone(),
             coalesce.schema(),
+            baseline_snapshot_id,
         )))
     }
 }

@@ -16,8 +16,17 @@
 | Limitation | Severity | Details |
 |------------|----------|---------|
 | Partitioned tables | High | Both UPDATE and DELETE return `NotImplemented` error |
-| UPDATE atomicity | Medium | Two-phase commit; recovery via time travel if crash between phases |
 | V1 tables | High | Position deletes require format version 2 |
+
+## Concurrency Safety
+
+Both UPDATE and DELETE operations now implement **baseline snapshot validation**:
+
+1. **Plan Construction**: When building the execution plan, the current snapshot ID is captured
+2. **Commit Validation**: Before committing, the table is refreshed from the catalog and the current snapshot ID is compared against the baseline
+3. **Conflict Detection**: If another transaction committed between scan and commit, the operation fails with a clear error message directing the user to retry
+
+This prevents applying stale position deletes to tables that have been reorganized by concurrent transactions.
 
 ---
 
@@ -248,7 +257,7 @@ datafusion = { git = "https://github.com/ethan-tyler/datafusion", branch = "main
 | Item | Priority | Notes |
 |------|----------|-------|
 | Partitioned table support | High | Both UPDATE and DELETE return NotImplemented |
-| UPDATE atomicity | Medium | Two-phase commit; needs RowDelta for true atomicity |
+| UPDATE atomicity | Done | Now uses RowDelta for atomic single-snapshot commits |
 | Partition evolution support | Medium | Requires `DataFile.partition_spec_id` exposure |
 | DataFusion fork dependency | Medium | Remove patch when upstream adds DML support |
 | MoR support | Low | Requires reader changes |

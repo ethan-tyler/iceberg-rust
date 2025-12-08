@@ -53,8 +53,10 @@
 mod action;
 
 pub use action::*;
+pub use row_delta::RowDeltaAction;
 mod append;
 mod delete;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -150,6 +152,33 @@ impl Transaction {
     /// `EqualityDeleteFileWriter`.
     pub fn delete(&self) -> DeleteAction {
         DeleteAction::new()
+    }
+
+    /// Creates a row delta action for atomically committing both data files and delete files.
+    ///
+    /// This action is used for row-level operations like UPDATE and MERGE that need to
+    /// atomically:
+    /// - Add new data files containing updated/inserted rows
+    /// - Add position delete files marking original rows as deleted
+    ///
+    /// Unlike chaining `fast_append()` and `delete()` (which would produce two
+    /// separate snapshots), `row_delta()` produces a **single snapshot** containing
+    /// both data and delete manifests.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.row_delta()
+    ///     .add_data_files(vec![updated_row_file, inserted_row_file])
+    ///     .add_delete_files(vec![position_delete_file]);
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
     }
 
     /// Creates replace sort order action.

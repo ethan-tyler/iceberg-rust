@@ -51,6 +51,13 @@ pub const DELETE_COUNT_COL_NAME: &str = "count";
 ///
 /// Collects serialized delete file JSON from input and commits them using
 /// the DeleteAction transaction. Returns a count of the deleted rows.
+///
+/// # Concurrency Safety
+///
+/// This executor captures a baseline snapshot ID at plan construction time and validates
+/// it at commit time. If the table has been modified since the scan started (i.e., another
+/// transaction committed), the commit will fail with a clear error rather than potentially
+/// applying stale position deletes to reorganized files.
 #[derive(Debug)]
 pub struct IcebergDeleteCommitExec {
     table: Table,
@@ -59,15 +66,28 @@ pub struct IcebergDeleteCommitExec {
     input_schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
     plan_properties: PlanProperties,
+    /// Snapshot ID captured at plan construction time for concurrency validation.
+    /// If set, commit will fail if the table's current snapshot has changed.
+    baseline_snapshot_id: Option<i64>,
 }
 
 impl IcebergDeleteCommitExec {
     /// Creates a new `IcebergDeleteCommitExec`.
+    ///
+    /// # Arguments
+    /// * `table` - The Iceberg table to commit to
+    /// * `catalog` - The catalog for committing changes
+    /// * `input` - The input execution plan providing delete files
+    /// * `input_schema` - Schema of the input plan
+    /// * `baseline_snapshot_id` - Snapshot ID captured at plan construction time.
+    ///   If provided, commit will validate that the table hasn't been modified since
+    ///   the scan started to prevent applying stale position deletes.
     pub fn new(
         table: Table,
         catalog: Arc<dyn Catalog>,
         input: Arc<dyn ExecutionPlan>,
         input_schema: ArrowSchemaRef,
+        baseline_snapshot_id: Option<i64>,
     ) -> Self {
         let count_schema = Self::make_count_schema();
         let plan_properties = Self::compute_properties(count_schema.clone());
@@ -79,6 +99,7 @@ impl IcebergDeleteCommitExec {
             input_schema,
             count_schema,
             plan_properties,
+            baseline_snapshot_id,
         }
     }
 
@@ -177,6 +198,7 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
             self.catalog.clone(),
             children[0].clone(),
             self.input_schema.clone(),
+            self.baseline_snapshot_id,
         )))
     }
 
@@ -192,10 +214,13 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
             )));
         }
 
-        let table = self.table.clone();
         let catalog = self.catalog.clone();
         let input_plan = self.input.clone();
         let count_schema = self.count_schema.clone();
+        let baseline_snapshot_id = self.baseline_snapshot_id;
+        let table_ident = self.table.identifier().clone();
+        // Note: We don't clone the table here because we refresh it from the catalog
+        // at commit time to get the latest state for validation.
 
         let spec_id = self.table.metadata().default_partition_spec_id();
         let partition_type = self.table.metadata().default_partition_type().clone();
@@ -248,6 +273,26 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
             // If no delete files were collected, return zero count
             if delete_files.is_empty() {
                 return Self::make_count_batch(0);
+            }
+
+            // Refresh table from catalog to get current state for commit
+            let table = catalog
+                .load_table(&table_ident)
+                .await
+                .map_err(to_datafusion_error)?;
+
+            // Validate baseline snapshot if provided - ensures position deletes
+            // are still valid (table hasn't been reorganized since scan started)
+            if let Some(baseline) = baseline_snapshot_id {
+                let current = table.metadata().current_snapshot_id();
+                if current != Some(baseline) {
+                    return Err(DataFusionError::Execution(format!(
+                        "DELETE conflict: table '{}' was modified by another transaction. \
+                         Expected snapshot {}, but current snapshot is {:?}. \
+                         Position deletes may be stale. Please retry the DELETE.",
+                        table_ident, baseline, current
+                    )));
+                }
             }
 
             // Commit delete files using DeleteAction transaction
