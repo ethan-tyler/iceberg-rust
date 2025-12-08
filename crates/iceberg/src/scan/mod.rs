@@ -470,7 +470,7 @@ impl TableScan {
                 manifest_entry_context.expression_evaluator_cache.as_ref();
 
             let expression_evaluator = expression_evaluator_cache.get(
-                manifest_entry_context.partition_spec_id,
+                manifest_entry_context.partition_spec.spec_id(),
                 partition_bound_predicate,
             )?;
 
@@ -522,7 +522,7 @@ impl TableScan {
                 manifest_entry_context.expression_evaluator_cache.as_ref();
 
             let expression_evaluator = expression_evaluator_cache.get(
-                manifest_entry_context.partition_spec_id,
+                manifest_entry_context.partition_spec.spec_id(),
                 &bound_predicates.partition_bound_predicate,
             )?;
 
@@ -536,7 +536,7 @@ impl TableScan {
         delete_file_ctx_tx
             .send(DeleteFileContext {
                 manifest_entry: manifest_entry_context.manifest_entry.clone(),
-                partition_spec_id: manifest_entry_context.partition_spec_id,
+                partition_spec_id: manifest_entry_context.partition_spec.spec_id(),
             })
             .await?;
 

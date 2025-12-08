@@ -465,26 +465,11 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
 
         // Create the write stream
         let stream = futures::stream::once(async move {
-            let partition_spec = table.metadata().default_partition_spec();
-            let is_unpartitioned = partition_spec.is_unpartitioned();
-
-            // Check for partition evolution - reject tables with multiple partition specs
-            // because we currently use the default partition spec for all files, which would
-            // produce incorrect delete files for files written with older partition specs.
-            if !is_unpartitioned {
-                let partition_spec_count = table.metadata().partition_specs_iter().count();
-                if partition_spec_count > 1 {
-                    return Err(DataFusionError::NotImplemented(
-                        "DELETE on tables with partition evolution (multiple partition specs) \
-                         is not yet supported. The current implementation uses the default \
-                         partition spec for all files, which would produce incorrect delete \
-                         files for files written with older partition specs."
-                            .to_string(),
-                    ));
-                }
-            }
+            let is_unpartitioned = table.metadata().default_partition_spec().is_unpartitioned();
 
             // Build file-to-partition mapping for partitioned tables
+            // Each file's partition spec is obtained from FileScanTask.partition_spec,
+            // which enables correct handling of tables with partition evolution.
             let file_partitions = if is_unpartitioned {
                 HashMap::new()
             } else {
@@ -596,11 +581,9 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
 /// associated partition information. This mapping is used during delete writing to
 /// route position deletes to the correct partition-specific delete file.
 ///
-/// # Note
-///
-/// This function assumes the table has only one partition spec (no partition evolution).
-/// The caller should validate this before calling. Currently uses the default partition
-/// spec for all files - see the guard in `IcebergDeleteWriteExec::execute()`.
+/// Supports partition evolution: each file's partition spec is obtained from the
+/// `FileScanTask.partition_spec` field, which carries the spec under which the file
+/// was originally written.
 async fn build_file_partition_map(table: &Table) -> DFResult<HashMap<String, FilePartitionInfo>> {
     use iceberg::scan::FileScanTask;
 
@@ -624,18 +607,11 @@ async fn build_file_partition_map(table: &Table) -> DFResult<HashMap<String, Fil
 
     // Build mapping from file path to partition info
     for task in file_tasks {
-        if let Some(partition) = task.partition {
-            // Get the partition spec for this file
-            // Note: FileScanTask.partition_spec is currently always None (TODO in context.rs)
-            // For now, we use the default partition spec. This works for tables without
-            // partition evolution. For tables with partition evolution, we'll need to
-            // enhance FileScanTask to carry the actual partition spec ID.
-            let partition_spec = table.metadata().default_partition_spec();
-
+        if let (Some(partition), Some(partition_spec)) = (task.partition, task.partition_spec) {
             let info = FilePartitionInfo {
                 spec_id: partition_spec.spec_id(),
                 partition,
-                partition_spec: partition_spec.clone(),
+                partition_spec,
             };
 
             file_partitions.insert(task.data_file_path, info);

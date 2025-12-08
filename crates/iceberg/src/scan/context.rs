@@ -28,8 +28,8 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, SchemaRef, SnapshotRef,
-    TableMetadataRef,
+    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, PartitionSpecRef, SchemaRef,
+    SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -37,6 +37,7 @@ use crate::{Error, ErrorKind, Result};
 /// to process it in a thread-safe manner
 pub(crate) struct ManifestFileContext {
     manifest_file: ManifestFile,
+    partition_spec: PartitionSpecRef,
 
     sender: Sender<ManifestEntryContext>,
 
@@ -56,7 +57,7 @@ pub(crate) struct ManifestEntryContext {
     pub expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     pub field_ids: Arc<Vec<i32>>,
     pub bound_predicates: Option<Arc<BoundPredicates>>,
-    pub partition_spec_id: i32,
+    pub partition_spec: PartitionSpecRef,
     pub snapshot_schema: SchemaRef,
     pub delete_file_index: DeleteFileIndex,
 }
@@ -68,13 +69,13 @@ impl ManifestFileContext {
         let ManifestFileContext {
             object_cache,
             manifest_file,
+            partition_spec,
             bound_predicates,
             snapshot_schema,
             field_ids,
             mut sender,
             expression_evaluator_cache,
             delete_file_index,
-            ..
         } = self;
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
@@ -85,7 +86,7 @@ impl ManifestFileContext {
                 manifest_entry: manifest_entry.clone(),
                 expression_evaluator_cache: expression_evaluator_cache.clone(),
                 field_ids: field_ids.clone(),
-                partition_spec_id: manifest_file.partition_spec_id,
+                partition_spec: partition_spec.clone(),
                 bound_predicates: bound_predicates.clone(),
                 snapshot_schema: snapshot_schema.clone(),
                 delete_file_index: delete_file_index.clone(),
@@ -131,8 +132,7 @@ impl ManifestEntryContext {
 
             // Include partition data and spec from manifest entry
             partition: Some(self.manifest_entry.data_file.partition.clone()),
-            // TODO: Pass actual PartitionSpec through context chain for native flow
-            partition_spec: None,
+            partition_spec: Some(self.partition_spec),
             // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
             name_mapping: None,
         })
@@ -231,7 +231,7 @@ impl PlanContext {
                 partition_bound_predicate,
                 tx,
                 delete_file_idx.clone(),
-            );
+            )?;
 
             filtered_mfcs.push(Ok(mfc));
         }
@@ -245,7 +245,7 @@ impl PlanContext {
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
         delete_file_index: DeleteFileIndex,
-    ) -> ManifestFileContext {
+    ) -> Result<ManifestFileContext> {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
                 (partition_filter, &self.snapshot_bound_predicate)
@@ -258,8 +258,32 @@ impl PlanContext {
                 None
             };
 
-        ManifestFileContext {
+        // Resolve partition spec from table metadata (fail-fast on invalid spec_id)
+        let spec_id = manifest_file.partition_spec_id;
+        let partition_spec = self
+            .table_metadata
+            .partition_spec_by_id(spec_id)
+            .cloned()
+            .ok_or_else(|| {
+                let available_spec_ids: Vec<i32> = self
+                    .table_metadata
+                    .partition_specs_iter()
+                    .map(|s| s.spec_id())
+                    .collect();
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Manifest '{}' references partition spec id {} which does not exist \
+                         in table metadata. Available spec ids: {:?}. This may indicate \
+                         table corruption or an incomplete metadata update.",
+                        manifest_file.manifest_path, spec_id, available_spec_ids
+                    ),
+                )
+            })?;
+
+        Ok(ManifestFileContext {
             manifest_file: manifest_file.clone(),
+            partition_spec,
             bound_predicates,
             sender,
             object_cache: self.object_cache.clone(),
@@ -267,6 +291,6 @@ impl PlanContext {
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
-        }
+        })
     }
 }
