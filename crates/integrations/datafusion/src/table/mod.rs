@@ -38,7 +38,7 @@ use datafusion::catalog::Session;
 use datafusion::common::DataFusionError;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::dml::{DmlCapabilities, InsertOp};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -56,6 +56,8 @@ use crate::physical_plan::delete_write::IcebergDeleteWriteExec;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
+use crate::physical_plan::update::IcebergUpdateExec;
+use crate::physical_plan::update_commit::IcebergUpdateCommitExec;
 use crate::physical_plan::write::IcebergWriteExec;
 use crate::update::UpdateBuilder;
 
@@ -312,6 +314,126 @@ impl TableProvider for IcebergTableProvider {
             self.catalog.clone(),
             coalesce_partitions,
             self.schema.clone(),
+        )))
+    }
+
+    /// Returns the DML capabilities supported by this table.
+    ///
+    /// IcebergTableProvider supports both DELETE and UPDATE operations
+    /// using Copy-on-Write semantics with position delete files.
+    fn dml_capabilities(&self) -> DmlCapabilities {
+        DmlCapabilities::ALL
+    }
+
+    /// Handles SQL DELETE statements by building an execution plan.
+    ///
+    /// Creates position delete files for all rows matching the filter predicates
+    /// and commits them atomically using the DeleteAction transaction.
+    ///
+    /// # Arguments
+    /// * `_state` - The DataFusion session state
+    /// * `filters` - Filter predicates from the DELETE WHERE clause
+    ///
+    /// # Returns
+    /// An execution plan that produces a single row with column `count` (UInt64)
+    /// indicating the number of rows deleted.
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Load fresh table metadata from catalog
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // Note: IcebergDeleteScanExec uses the table's current schema internally,
+        // so schema evolution is handled correctly within the scan operator.
+
+        // Step 1: Scan for rows to delete
+        let delete_scan = Arc::new(IcebergDeleteScanExec::new(
+            table.clone(),
+            None, // Use current snapshot
+            &filters,
+        ));
+
+        // Step 2: Write position delete files
+        let delete_write = Arc::new(IcebergDeleteWriteExec::new(table.clone(), delete_scan));
+
+        // Step 3: Coalesce partitions for single commit
+        let coalesce = Arc::new(CoalescePartitionsExec::new(delete_write));
+
+        // Step 4: Commit delete files
+        Ok(Arc::new(IcebergDeleteCommitExec::new(
+            table,
+            self.catalog.clone(),
+            coalesce.clone(),
+            coalesce.schema(),
+        )))
+    }
+
+    /// Handles SQL UPDATE statements by building an execution plan.
+    ///
+    /// Uses Copy-on-Write semantics: reads matching rows, applies SET expressions,
+    /// writes new data files, creates position delete files for originals,
+    /// and commits everything atomically.
+    ///
+    /// # Arguments
+    /// * `_state` - The DataFusion session state
+    /// * `assignments` - Column assignments from SET clause (column_name, expression)
+    /// * `filters` - Filter predicates from the UPDATE WHERE clause
+    ///
+    /// # Returns
+    /// An execution plan that produces a single row with column `count` (UInt64)
+    /// indicating the number of rows updated.
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Load fresh table metadata from catalog
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // Use fresh schema from loaded table to handle schema evolution
+        let current_schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(to_datafusion_error)?,
+        );
+
+        // Validate that all assigned columns exist in the current schema
+        for (column_name, _) in &assignments {
+            if current_schema.field_with_name(column_name).is_err() {
+                return Err(DataFusionError::Plan(format!(
+                    "Column '{}' not found in table schema",
+                    column_name
+                )));
+            }
+        }
+
+        // Build the UPDATE execution plan with fresh schema
+        let update_exec = Arc::new(IcebergUpdateExec::new(
+            table.clone(),
+            current_schema,
+            assignments,
+            filters,
+        ));
+
+        // Coalesce partitions for single commit
+        let coalesce = Arc::new(CoalescePartitionsExec::new(update_exec));
+
+        // Commit both data files and delete files atomically
+        Ok(Arc::new(IcebergUpdateCommitExec::new(
+            table,
+            self.catalog.clone(),
+            coalesce.clone(),
+            coalesce.schema(),
         )))
     }
 }

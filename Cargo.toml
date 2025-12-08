@@ -136,3 +136,25 @@ uuid = { version = "1.18", features = ["v7"] }
 volo = "0.10.6"
 volo-thrift = "0.10.8"
 zstd = "0.13.3"
+
+# Patch DataFusion to use fork with DML support (delete_from, update methods)
+[patch.crates-io]
+datafusion = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-catalog = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-common = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-common-runtime = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-datasource = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-expr = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-expr-common = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-functions = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-functions-aggregate = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-functions-aggregate-common = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-functions-nested = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-functions-window = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-functions-window-common = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-optimizer = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-physical-expr = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-physical-expr-common = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-physical-optimizer = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-physical-plan = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }
+datafusion-sql = { git = "https://github.com/ethan-tyler/datafusion", branch = "main" }

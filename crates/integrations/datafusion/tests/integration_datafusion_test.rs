@@ -1963,3 +1963,252 @@ async fn test_update_cross_column_swap() -> Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// SQL Interface Tests (Epic 2)
+// These tests verify that SQL UPDATE and DELETE statements work via the
+// TableProvider trait methods (dml_capabilities, delete_from, update).
+// =============================================================================
+
+#[tokio::test]
+async fn test_sql_update_with_predicate() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_sql_update".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "sql_update_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_sql_update.sql_update_table VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Execute SQL UPDATE
+    let result = ctx
+        .sql("UPDATE catalog.test_sql_update.sql_update_table SET foo2 = 'updated' WHERE foo1 = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify count (should be 1 row updated)
+    assert!(!result.is_empty());
+    let count = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 1, "Expected 1 row to be updated");
+
+    // Verify the data was updated correctly
+    let batches = ctx
+        .sql("SELECT foo1, foo2 FROM catalog.test_sql_update.sql_update_table ORDER BY foo1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let values: Vec<_> = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|v| v.unwrap().to_string())
+        .collect();
+
+    assert_eq!(values, vec!["a", "updated", "c"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sql_update_full_table() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_sql_update_full".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "sql_update_full_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_sql_update_full.sql_update_full_table VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Execute SQL UPDATE without WHERE clause (update all rows)
+    let result = ctx
+        .sql("UPDATE catalog.test_sql_update_full.sql_update_full_table SET foo2 = 'all_updated'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify count (should be 3 rows updated)
+    let count = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 3, "Expected 3 rows to be updated");
+
+    // Verify all data was updated
+    let batches = ctx
+        .sql("SELECT DISTINCT foo2 FROM catalog.test_sql_update_full.sql_update_full_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let value = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(value, "all_updated");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sql_delete_with_predicate() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_sql_delete".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "sql_delete_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_sql_delete.sql_delete_table VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Execute SQL DELETE
+    let result = ctx
+        .sql("DELETE FROM catalog.test_sql_delete.sql_delete_table WHERE foo1 = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify count (should be 1 row deleted)
+    let count = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 1, "Expected 1 row to be deleted");
+
+    // Verify the data after delete
+    let batches = ctx
+        .sql("SELECT foo1 FROM catalog.test_sql_delete.sql_delete_table ORDER BY foo1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Expected 2 rows remaining after delete");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sql_delete_full_table() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_sql_delete_full".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let location = temp_path();
+    let creation = get_table_creation(&location, "sql_delete_full_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert test data
+    ctx.sql("INSERT INTO catalog.test_sql_delete_full.sql_delete_full_table VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Execute SQL DELETE without WHERE clause (delete all rows)
+    let result = ctx
+        .sql("DELETE FROM catalog.test_sql_delete_full.sql_delete_full_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify count (should be 3 rows deleted)
+    let count = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 3, "Expected 3 rows to be deleted");
+
+    // Verify table is empty
+    let batches = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_sql_delete_full.sql_delete_full_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let remaining_count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(remaining_count, 0, "Expected 0 rows after full delete");
+
+    Ok(())
+}
