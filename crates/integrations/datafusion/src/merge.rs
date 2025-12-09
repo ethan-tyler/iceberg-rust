@@ -78,6 +78,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -525,26 +526,118 @@ impl MergeBuilder {
     /// - The merge operation fails
     /// - The commit fails (e.g., due to conflicts)
     pub async fn execute(self, _session: &dyn Session) -> DFResult<MergeStats> {
+        use datafusion::execution::context::TaskContext;
+        use datafusion::physical_plan::collect;
+
+        use crate::physical_plan::merge::IcebergMergeExec;
+        use crate::physical_plan::merge_commit::{
+            IcebergMergeCommitExec, MERGE_RESULT_DELETED_COL, MERGE_RESULT_INSERTED_COL,
+            MERGE_RESULT_UPDATED_COL,
+        };
+
         // Validate first
         self.validate()?;
 
-        // TODO: Implement the execution plan
-        // This is where we'll build:
-        // 1. Target scan with metadata columns
-        // 2. FULL OUTER JOIN with source
-        // 3. Row classification and WHEN clause application
-        // 4. Data file writer for updates/inserts
-        // 5. Position delete file writer for deletes/updates
-        // 6. RowDeltaAction commit
+        // Capture baseline snapshot ID for concurrency validation.
+        // This ensures position deletes are still valid at commit time.
+        let baseline_snapshot_id = self.table.metadata().current_snapshot_id();
 
-        // For now, return NotImplemented to allow incremental development
-        Err(DataFusionError::NotImplemented(
-            "MERGE execution is not yet implemented. \
-             Alternative: Use IcebergTableProvider::update() and delete() separately \
-             (note: separate operations produce two snapshots and are NOT atomic). \
-             For atomic row-level updates, MERGE execution support is required."
-                .to_string(),
-        ))
+        // Get the match condition (already validated to be Some)
+        let match_condition = self.match_condition.clone().ok_or_else(|| {
+            DataFusionError::Internal(
+                "MERGE ON condition is required (should have been validated)".to_string(),
+            )
+        })?;
+
+        // Get the source execution plan from the DataFrame
+        let source_plan = self.source.clone().create_physical_plan().await?;
+
+        // Build the MERGE execution plan (scan -> join -> classify -> write files)
+        let merge_exec = Arc::new(IcebergMergeExec::new(
+            self.table.clone(),
+            self.target_schema.clone(),
+            source_plan,
+            match_condition,
+            self.when_matched.clone(),
+            self.when_not_matched.clone(),
+            self.when_not_matched_by_source.clone(),
+        ));
+
+        // Build the commit layer (deserialize files -> commit via RowDelta)
+        let commit_exec = Arc::new(IcebergMergeCommitExec::new(
+            self.table.clone(),
+            self.catalog.clone(),
+            merge_exec.clone() as Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+            merge_exec.schema(),
+            baseline_snapshot_id,
+        ));
+
+        // Execute the full pipeline: join -> classify -> write -> commit
+        let task_ctx = Arc::new(TaskContext::default());
+        let batches = collect(commit_exec, task_ctx).await?;
+
+        // Extract stats from the commit result
+        if batches.is_empty() || batches[0].num_rows() == 0 {
+            return Ok(MergeStats::default());
+        }
+
+        let batch = &batches[0];
+
+        // Parse result columns from commit output
+        let inserted = batch
+            .column_by_name(MERGE_RESULT_INSERTED_COL)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Expected '{}' column in commit result",
+                    MERGE_RESULT_INSERTED_COL
+                ))
+            })?
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected UInt64Array for inserted count".to_string())
+            })?
+            .value(0);
+
+        let updated = batch
+            .column_by_name(MERGE_RESULT_UPDATED_COL)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Expected '{}' column in commit result",
+                    MERGE_RESULT_UPDATED_COL
+                ))
+            })?
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected UInt64Array for updated count".to_string())
+            })?
+            .value(0);
+
+        let deleted = batch
+            .column_by_name(MERGE_RESULT_DELETED_COL)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Expected '{}' column in commit result",
+                    MERGE_RESULT_DELETED_COL
+                ))
+            })?
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected UInt64Array for deleted count".to_string())
+            })?
+            .value(0);
+
+        Ok(MergeStats {
+            rows_inserted: inserted,
+            rows_updated: updated,
+            rows_deleted: deleted,
+            // File metrics could be populated from manifest info in future
+            rows_copied: 0,
+            files_added: 0,
+            files_removed: 0,
+        })
     }
 
     /// Returns the source DataFrame for inspection.

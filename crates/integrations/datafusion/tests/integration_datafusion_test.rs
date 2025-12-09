@@ -2472,3 +2472,491 @@ async fn test_select_after_concurrent_operations() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// MERGE TESTS
+// ============================================================================
+
+/// Helper to set up a test table with data for MERGE tests.
+async fn setup_merge_test_table(
+    namespace_name: &str,
+) -> Result<(Arc<MemoryCatalog>, NamespaceIdent, SessionContext)> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new(namespace_name.to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "merge_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert initial data: [(1, "alice"), (2, "bob"), (3, "charlie")]
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{}.merge_table VALUES \
+         (1, 'alice'), \
+         (2, 'bob'), \
+         (3, 'charlie')",
+        namespace_name
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    Ok((client, namespace, ctx))
+}
+
+/// Test MERGE classification with WHEN MATCHED UPDATE.
+/// Verifies that matched rows are counted correctly.
+#[tokio::test]
+async fn test_merge_classification_matched_update() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let (catalog, namespace, ctx) = setup_merge_test_table("test_merge_matched").await?;
+
+    // Create source DataFrame: [(2, "bob_updated"), (3, "charlie_updated")]
+    // These match rows 2 and 3 in target
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "id",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "name",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    let id_array =
+        Arc::new(datafusion::arrow::array::Int32Array::from(vec![2, 3]))
+            as datafusion::arrow::array::ArrayRef;
+    let name_array = Arc::new(StringArray::from(vec!["bob_updated", "charlie_updated"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch =
+        datafusion::arrow::array::RecordBatch::try_new(source_schema.clone(), vec![id_array, name_array])
+            .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("source_data", source_table).unwrap();
+    let source_df = ctx.table("source_data").await.unwrap();
+
+    // Create provider for programmatic merge
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "merge_table",
+    )
+    .await?;
+
+    // Execute MERGE with WHEN MATCHED THEN UPDATE *
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.foo1").eq(df_col("source.id")))
+        .when_matched(None)
+        .update_all()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Expected classification:
+    // - Row (1, "alice"): NOT_MATCHED_BY_SOURCE (target only) -> no action
+    // - Row (2, "bob"): MATCHED -> UPDATE
+    // - Row (3, "charlie"): MATCHED -> UPDATE
+    // - No rows from source are NOT_MATCHED (all source rows matched)
+    assert_eq!(stats.rows_updated, 2, "Expected 2 rows classified for UPDATE");
+    assert_eq!(stats.rows_inserted, 0, "Expected 0 rows classified for INSERT");
+    assert_eq!(stats.rows_deleted, 0, "Expected 0 rows classified for DELETE");
+
+    Ok(())
+}
+
+/// Test MERGE classification with WHEN NOT MATCHED INSERT.
+/// Verifies that source-only rows are counted correctly.
+#[tokio::test]
+async fn test_merge_classification_not_matched_insert() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let (catalog, namespace, ctx) = setup_merge_test_table("test_merge_insert").await?;
+
+    // Create source DataFrame: [(4, "diana"), (5, "eve")]
+    // These do NOT match any rows in target (target has ids 1, 2, 3)
+    // Source must use same column names as target for INSERT * to work
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "foo1",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "foo2",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    let foo1_array =
+        Arc::new(datafusion::arrow::array::Int32Array::from(vec![4, 5]))
+            as datafusion::arrow::array::ArrayRef;
+    let foo2_array = Arc::new(StringArray::from(vec!["diana", "eve"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch =
+        datafusion::arrow::array::RecordBatch::try_new(source_schema.clone(), vec![foo1_array, foo2_array])
+            .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("source_data2", source_table).unwrap();
+    let source_df = ctx.table("source_data2").await.unwrap();
+
+    // Create provider for programmatic merge
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "merge_table",
+    )
+    .await?;
+
+    // Execute MERGE with WHEN NOT MATCHED THEN INSERT *
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.foo1").eq(df_col("source.foo1")))
+        .when_not_matched(None)
+        .insert_all()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Expected classification:
+    // - All 3 target rows (1,2,3): NOT_MATCHED_BY_SOURCE -> no action (no clause for this)
+    // - Row (4, "diana"): NOT_MATCHED -> INSERT
+    // - Row (5, "eve"): NOT_MATCHED -> INSERT
+    assert_eq!(stats.rows_inserted, 2, "Expected 2 rows classified for INSERT");
+    assert_eq!(stats.rows_updated, 0, "Expected 0 rows classified for UPDATE");
+    assert_eq!(stats.rows_deleted, 0, "Expected 0 rows classified for DELETE");
+
+    Ok(())
+}
+
+/// Test MERGE classification with WHEN NOT MATCHED BY SOURCE DELETE.
+/// Verifies that target-only rows are counted correctly.
+#[tokio::test]
+async fn test_merge_classification_not_matched_by_source_delete() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let (catalog, namespace, ctx) = setup_merge_test_table("test_merge_delete").await?;
+
+    // Create source DataFrame: [(2, "bob_updated")]
+    // Only row 2 matches; rows 1 and 3 are NOT_MATCHED_BY_SOURCE
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "id",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "name",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    let id_array =
+        Arc::new(datafusion::arrow::array::Int32Array::from(vec![2]))
+            as datafusion::arrow::array::ArrayRef;
+    let name_array = Arc::new(StringArray::from(vec!["bob_updated"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch =
+        datafusion::arrow::array::RecordBatch::try_new(source_schema.clone(), vec![id_array, name_array])
+            .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("source_data3", source_table).unwrap();
+    let source_df = ctx.table("source_data3").await.unwrap();
+
+    // Create provider for programmatic merge
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "merge_table",
+    )
+    .await?;
+
+    // Execute MERGE with WHEN NOT MATCHED BY SOURCE THEN DELETE
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.foo1").eq(df_col("source.id")))
+        .when_not_matched_by_source(None)
+        .delete()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Expected classification:
+    // - Row (1, "alice"): NOT_MATCHED_BY_SOURCE -> DELETE
+    // - Row (2, "bob"): MATCHED -> no action (no WHEN MATCHED clause)
+    // - Row (3, "charlie"): NOT_MATCHED_BY_SOURCE -> DELETE
+    assert_eq!(stats.rows_deleted, 2, "Expected 2 rows classified for DELETE");
+    assert_eq!(stats.rows_inserted, 0, "Expected 0 rows classified for INSERT");
+    assert_eq!(stats.rows_updated, 0, "Expected 0 rows classified for UPDATE");
+
+    Ok(())
+}
+
+/// Test MERGE classification with all three clause types.
+/// Verifies comprehensive CDC-style MERGE behavior.
+#[tokio::test]
+async fn test_merge_classification_full_cdc() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let (catalog, namespace, ctx) = setup_merge_test_table("test_merge_cdc").await?;
+
+    // Create source DataFrame simulating CDC data:
+    // - (2, "bob_updated"): matches target row 2 -> UPDATE
+    // - (4, "diana"): new row -> INSERT
+    // Target rows 1 and 3 are NOT_MATCHED_BY_SOURCE -> DELETE
+    // Source must use same column names as target for INSERT * to work
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "foo1",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "foo2",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    let id_array =
+        Arc::new(datafusion::arrow::array::Int32Array::from(vec![2, 4]))
+            as datafusion::arrow::array::ArrayRef;
+    let name_array = Arc::new(StringArray::from(vec!["bob_updated", "diana"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch =
+        datafusion::arrow::array::RecordBatch::try_new(source_schema.clone(), vec![id_array, name_array])
+            .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("source_data4", source_table).unwrap();
+    let source_df = ctx.table("source_data4").await.unwrap();
+
+    // Create provider for programmatic merge
+    let provider = IcebergTableProvider::try_new(
+        catalog.clone(),
+        namespace.clone(),
+        "merge_table",
+    )
+    .await?;
+
+    // Execute full CDC MERGE:
+    // - WHEN MATCHED -> UPDATE *
+    // - WHEN NOT MATCHED -> INSERT *
+    // - WHEN NOT MATCHED BY SOURCE -> DELETE
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.foo1").eq(df_col("source.foo1")))
+        .when_matched(None)
+        .update_all()
+        .when_not_matched(None)
+        .insert_all()
+        .when_not_matched_by_source(None)
+        .delete()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Expected classification:
+    // - Row (1, "alice"): NOT_MATCHED_BY_SOURCE -> DELETE
+    // - Row (2, "bob"): MATCHED -> UPDATE
+    // - Row (3, "charlie"): NOT_MATCHED_BY_SOURCE -> DELETE
+    // - Row (4, "diana"): NOT_MATCHED -> INSERT
+    assert_eq!(stats.rows_updated, 1, "Expected 1 row classified for UPDATE (row 2)");
+    assert_eq!(stats.rows_inserted, 1, "Expected 1 row classified for INSERT (row 4)");
+    assert_eq!(stats.rows_deleted, 2, "Expected 2 rows classified for DELETE (rows 1, 3)");
+
+    // Total affected = 4 (1 update + 1 insert + 2 deletes)
+    assert_eq!(stats.total_affected(), 4, "Expected 4 total rows affected");
+
+    Ok(())
+}
+
+/// Test MERGE E2E: verify commit persists by reloading table from catalog.
+/// This is the critical test that proves MERGE actually commits atomically.
+#[tokio::test]
+async fn test_merge_e2e_commit_persists() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_merge_e2e".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "e2e_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog_provider = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog_provider.clone());
+
+    // Insert initial data: [(1, "alice"), (2, "bob"), (3, "charlie")]
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{}.e2e_table VALUES \
+         (1, 'alice'), \
+         (2, 'bob'), \
+         (3, 'charlie')",
+        "test_merge_e2e"
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Verify initial data
+    let initial_count = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_merge_e2e.e2e_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let initial_cnt = initial_count[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(initial_cnt, 3, "Initial table should have 3 rows");
+
+    // Create source DataFrame for MERGE:
+    // - (2, "bob_updated"): matches target -> UPDATE
+    // - (4, "diana"): new row -> INSERT
+    // - Rows 1 and 3: NOT_MATCHED_BY_SOURCE -> DELETE
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "foo1",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "foo2",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    let id_array =
+        Arc::new(datafusion::arrow::array::Int32Array::from(vec![2, 4]))
+            as datafusion::arrow::array::ArrayRef;
+    let name_array = Arc::new(StringArray::from(vec!["bob_updated", "diana"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch =
+        datafusion::arrow::array::RecordBatch::try_new(source_schema.clone(), vec![id_array, name_array])
+            .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("e2e_source", source_table).unwrap();
+    let source_df = ctx.table("e2e_source").await.unwrap();
+
+    // Execute MERGE
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "e2e_table",
+    )
+    .await?;
+
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.foo1").eq(df_col("source.foo1")))
+        .when_matched(None)
+        .update_all()
+        .when_not_matched(None)
+        .insert_all()
+        .when_not_matched_by_source(None)
+        .delete()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Verify stats
+    assert_eq!(stats.rows_updated, 1, "Should update 1 row (id=2)");
+    assert_eq!(stats.rows_inserted, 1, "Should insert 1 row (id=4)");
+    assert_eq!(stats.rows_deleted, 2, "Should delete 2 rows (ids 1, 3)");
+
+    // ========== CRITICAL: Reload table from catalog ==========
+    // This proves the commit actually persisted to the table metadata
+    let fresh_provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "e2e_table",
+    )
+    .await?;
+
+    // Register the fresh provider
+    ctx.deregister_table("fresh_e2e_table").ok();
+    ctx.register_table("fresh_e2e_table", Arc::new(fresh_provider)).unwrap();
+
+    // Query the freshly loaded table
+    let result = ctx
+        .sql("SELECT foo1, foo2 FROM fresh_e2e_table ORDER BY foo1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Should have 2 rows: (2, "bob_updated") and (4, "diana")
+    assert_eq!(result.len(), 1, "Should have one batch");
+    let batch = &result[0];
+    assert_eq!(batch.num_rows(), 2, "Should have 2 rows after MERGE");
+
+    let foo1_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let foo2_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify row 1: (2, "bob_updated")
+    assert_eq!(foo1_col.value(0), 2);
+    assert_eq!(foo2_col.value(0), "bob_updated");
+
+    // Verify row 2: (4, "diana")
+    assert_eq!(foo1_col.value(1), 4);
+    assert_eq!(foo2_col.value(1), "diana");
+
+    Ok(())
+}
