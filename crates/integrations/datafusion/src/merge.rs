@@ -935,6 +935,8 @@ mod tests {
             rows_copied: 100, // CoW overhead
             files_added: 2,
             files_removed: 1,
+            dpp_applied: false,
+            dpp_partition_count: 0,
         };
         assert_eq!(stats.total_affected(), 18); // 10 + 5 + 3 (logical changes)
         assert_eq!(stats.total_rows_written(), 115); // 10 + 5 + 100 (I/O cost)
@@ -949,6 +951,8 @@ mod tests {
             rows_copied: 100,
             files_added: 2,
             files_removed: 1,
+            dpp_applied: true,
+            dpp_partition_count: 5,
         };
         let stats2 = stats1.clone();
         assert_eq!(stats1, stats2);

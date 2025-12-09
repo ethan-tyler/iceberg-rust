@@ -3361,6 +3361,8 @@ mod tests {
             rows_copied: 0,
             files_added: 2,
             files_removed: 1,
+            dpp_applied: true,
+            dpp_partition_count: 3,
         };
 
         let result = IcebergMergeExec::make_result_batch(
