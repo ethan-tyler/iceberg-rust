@@ -42,17 +42,9 @@
 //!
 //! # Current Limitations
 //!
-//! **Partitioned tables**: MERGE on partitioned tables is **not supported** and will
-//! return an error. Partition-aware file writing (routing rows to correct partitions
-//! and setting partition values on DataFiles) is required before this can be enabled.
-//!
 //! **Memory**: Both target table and source data are materialized in memory for the
 //! FULL OUTER JOIN. This will not scale to large tables. For production use with
 //! large datasets, a streaming join implementation would be needed.
-//!
-//! **Single-key join**: The ON condition parser (`extract_join_keys`) only handles
-//! simple equality conditions like `col("a") = col("b")`. Composite keys with AND
-//! conditions are not yet supported.
 //!
 //! **WHEN clause conditions**: Conditional clauses (e.g., `WHEN MATCHED AND x > 0`)
 //! are parsed but conditions are ignored during evaluation. Only unconditional
@@ -84,9 +76,15 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{StreamExt, TryStreamExt};
+use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataFileFormat, TableProperties, serialize_data_file_to_json};
+use iceberg::expr::{Predicate, Reference};
+use iceberg::spec::{
+    DataFile, DataFileFormat, PartitionKey, PartitionSpecRef, PrimitiveType, SchemaRef,
+    TableProperties, Transform, serialize_data_file_to_json,
+};
 use iceberg::table::Table;
+use iceberg::transform::create_transform_function;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
@@ -96,6 +94,8 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
+use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -127,6 +127,9 @@ pub const MERGE_DELETE_FILES_COL: &str = "delete_files";
 pub const MERGE_INSERTED_COUNT_COL: &str = "inserted_count";
 pub const MERGE_UPDATED_COUNT_COL: &str = "updated_count";
 pub const MERGE_DELETED_COUNT_COL: &str = "deleted_count";
+/// Column names for DPP metrics in output
+pub const MERGE_DPP_APPLIED_COL: &str = "dpp_applied";
+pub const MERGE_DPP_PARTITION_COUNT_COL: &str = "dpp_partition_count";
 
 /// Encoded action values for the MERGE_ACTION_COL column.
 /// These are i8 values that encode the MergeAction enum.
@@ -139,6 +142,112 @@ pub mod action_codes {
     pub const DELETE: i8 = 3;
     /// No action - keep the row as-is
     pub const NO_ACTION: i8 = 0;
+}
+
+// ============================================================================
+// Dynamic Partition Pruning (DPP) Configuration
+// ============================================================================
+
+/// Default maximum number of distinct partition values for DPP to be enabled.
+/// If source touches more partitions than this, DPP is disabled to avoid huge IN lists.
+pub const DPP_DEFAULT_MAX_PARTITIONS: usize = 1000;
+
+/// Configuration options for MERGE operations.
+///
+/// Controls optimization features like Dynamic Partition Pruning (DPP) and
+/// memory management for large-scale MERGE operations.
+///
+/// # Dynamic Partition Pruning (DPP)
+///
+/// DPP optimizes MERGE performance by pruning target partitions based on
+/// the partition values present in the source data. This reduces I/O by
+/// only scanning partitions that could potentially match.
+///
+/// ## When DPP Applies
+///
+/// DPP is applied when **all** of the following conditions are met:
+/// - `enable_dpp` is `true` (default)
+/// - The table uses **identity** partition transforms (not bucket, truncate, etc.)
+/// - At least one join key in the ON condition is also a partition column
+/// - The partition column has a supported data type (see below)
+/// - The number of distinct partition values in source is ≤ `dpp_max_partitions`
+///
+/// ## Supported Data Types
+///
+/// DPP can extract partition values from these Arrow/Iceberg types:
+/// - `Int32` / Iceberg `int`
+/// - `Int64` / Iceberg `long`
+/// - `Utf8` / `LargeUtf8` / Iceberg `string`
+/// - `Date32` / Iceberg `date`
+///
+/// Other types (timestamps, decimals, binary, etc.) will cause DPP to be
+/// skipped silently, falling back to a full table scan.
+///
+/// ## Current Limitations
+///
+/// - **Single partition column**: For compound partition keys like `(region, date)`,
+///   DPP currently only prunes on the **first** partition column that appears in
+///   the join condition. Future enhancement: prune on all matching partition columns.
+///
+/// - **Identity transforms only**: Transforms like `bucket()`, `truncate()`,
+///   `days()`, `months()` are not supported. Future enhancement: support date/time
+///   extraction transforms where the mapping is straightforward.
+///
+/// ## Observability
+///
+/// Check the returned [`MergeStats`] for DPP metrics:
+/// - `dpp_applied`: Whether DPP was used for this operation
+/// - `dpp_partition_count`: Number of partitions pruned to (or the count that exceeded threshold)
+///
+/// In debug builds, diagnostic messages are printed to stderr when DPP is
+/// skipped due to non-identity transforms, unsupported types, or threshold limits.
+#[derive(Debug, Clone)]
+pub struct MergeConfig {
+    /// Enable Dynamic Partition Pruning (DPP) to reduce target table scan.
+    ///
+    /// When enabled and the join key includes a partition column, MERGE will:
+    /// 1. Extract distinct partition values from source data
+    /// 2. Build an IN filter for target table scan
+    /// 3. Skip partitions not touched by source data
+    ///
+    /// Default: `true`
+    pub enable_dpp: bool,
+
+    /// Maximum number of distinct partition values before disabling DPP.
+    ///
+    /// If source data touches more than this many partitions, DPP is disabled
+    /// to avoid generating very large IN lists that may hurt performance.
+    ///
+    /// Default: `1000`
+    pub dpp_max_partitions: usize,
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            enable_dpp: true,
+            dpp_max_partitions: DPP_DEFAULT_MAX_PARTITIONS,
+        }
+    }
+}
+
+impl MergeConfig {
+    /// Creates a new MergeConfig with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enables or disables Dynamic Partition Pruning.
+    pub fn with_dpp(mut self, enable: bool) -> Self {
+        self.enable_dpp = enable;
+        self
+    }
+
+    /// Sets the maximum partition count threshold for DPP.
+    pub fn with_dpp_max_partitions(mut self, max: usize) -> Self {
+        self.dpp_max_partitions = max;
+        self
+    }
 }
 
 /// Classification of a row after FULL OUTER JOIN.
@@ -233,6 +342,437 @@ impl MergeAction {
     }
 }
 
+// ============================================================================
+// Partition-Aware Writers for MERGE Operations
+// ============================================================================
+
+// Type aliases for the complex writer types
+type DataFileWriterType = iceberg::writer::base_writer::data_file_writer::DataFileWriter<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+type PositionDeleteWriterType = iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+type DataFileWriterBuilderType = DataFileWriterBuilder<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+type PositionDeleteWriterBuilderType = PositionDeleteFileWriterBuilder<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+/// Handles both data file and position delete file writing with partition awareness.
+///
+/// For unpartitioned tables, writes go directly to single writers.
+/// For partitioned tables, uses FanoutWriter to route writes to correct partitions.
+struct MergeWriters {
+    /// Data file writer - either unpartitioned or fanout
+    data_writer: MergeDataWriter,
+    /// Partition splitter for data files (None for unpartitioned)
+    partition_splitter: Option<RecordBatchPartitionSplitter>,
+    /// Delete file writer - either unpartitioned or fanout
+    delete_writer: MergeDeleteWriter,
+    /// Schema for position delete batches
+    delete_schema: ArrowSchemaRef,
+    /// Partition spec for computing partition keys
+    partition_spec: PartitionSpecRef,
+    /// Iceberg schema for partition key computation
+    iceberg_schema: SchemaRef,
+}
+
+/// Data file writer that supports both partitioned and unpartitioned tables.
+enum MergeDataWriter {
+    Unpartitioned(DataFileWriterType),
+    Partitioned(FanoutWriter<DataFileWriterBuilderType>),
+}
+
+/// Position delete writer that supports both partitioned and unpartitioned tables.
+enum MergeDeleteWriter {
+    Unpartitioned(PositionDeleteWriterType),
+    Partitioned(FanoutWriter<PositionDeleteWriterBuilderType>),
+}
+
+impl MergeWriters {
+    /// Creates writers for MERGE output, either partitioned or unpartitioned.
+    async fn new(table: &Table) -> DFResult<Self> {
+        let file_io = table.file_io().clone();
+        let partition_spec = table.metadata().default_partition_spec().clone();
+        let iceberg_schema = table.metadata().current_schema().clone();
+        let is_partitioned = !partition_spec.is_unpartitioned();
+
+        let target_file_size = table
+            .metadata()
+            .properties()
+            .get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
+
+        // Create location generator
+        let location_generator =
+            DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
+
+        // === Data file writer ===
+        let data_file_name_generator = DefaultFileNameGenerator::new(
+            format!("merge-data-{}", Uuid::now_v7()),
+            None,
+            DataFileFormat::Parquet,
+        );
+        let parquet_writer = ParquetWriterBuilder::new(
+            WriterProperties::default(),
+            iceberg_schema.clone(),
+        );
+        let data_rolling_writer = RollingFileWriterBuilder::new(
+            parquet_writer.clone(),
+            target_file_size,
+            file_io.clone(),
+            location_generator.clone(),
+            data_file_name_generator,
+        );
+        let data_file_builder = DataFileWriterBuilder::new(data_rolling_writer);
+
+        // === Position delete file writer ===
+        let delete_config = PositionDeleteWriterConfig::new();
+        let delete_schema = delete_config.delete_schema().clone();
+
+        // Build Iceberg schema for position deletes
+        let iceberg_delete_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(table.metadata().current_schema_id())
+                .with_fields(vec![
+                    iceberg::spec::NestedField::required(
+                        iceberg::writer::base_writer::position_delete_writer::POSITION_DELETE_FILE_PATH_FIELD_ID,
+                        "file_path",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                    )
+                    .into(),
+                    iceberg::spec::NestedField::required(
+                        iceberg::writer::base_writer::position_delete_writer::POSITION_DELETE_POS_FIELD_ID,
+                        "pos",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                    )
+                    .into(),
+                ])
+                .build()
+                .map_err(to_datafusion_error)?,
+        );
+
+        let delete_parquet_writer =
+            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema);
+        let delete_file_name_generator = DefaultFileNameGenerator::new(
+            format!("merge-delete-{}", Uuid::now_v7()),
+            None,
+            DataFileFormat::Parquet,
+        );
+        let delete_rolling_writer = RollingFileWriterBuilder::new(
+            delete_parquet_writer,
+            target_file_size,
+            file_io,
+            location_generator,
+            delete_file_name_generator,
+        );
+        let delete_file_builder =
+            PositionDeleteFileWriterBuilder::new(delete_rolling_writer, delete_config);
+
+        // Create partition splitter if partitioned
+        let partition_splitter = if is_partitioned {
+            Some(
+                RecordBatchPartitionSplitter::try_new_with_computed_values(
+                    iceberg_schema.clone(),
+                    partition_spec.clone(),
+                )
+                .map_err(to_datafusion_error)?,
+            )
+        } else {
+            None
+        };
+
+        // Create writers based on partition status
+        let (data_writer, delete_writer) = if is_partitioned {
+            (
+                MergeDataWriter::Partitioned(FanoutWriter::new(data_file_builder)),
+                MergeDeleteWriter::Partitioned(FanoutWriter::new(delete_file_builder)),
+            )
+        } else {
+            (
+                MergeDataWriter::Unpartitioned(
+                    data_file_builder
+                        .build(None)
+                        .await
+                        .map_err(to_datafusion_error)?,
+                ),
+                MergeDeleteWriter::Unpartitioned(
+                    delete_file_builder
+                        .build(None)
+                        .await
+                        .map_err(to_datafusion_error)?,
+                ),
+            )
+        };
+
+        Ok(Self {
+            data_writer,
+            partition_splitter,
+            delete_writer,
+            delete_schema,
+            partition_spec,
+            iceberg_schema,
+        })
+    }
+
+    /// Writes a data batch, automatically splitting by partition if needed.
+    async fn write_data(&mut self, batch: RecordBatch) -> DFResult<()> {
+        match &mut self.data_writer {
+            MergeDataWriter::Unpartitioned(writer) => {
+                writer.write(batch).await.map_err(to_datafusion_error)
+            }
+            MergeDataWriter::Partitioned(writer) => {
+                let splitter = self.partition_splitter.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Partition splitter required for partitioned table".into(),
+                    )
+                })?;
+                let partitioned_batches = splitter.split(&batch).map_err(to_datafusion_error)?;
+                for (partition_key, partition_batch) in partitioned_batches {
+                    writer
+                        .write(partition_key, partition_batch)
+                        .await
+                        .map_err(to_datafusion_error)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Writes a position delete batch.
+    /// For partitioned tables, the partition_key must be provided.
+    async fn write_deletes(
+        &mut self,
+        batch: RecordBatch,
+        partition_key: Option<PartitionKey>,
+    ) -> DFResult<()> {
+        match &mut self.delete_writer {
+            MergeDeleteWriter::Unpartitioned(writer) => {
+                writer.write(batch).await.map_err(to_datafusion_error)
+            }
+            MergeDeleteWriter::Partitioned(writer) => {
+                let key = partition_key.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Partition key required for delete writes on partitioned table".into(),
+                    )
+                })?;
+                writer
+                    .write(key, batch)
+                    .await
+                    .map_err(to_datafusion_error)
+            }
+        }
+    }
+
+    /// Returns the delete schema for creating position delete batches.
+    fn delete_schema(&self) -> &ArrowSchemaRef {
+        &self.delete_schema
+    }
+
+    /// Checks if the table is partitioned.
+    fn is_partitioned(&self) -> bool {
+        self.partition_splitter.is_some()
+    }
+
+    /// Computes partition key from a row in the joined batch (using target columns).
+    ///
+    /// This is used for position deletes on partitioned tables - we need to know
+    /// which partition the deleted row belongs to.
+    fn compute_partition_key_from_target_row(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        _target_schema: &ArrowSchemaRef,
+    ) -> DFResult<Option<PartitionKey>> {
+        if !self.is_partitioned() {
+            return Ok(None);
+        }
+
+        // Extract partition values from the target row columns
+        // The partition columns are in the batch with target_ prefix
+        let mut partition_values = Vec::new();
+        for field in self.partition_spec.fields() {
+            let source_field = self
+                .iceberg_schema
+                .field_by_id(field.source_id)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "Partition source field {} not found in schema",
+                        field.source_id
+                    ))
+                })?;
+
+            // Find the column in the batch (with target_ prefix)
+            let col_name = format!("{}{}", TARGET_PREFIX, source_field.name);
+            let col_idx = batch
+                .schema()
+                .index_of(&col_name)
+                .map_err(|_| {
+                    DataFusionError::Internal(format!(
+                        "Partition column {} not found in batch",
+                        col_name
+                    ))
+                })?;
+
+            let col = batch.column(col_idx);
+
+            // Get the primitive type from the source field
+            let primitive_type = source_field
+                .field_type
+                .as_primitive_type()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "Partition source field {} is not a primitive type",
+                        source_field.name
+                    ))
+                })?;
+
+            // Extract the datum (literal + type) from the column
+            let datum = extract_datum_from_column(col, row_idx, primitive_type)?;
+
+            // Create transform function and apply it
+            let transform_fn = create_transform_function(&field.transform)
+                .map_err(to_datafusion_error)?;
+            let transformed = transform_fn
+                .transform_literal(&datum)
+                .map_err(to_datafusion_error)?
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Transform produced null for partition value".into())
+                })?;
+
+            // Convert datum's primitive literal to Literal for the partition struct
+            let literal = iceberg::spec::Literal::Primitive(transformed.literal().clone());
+            partition_values.push(literal);
+        }
+
+        let partition_struct =
+            iceberg::spec::Struct::from_iter(partition_values.into_iter().map(Some));
+        Ok(Some(PartitionKey::new(
+            (*self.partition_spec).clone(),
+            self.iceberg_schema.clone(),
+            partition_struct,
+        )))
+    }
+
+    /// Closes all writers and returns the written data files.
+    async fn close(self) -> DFResult<(Vec<DataFile>, Vec<DataFile>)> {
+        let data_files = match self.data_writer {
+            MergeDataWriter::Unpartitioned(mut writer) => {
+                writer.close().await.map_err(to_datafusion_error)?
+            }
+            MergeDataWriter::Partitioned(writer) => {
+                writer.close().await.map_err(to_datafusion_error)?
+            }
+        };
+
+        let delete_files = match self.delete_writer {
+            MergeDeleteWriter::Unpartitioned(mut writer) => {
+                writer.close().await.map_err(to_datafusion_error)?
+            }
+            MergeDeleteWriter::Partitioned(writer) => {
+                writer.close().await.map_err(to_datafusion_error)?
+            }
+        };
+
+        Ok((data_files, delete_files))
+    }
+}
+
+/// Extracts a Datum (value + type) from an array column at the given row index.
+///
+/// This is used for partition key computation where we need both the value and its type
+/// to properly apply transforms.
+fn extract_datum_from_column(
+    col: &ArrayRef,
+    row_idx: usize,
+    primitive_type: &PrimitiveType,
+) -> DFResult<iceberg::spec::Datum> {
+    use datafusion::arrow::array::*;
+
+    if col.is_null(row_idx) {
+        return Err(DataFusionError::Internal(
+            "Cannot extract partition value from null".into(),
+        ));
+    }
+
+    let datum = match primitive_type {
+        PrimitiveType::Int => {
+            let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                DataFusionError::Internal("Expected Int32Array for Int type".into())
+            })?;
+            iceberg::spec::Datum::int(arr.value(row_idx))
+        }
+        PrimitiveType::Long => {
+            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                DataFusionError::Internal("Expected Int64Array for Long type".into())
+            })?;
+            iceberg::spec::Datum::long(arr.value(row_idx))
+        }
+        PrimitiveType::String => {
+            // Try both StringArray and LargeStringArray
+            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                iceberg::spec::Datum::string(arr.value(row_idx))
+            } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+                iceberg::spec::Datum::string(arr.value(row_idx))
+            } else {
+                return Err(DataFusionError::Internal(
+                    "Expected StringArray or LargeStringArray for String type".into(),
+                ));
+            }
+        }
+        PrimitiveType::Date => {
+            let arr = col.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
+                DataFusionError::Internal("Expected Date32Array for Date type".into())
+            })?;
+            iceberg::spec::Datum::date(arr.value(row_idx))
+        }
+        PrimitiveType::Timestamp => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Expected TimestampMicrosecondArray for Timestamp type".into(),
+                    )
+                })?;
+            iceberg::spec::Datum::timestamp_micros(arr.value(row_idx))
+        }
+        PrimitiveType::Timestamptz => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Expected TimestampMicrosecondArray for Timestamptz type".into(),
+                    )
+                })?;
+            iceberg::spec::Datum::timestamptz_micros(arr.value(row_idx))
+        }
+        _ => {
+            return Err(DataFusionError::NotImplemented(format!(
+                "Partition value extraction not implemented for {:?}",
+                primitive_type
+            )));
+        }
+    };
+
+    Ok(datum)
+}
+
 /// Execution plan for MERGE operations using Copy-on-Write semantics.
 ///
 /// This plan performs a complete MERGE operation:
@@ -259,6 +799,8 @@ pub struct IcebergMergeExec {
     when_not_matched: Vec<WhenNotMatchedClause>,
     /// WHEN NOT MATCHED BY SOURCE clauses for target-only rows
     when_not_matched_by_source: Vec<WhenNotMatchedBySourceClause>,
+    /// Configuration for Dynamic Partition Pruning and other optimizations
+    merge_config: MergeConfig,
     /// Output schema for this execution plan
     output_schema: ArrowSchemaRef,
     /// Plan properties for query optimization
@@ -276,6 +818,7 @@ impl IcebergMergeExec {
         when_matched: Vec<WhenMatchedClause>,
         when_not_matched: Vec<WhenNotMatchedClause>,
         when_not_matched_by_source: Vec<WhenNotMatchedBySourceClause>,
+        merge_config: MergeConfig,
     ) -> Self {
         let output_schema = Self::make_output_schema();
         let plan_properties = Self::compute_properties(output_schema.clone());
@@ -288,6 +831,7 @@ impl IcebergMergeExec {
             when_matched,
             when_not_matched,
             when_not_matched_by_source,
+            merge_config,
             output_schema,
             plan_properties,
         }
@@ -301,6 +845,8 @@ impl IcebergMergeExec {
             Field::new(MERGE_INSERTED_COUNT_COL, DataType::UInt64, false),
             Field::new(MERGE_UPDATED_COUNT_COL, DataType::UInt64, false),
             Field::new(MERGE_DELETED_COUNT_COL, DataType::UInt64, false),
+            Field::new(MERGE_DPP_APPLIED_COL, DataType::Boolean, false),
+            Field::new(MERGE_DPP_PARTITION_COUNT_COL, DataType::UInt64, false),
         ]))
     }
 
@@ -320,6 +866,8 @@ impl IcebergMergeExec {
         delete_files_json: Vec<String>,
         stats: &MergeStats,
     ) -> DFResult<RecordBatch> {
+        use datafusion::arrow::array::BooleanArray;
+
         let data_files_str = data_files_json.join("\n");
         let delete_files_str = delete_files_json.join("\n");
 
@@ -334,6 +882,11 @@ impl IcebergMergeExec {
         let deleted_array = Arc::new(datafusion::arrow::array::UInt64Array::from(vec![
             stats.rows_deleted,
         ])) as ArrayRef;
+        let dpp_applied_array =
+            Arc::new(BooleanArray::from(vec![stats.dpp_applied])) as ArrayRef;
+        let dpp_partition_count_array = Arc::new(datafusion::arrow::array::UInt64Array::from(
+            vec![stats.dpp_partition_count as u64],
+        )) as ArrayRef;
 
         RecordBatch::try_new(
             Self::make_output_schema(),
@@ -343,6 +896,8 @@ impl IcebergMergeExec {
                 inserted_array,
                 updated_array,
                 deleted_array,
+                dpp_applied_array,
+                dpp_partition_count_array,
             ],
         )
         .map_err(|e| {
@@ -475,6 +1030,7 @@ impl ExecutionPlan for IcebergMergeExec {
             self.when_matched.clone(),
             self.when_not_matched.clone(),
             self.when_not_matched_by_source.clone(),
+            self.merge_config.clone(),
         )))
     }
 
@@ -495,6 +1051,7 @@ impl ExecutionPlan for IcebergMergeExec {
         let when_matched = self.when_matched.clone();
         let when_not_matched = self.when_not_matched.clone();
         let when_not_matched_by_source = self.when_not_matched_by_source.clone();
+        let merge_config = self.merge_config.clone();
         let output_schema = self.output_schema.clone();
 
         let stream = futures::stream::once(async move {
@@ -508,6 +1065,7 @@ impl ExecutionPlan for IcebergMergeExec {
                 when_matched,
                 when_not_matched,
                 when_not_matched_by_source,
+                merge_config,
             )
             .await
         })
@@ -556,118 +1114,166 @@ async fn execute_merge(
     when_matched: Vec<WhenMatchedClause>,
     when_not_matched: Vec<WhenNotMatchedClause>,
     when_not_matched_by_source: Vec<WhenNotMatchedBySourceClause>,
+    merge_config: MergeConfig,
 ) -> DFResult<RecordBatch> {
-    // === Validation: Reject partitioned tables (not yet supported) ===
-    let partition_spec = table.metadata().default_partition_spec();
-    if !partition_spec.is_unpartitioned() {
-        return Err(DataFusionError::NotImplemented(
-            "MERGE on partitioned tables is not yet supported. \
-             Partition-aware file writing will be added in a future commit."
-                .to_string(),
-        ));
+    // === Safety Check: Partition spec evolution guard ===
+    // MERGE operations with partitioned tables currently only support tables with
+    // a single partition spec. Tables that have undergone partition evolution may
+    // have data files written with different partition specs, which could lead to
+    // incorrect partition routing for position deletes.
+    let partition_spec_count = table.metadata().partition_specs_iter().count();
+    if partition_spec_count > 1 && !table.metadata().default_partition_spec().is_unpartitioned() {
+        return Err(DataFusionError::NotImplemented(format!(
+            "MERGE on partitioned tables with partition evolution is not yet supported. \
+             Table '{}' has {} partition specs. MERGE requires all data to use the same \
+             partition spec to ensure position deletes are correctly routed.",
+            table.identifier(),
+            partition_spec_count
+        )));
     }
 
-    // === Step 1: Scan target table with metadata columns ===
-    let target_batches = scan_target_with_metadata(&table, &schema).await?;
+    // === Step 1: Extract join keys from match condition (supports compound keys) ===
+    // We need join keys early for DPP computation
+    let join_keys = extract_join_keys(&match_condition)?;
 
-    if target_batches.is_empty() && when_not_matched.is_empty() {
-        // No target rows and no INSERT clause - nothing to do
-        return IcebergMergeExec::make_result_batch(vec![], vec![], &MergeStats::default());
-    }
-
-    // === Step 2: Materialize source data ===
+    // === Step 2: Materialize source data FIRST (required for DPP) ===
     let source_batches = materialize_source(source, partition, context).await?;
+
+    // Memory warning for large MERGE operations
+    // Note: Streaming execution (Phase 3) will address memory bounds for very large merges
+    let source_row_count: usize = source_batches.iter().map(|b| b.num_rows()).sum();
+    const LARGE_MERGE_THRESHOLD: usize = 1_000_000;
+    if source_row_count > LARGE_MERGE_THRESHOLD {
+        eprintln!(
+            "MERGE: Large source dataset ({} rows). Memory usage may be significant. \
+             Consider batching source data for very large merges. \
+             DPP is {} to help reduce target scan scope.",
+            source_row_count,
+            if merge_config.enable_dpp { "enabled" } else { "disabled" }
+        );
+    }
 
     if source_batches.is_empty() && when_not_matched_by_source.is_empty() {
         // No source rows and no DELETE BY SOURCE clause - nothing to do
         return IcebergMergeExec::make_result_batch(vec![], vec![], &MergeStats::default());
     }
 
-    // === Step 3: Extract join keys from match condition ===
-    let (target_key, source_key) = extract_join_keys(&match_condition)?;
+    // === Step 3: Compute Dynamic Partition Pruning (DPP) filter ===
+    let dpp_result = compute_dpp_filter(&source_batches, &join_keys, &table, &merge_config)?;
 
-    // === Step 4: Perform FULL OUTER JOIN ===
+    // Log DPP status for debugging (will appear in debug builds)
+    #[cfg(debug_assertions)]
+    if let Some(ref col) = dpp_result.partition_column {
+        if dpp_result.predicate.is_some() {
+            eprintln!(
+                "MERGE DPP: Enabled on column '{}', pruning to {} partition(s)",
+                col, dpp_result.partition_count
+            );
+        } else if dpp_result.partition_count > merge_config.dpp_max_partitions {
+            eprintln!(
+                "MERGE DPP: Disabled - {} partitions exceeds threshold {}",
+                dpp_result.partition_count, merge_config.dpp_max_partitions
+            );
+        }
+    }
+
+    // Capture DPP stats before consuming predicate
+    let dpp_applied = dpp_result.predicate.is_some();
+    let dpp_partition_count = dpp_result.partition_count;
+
+    // === Step 4: Scan target table with metadata columns (with DPP filter) ===
+    let target_batches =
+        scan_target_with_metadata(&table, &schema, dpp_result.predicate).await?;
+
+    if target_batches.is_empty() && when_not_matched.is_empty() {
+        // No target rows and no INSERT clause - nothing to do
+        // Still report DPP stats even on early return
+        let stats = MergeStats {
+            dpp_applied,
+            dpp_partition_count,
+            ..Default::default()
+        };
+        return IcebergMergeExec::make_result_batch(vec![], vec![], &stats);
+    }
+
+    // === Step 5: Perform FULL OUTER JOIN ===
     let joined_batches = perform_full_outer_join(
         &target_batches,
         &source_batches,
         &schema,
-        &target_key,
-        &source_key,
+        &join_keys,
     )
     .await?;
 
-    // === Step 5: Set up writers for file output ===
-    let (mut data_file_writer, mut delete_file_writer, delete_schema) =
-        setup_writers(&table, &schema).await?;
+    // === Step 6: Set up partition-aware writers for file output ===
+    let mut writers = MergeWriters::new(&table).await?;
 
-    // === Step 6: Process joined rows and write files ===
-    let mut stats = MergeStats::default();
+    // === Step 7: Process joined rows and write files ===
+    let mut stats = MergeStats {
+        dpp_applied,
+        dpp_partition_count,
+        ..Default::default()
+    };
 
-    let prefixed_target_key = format!("{}{}", TARGET_PREFIX, target_key);
-    let prefixed_source_key = format!("{}{}", SOURCE_PREFIX, source_key);
+    // Build prefixed key column names for all join keys
+    let prefixed_join_keys: Vec<(String, String)> = join_keys
+        .iter()
+        .map(|(t, s)| {
+            (
+                format!("{}{}", TARGET_PREFIX, t),
+                format!("{}{}", SOURCE_PREFIX, s),
+            )
+        })
+        .collect();
 
     // Metadata column names after prefix
     let file_path_col_name = format!("{}{}", TARGET_PREFIX, MERGE_FILE_PATH_COL);
     let row_pos_col_name = format!("{}{}", TARGET_PREFIX, MERGE_ROW_POS_COL);
 
     for batch in &joined_batches {
-        // Process MATCHED rows (both keys non-null)
+        // Process MATCHED rows (all keys non-null on both sides)
         process_matched_rows(
             batch,
-            &prefixed_target_key,
-            &prefixed_source_key,
+            &prefixed_join_keys,
             &file_path_col_name,
             &row_pos_col_name,
             &schema,
             &when_matched,
-            &mut data_file_writer,
-            &mut delete_file_writer,
-            &delete_schema,
+            &mut writers,
             &mut stats,
         )
         .await?;
 
-        // Process NOT_MATCHED rows (target key null, source key non-null)
+        // Process NOT_MATCHED rows (any target key null, all source keys non-null)
         process_not_matched_rows(
             batch,
-            &prefixed_target_key,
-            &prefixed_source_key,
+            &prefixed_join_keys,
             &schema,
             &when_not_matched,
-            &mut data_file_writer,
+            &mut writers,
             &mut stats,
         )
         .await?;
 
-        // Process NOT_MATCHED_BY_SOURCE rows (target key non-null, source key null)
+        // Process NOT_MATCHED_BY_SOURCE rows (all target keys non-null, any source key null)
         process_not_matched_by_source_rows(
             batch,
-            &prefixed_target_key,
-            &prefixed_source_key,
+            &prefixed_join_keys,
             &file_path_col_name,
             &row_pos_col_name,
             &schema,
             &when_not_matched_by_source,
-            &mut data_file_writer,
-            &mut delete_file_writer,
-            &delete_schema,
+            &mut writers,
             &mut stats,
         )
         .await?;
     }
 
-    // === Step 7: Close writers and collect files ===
+    // === Step 8: Close writers and collect files ===
     let partition_type = table.metadata().default_partition_type().clone();
     let format_version = table.metadata().format_version();
 
-    let data_files = data_file_writer
-        .close()
-        .await
-        .map_err(to_datafusion_error)?;
-    let delete_files = delete_file_writer
-        .close()
-        .await
-        .map_err(to_datafusion_error)?;
+    let (data_files, delete_files) = writers.close().await?;
 
     // Serialize to JSON
     let data_files_json: Vec<String> = data_files
@@ -689,15 +1295,311 @@ async fn execute_merge(
     IcebergMergeExec::make_result_batch(data_files_json, delete_files_json, &stats)
 }
 
+// ============================================================================
+// Dynamic Partition Pruning (DPP) Functions
+// ============================================================================
+
+/// Result of DPP analysis, containing the filter predicate and statistics.
+#[derive(Debug)]
+pub struct DppResult {
+    /// The partition filter predicate (if applicable)
+    pub predicate: Option<Predicate>,
+    /// Number of distinct partition values found in source
+    pub partition_count: usize,
+    /// Name of the partition column used for DPP (if applicable)
+    pub partition_column: Option<String>,
+}
+
+/// Analyzes source data to extract partition values for Dynamic Partition Pruning.
+///
+/// This function:
+/// 1. Identifies if any join key is a partition column
+/// 2. Extracts distinct partition values from source data
+/// 3. Builds an IN predicate for partition pruning
+///
+/// # Arguments
+///
+/// * `source_batches` - Materialized source data
+/// * `join_keys` - Join key column names (target, source) pairs
+/// * `table` - Target table (for partition spec)
+/// * `config` - MERGE configuration with DPP settings
+///
+/// # Returns
+///
+/// DppResult containing the filter predicate (if applicable) and statistics.
+fn compute_dpp_filter(
+    source_batches: &[RecordBatch],
+    join_keys: &[(String, String)],
+    table: &Table,
+    config: &MergeConfig,
+) -> DFResult<DppResult> {
+    if !config.enable_dpp {
+        return Ok(DppResult {
+            predicate: None,
+            partition_count: 0,
+            partition_column: None,
+        });
+    }
+
+    let partition_spec = table.metadata().default_partition_spec();
+    if partition_spec.is_unpartitioned() {
+        return Ok(DppResult {
+            predicate: None,
+            partition_count: 0,
+            partition_column: None,
+        });
+    }
+
+    let iceberg_schema = table.metadata().current_schema();
+
+    // Find partition columns that are join keys
+    // For identity partitioning: partition column name == source column name
+    // Note: We only support identity transforms for DPP (bucket/truncate/etc. are not supported)
+    let identity_fields: Vec<_> = partition_spec
+        .fields()
+        .iter()
+        .filter(|f| f.transform == Transform::Identity)
+        .collect();
+
+    // Log when non-identity transforms are present (they won't be used for DPP)
+    #[cfg(debug_assertions)]
+    {
+        let non_identity: Vec<_> = partition_spec
+            .fields()
+            .iter()
+            .filter(|f| f.transform != Transform::Identity)
+            .collect();
+        if !non_identity.is_empty() {
+            let transforms: Vec<_> = non_identity
+                .iter()
+                .filter_map(|f| {
+                    iceberg_schema
+                        .field_by_id(f.source_id)
+                        .map(|sf| format!("{}={:?}", sf.name, f.transform))
+                })
+                .collect();
+            eprintln!(
+                "MERGE DPP: Skipping non-identity partition columns [{}] (only identity supported)",
+                transforms.join(", ")
+            );
+        }
+    }
+
+    let partition_source_ids: std::collections::HashSet<i32> =
+        identity_fields.iter().map(|f| f.source_id).collect();
+
+    // Map partition source IDs to column names
+    let partition_col_names: std::collections::HashMap<String, i32> = partition_source_ids
+        .iter()
+        .filter_map(|&id| {
+            iceberg_schema
+                .field_by_id(id)
+                .map(|f| (f.name.to_string(), id))
+        })
+        .collect();
+
+    // Find first join key that is a partition column
+    let mut partition_join_key: Option<(&String, &String)> = None;
+    for (target_key, source_key) in join_keys {
+        if partition_col_names.contains_key(target_key) {
+            partition_join_key = Some((target_key, source_key));
+            break;
+        }
+    }
+
+    let (target_col, source_col) = match partition_join_key {
+        Some(keys) => keys,
+        None => {
+            // No join key is a partition column - DPP not applicable
+            #[cfg(debug_assertions)]
+            {
+                let join_key_names: Vec<_> = join_keys.iter().map(|(t, _)| t.as_str()).collect();
+                let partition_names: Vec<_> = partition_col_names.keys().collect();
+                eprintln!(
+                    "MERGE DPP: Not applicable - join keys [{}] do not include partition columns [{}]",
+                    join_key_names.join(", "),
+                    partition_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            }
+            return Ok(DppResult {
+                predicate: None,
+                partition_count: 0,
+                partition_column: None,
+            });
+        }
+    };
+
+    // Extract distinct partition values from source
+    let distinct_values = extract_distinct_values(source_batches, source_col)?;
+
+    if distinct_values.is_empty() {
+        return Ok(DppResult {
+            predicate: None,
+            partition_count: 0,
+            partition_column: Some(target_col.clone()),
+        });
+    }
+
+    let partition_count = distinct_values.len();
+
+    // Check if we exceed the threshold
+    if partition_count > config.dpp_max_partitions {
+        // Too many partitions - fall back to full scan
+        return Ok(DppResult {
+            predicate: None,
+            partition_count,
+            partition_column: Some(target_col.clone()),
+        });
+    }
+
+    // Build IN predicate: target_col IN (val1, val2, ...)
+    let predicate = Reference::new(target_col.clone()).is_in(distinct_values);
+
+    Ok(DppResult {
+        predicate: Some(predicate),
+        partition_count,
+        partition_column: Some(target_col.clone()),
+    })
+}
+
+/// Extracts distinct values from a column in the source batches.
+///
+/// Converts Arrow array values to Iceberg Datum for predicate construction.
+fn extract_distinct_values(
+    batches: &[RecordBatch],
+    column_name: &str,
+) -> DFResult<Vec<iceberg::spec::Datum>> {
+    use datafusion::arrow::array::*;
+    use std::collections::HashSet;
+
+    if batches.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Find column index
+    let schema = batches[0].schema();
+    let col_idx = schema.index_of(column_name).map_err(|_| {
+        DataFusionError::Internal(format!(
+            "DPP: Source column '{}' not found in schema",
+            column_name
+        ))
+    })?;
+
+    let data_type = schema.field(col_idx).data_type().clone();
+
+    // Use HashSet to collect distinct string representations, then convert to Datum
+    // This approach handles all types uniformly
+    let mut seen_strings: HashSet<String> = HashSet::new();
+    let mut values: Vec<iceberg::spec::Datum> = Vec::new();
+
+    for batch in batches {
+        let col = batch.column(col_idx);
+
+        for row_idx in 0..col.len() {
+            if col.is_null(row_idx) {
+                continue;
+            }
+
+            let datum = match &data_type {
+                DataType::Int32 => {
+                    let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                        DataFusionError::Internal("Expected Int32Array".into())
+                    })?;
+                    let val = arr.value(row_idx);
+                    let key = val.to_string();
+                    if seen_strings.insert(key) {
+                        Some(iceberg::spec::Datum::int(val))
+                    } else {
+                        None
+                    }
+                }
+                DataType::Int64 => {
+                    let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                        DataFusionError::Internal("Expected Int64Array".into())
+                    })?;
+                    let val = arr.value(row_idx);
+                    let key = val.to_string();
+                    if seen_strings.insert(key) {
+                        Some(iceberg::spec::Datum::long(val))
+                    } else {
+                        None
+                    }
+                }
+                DataType::Utf8 => {
+                    let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                        DataFusionError::Internal("Expected StringArray".into())
+                    })?;
+                    let val = arr.value(row_idx);
+                    if seen_strings.insert(val.to_string()) {
+                        Some(iceberg::spec::Datum::string(val))
+                    } else {
+                        None
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal("Expected LargeStringArray".into())
+                        })?;
+                    let val = arr.value(row_idx);
+                    if seen_strings.insert(val.to_string()) {
+                        Some(iceberg::spec::Datum::string(val))
+                    } else {
+                        None
+                    }
+                }
+                DataType::Date32 => {
+                    let arr = col.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
+                        DataFusionError::Internal("Expected Date32Array".into())
+                    })?;
+                    let val = arr.value(row_idx);
+                    let key = val.to_string();
+                    if seen_strings.insert(key) {
+                        Some(iceberg::spec::Datum::date(val))
+                    } else {
+                        None
+                    }
+                }
+                other => {
+                    // For unsupported types, skip DPP rather than fail
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "MERGE DPP: Skipping - unsupported data type {:?} for column '{}' \
+                         (supported: Int32, Int64, Utf8, LargeUtf8, Date32)",
+                        other, column_name
+                    );
+                    return Ok(vec![]);
+                }
+            };
+
+            if let Some(d) = datum {
+                values.push(d);
+            }
+        }
+    }
+
+    Ok(values)
+}
+
 /// Scans the target table and adds metadata columns (_file_path, _row_pos).
 ///
 /// Uses the FileScanTask iteration pattern from UPDATE implementation.
+/// Optionally applies a partition filter for Dynamic Partition Pruning.
 async fn scan_target_with_metadata(
     table: &Table,
     _schema: &ArrowSchemaRef,
+    partition_filter: Option<Predicate>,
 ) -> DFResult<Vec<RecordBatch>> {
     // Build the scan - select all columns
-    let scan_builder = table.scan().select_all();
+    let mut scan_builder = table.scan().select_all();
+
+    // Apply DPP filter if provided
+    if let Some(predicate) = partition_filter {
+        scan_builder = scan_builder.with_filter(predicate);
+    }
+
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
     // Get file scan tasks
@@ -757,113 +1659,14 @@ async fn materialize_source(
     let batches: Vec<RecordBatch> = stream.try_collect().await?;
     Ok(batches)
 }
-
-/// Sets up data file and position delete file writers for MERGE output.
-///
-/// Returns (data_file_writer, delete_file_writer, delete_schema).
-async fn setup_writers(
-    table: &Table,
-    _schema: &ArrowSchemaRef,
-) -> DFResult<(
-    Box<dyn IcebergWriter + Send>,
-    Box<dyn IcebergWriter + Send>,
-    ArrowSchemaRef,
-)> {
-    let file_io = table.file_io().clone();
-
-    let target_file_size = table
-        .metadata()
-        .properties()
-        .get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES)
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
-
-    // Create location generator
-    let location_generator =
-        DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
-
-    // === Data file writer ===
-    let data_file_name_generator = DefaultFileNameGenerator::new(
-        format!("merge-data-{}", Uuid::now_v7()),
-        None,
-        DataFileFormat::Parquet,
-    );
-    let parquet_writer = ParquetWriterBuilder::new(
-        WriterProperties::default(),
-        table.metadata().current_schema().clone(),
-    );
-    let data_rolling_writer = RollingFileWriterBuilder::new(
-        parquet_writer.clone(),
-        target_file_size,
-        file_io.clone(),
-        location_generator.clone(),
-        data_file_name_generator,
-    );
-    let data_file_builder = DataFileWriterBuilder::new(data_rolling_writer);
-    let data_file_writer = data_file_builder
-        .build(None)
-        .await
-        .map_err(to_datafusion_error)?;
-
-    // === Position delete file writer ===
-    let delete_config = PositionDeleteWriterConfig::new();
-    let delete_schema = delete_config.delete_schema().clone();
-
-    // Build Iceberg schema for position deletes
-    let iceberg_delete_schema = Arc::new(
-        iceberg::spec::Schema::builder()
-            .with_schema_id(table.metadata().current_schema_id())
-            .with_fields(vec![
-                iceberg::spec::NestedField::required(
-                    iceberg::writer::base_writer::position_delete_writer::POSITION_DELETE_FILE_PATH_FIELD_ID,
-                    "file_path",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
-                )
-                .into(),
-                iceberg::spec::NestedField::required(
-                    iceberg::writer::base_writer::position_delete_writer::POSITION_DELETE_POS_FIELD_ID,
-                    "pos",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                )
-                .into(),
-            ])
-            .build()
-            .map_err(to_datafusion_error)?,
-    );
-
-    let delete_parquet_writer =
-        ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema);
-    let delete_file_name_generator = DefaultFileNameGenerator::new(
-        format!("merge-delete-{}", Uuid::now_v7()),
-        None,
-        DataFileFormat::Parquet,
-    );
-    let delete_rolling_writer = RollingFileWriterBuilder::new(
-        delete_parquet_writer,
-        target_file_size,
-        file_io,
-        location_generator,
-        delete_file_name_generator,
-    );
-    let delete_file_builder =
-        PositionDeleteFileWriterBuilder::new(delete_rolling_writer, delete_config);
-    let delete_file_writer = delete_file_builder
-        .build(None)
-        .await
-        .map_err(to_datafusion_error)?;
-
-    Ok((
-        Box::new(data_file_writer),
-        Box::new(delete_file_writer),
-        delete_schema,
-    ))
-}
-
 /// Processes MATCHED rows from joined batch and writes files.
 ///
 /// For each MATCHED row (where both target and source keys are non-null):
 /// - If action is UPDATE: Write transformed data to data file + position delete
 /// - If action is DELETE: Write position delete only
+///
+/// For partitioned tables, position deletes are routed to the correct partition
+/// based on the partition key computed from the target row data.
 ///
 /// # Arguments
 /// * `batch` - The joined batch containing both target and source columns
@@ -873,22 +1676,17 @@ async fn setup_writers(
 /// * `row_pos_col` - Prefixed row position metadata column name
 /// * `target_schema` - Original target table schema (for output)
 /// * `when_matched` - WHEN MATCHED clauses
-/// * `data_writer` - Data file writer for updated rows
-/// * `delete_writer` - Position delete file writer
-/// * `delete_schema` - Schema for position delete batches
+/// * `writers` - Partition-aware writers for data and delete files
 /// * `stats` - Statistics to update
 #[allow(clippy::too_many_arguments)]
 async fn process_matched_rows(
     batch: &RecordBatch,
-    target_key: &str,
-    source_key: &str,
+    join_keys: &[(String, String)],
     file_path_col: &str,
     row_pos_col: &str,
     target_schema: &ArrowSchemaRef,
     when_matched: &[WhenMatchedClause],
-    data_writer: &mut Box<dyn IcebergWriter + Send>,
-    delete_writer: &mut Box<dyn IcebergWriter + Send>,
-    delete_schema: &ArrowSchemaRef,
+    writers: &mut MergeWriters,
     stats: &mut MergeStats,
 ) -> DFResult<()> {
     if when_matched.is_empty() {
@@ -897,13 +1695,19 @@ async fn process_matched_rows(
 
     let batch_schema = batch.schema();
 
-    // Find key columns
-    let target_key_idx = batch_schema
-        .index_of(target_key)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let source_key_idx = batch_schema
-        .index_of(source_key)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    // Find all key column indices for compound key support
+    let key_indices: Vec<(usize, usize)> = join_keys
+        .iter()
+        .map(|(t, s)| {
+            let target_idx = batch_schema
+                .index_of(t)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let source_idx = batch_schema
+                .index_of(s)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            Ok((target_idx, source_idx))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
 
     // Find metadata columns
     let file_path_idx = batch_schema
@@ -913,8 +1717,6 @@ async fn process_matched_rows(
         .index_of(row_pos_col)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
-    let target_key_col = batch.column(target_key_idx);
-    let source_key_col = batch.column(source_key_idx);
     let file_path_col_arr = batch
         .column(file_path_idx)
         .as_any()
@@ -926,11 +1728,17 @@ async fn process_matched_rows(
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| DataFusionError::Internal("row_pos column must be Int64Array".into()))?;
 
-    // Collect all MATCHED row indices (both keys non-null)
+    // Collect all MATCHED row indices (all keys non-null on both sides)
     let mut matched_indices: Vec<usize> = Vec::new();
     for row_idx in 0..batch.num_rows() {
-        let target_is_null = target_key_col.is_null(row_idx);
-        let source_is_null = source_key_col.is_null(row_idx);
+        // For compound keys: target is null if ANY target key is null
+        let target_is_null = key_indices
+            .iter()
+            .any(|(t_idx, _)| batch.column(*t_idx).is_null(row_idx));
+        // For compound keys: source is null if ANY source key is null
+        let source_is_null = key_indices
+            .iter()
+            .any(|(_, s_idx)| batch.column(*s_idx).is_null(row_idx));
 
         if !target_is_null && !source_is_null {
             matched_indices.push(row_idx);
@@ -969,21 +1777,15 @@ async fn process_matched_rows(
         match &clause.action {
             MatchedAction::Delete => {
                 // For DELETE: only write position deletes
-                let file_paths: Vec<String> = clause_indices
-                    .iter()
-                    .map(|&idx| file_path_col_arr.value(idx).to_string())
-                    .collect();
-                let positions: Vec<i64> = clause_indices
-                    .iter()
-                    .map(|&idx| row_pos_col_arr.value(idx))
-                    .collect();
-
-                let delete_batch =
-                    make_position_delete_batch(&file_paths, &positions, delete_schema.clone())?;
-                delete_writer
-                    .write(delete_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                write_position_deletes_partitioned(
+                    batch,
+                    &clause_indices,
+                    file_path_col_arr,
+                    row_pos_col_arr,
+                    target_schema,
+                    writers,
+                )
+                .await?;
 
                 stats.rows_deleted += clause_indices.len() as u64;
             }
@@ -993,28 +1795,19 @@ async fn process_matched_rows(
                     extract_source_data_for_update(batch, &clause_indices, target_schema)?;
 
                 if data_batch.num_rows() > 0 {
-                    data_writer
-                        .write(data_batch)
-                        .await
-                        .map_err(to_datafusion_error)?;
+                    writers.write_data(data_batch).await?;
                 }
 
                 // Write position deletes for original rows
-                let file_paths: Vec<String> = clause_indices
-                    .iter()
-                    .map(|&idx| file_path_col_arr.value(idx).to_string())
-                    .collect();
-                let positions: Vec<i64> = clause_indices
-                    .iter()
-                    .map(|&idx| row_pos_col_arr.value(idx))
-                    .collect();
-
-                let delete_batch =
-                    make_position_delete_batch(&file_paths, &positions, delete_schema.clone())?;
-                delete_writer
-                    .write(delete_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                write_position_deletes_partitioned(
+                    batch,
+                    &clause_indices,
+                    file_path_col_arr,
+                    row_pos_col_arr,
+                    target_schema,
+                    writers,
+                )
+                .await?;
 
                 stats.rows_updated += clause_indices.len() as u64;
             }
@@ -1024,31 +1817,89 @@ async fn process_matched_rows(
                     apply_update_assignments(batch, &clause_indices, assignments, target_schema)?;
 
                 if data_batch.num_rows() > 0 {
-                    data_writer
-                        .write(data_batch)
-                        .await
-                        .map_err(to_datafusion_error)?;
+                    writers.write_data(data_batch).await?;
                 }
 
                 // Write position deletes for original rows
-                let file_paths: Vec<String> = clause_indices
-                    .iter()
-                    .map(|&idx| file_path_col_arr.value(idx).to_string())
-                    .collect();
-                let positions: Vec<i64> = clause_indices
-                    .iter()
-                    .map(|&idx| row_pos_col_arr.value(idx))
-                    .collect();
-
-                let delete_batch =
-                    make_position_delete_batch(&file_paths, &positions, delete_schema.clone())?;
-                delete_writer
-                    .write(delete_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                write_position_deletes_partitioned(
+                    batch,
+                    &clause_indices,
+                    file_path_col_arr,
+                    row_pos_col_arr,
+                    target_schema,
+                    writers,
+                )
+                .await?;
 
                 stats.rows_updated += clause_indices.len() as u64;
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Writes position deletes with partition awareness.
+///
+/// For unpartitioned tables, writes all deletes at once.
+/// For partitioned tables, groups deletes by partition key and writes each group separately.
+#[allow(clippy::too_many_arguments)]
+async fn write_position_deletes_partitioned(
+    batch: &RecordBatch,
+    indices: &[usize],
+    file_path_col: &StringArray,
+    row_pos_col: &Int64Array,
+    target_schema: &ArrowSchemaRef,
+    writers: &mut MergeWriters,
+) -> DFResult<()> {
+    if indices.is_empty() {
+        return Ok(());
+    }
+
+    let delete_schema = writers.delete_schema().clone();
+
+    if !writers.is_partitioned() {
+        // Unpartitioned: write all deletes at once
+        let file_paths: Vec<String> = indices
+            .iter()
+            .map(|&idx| file_path_col.value(idx).to_string())
+            .collect();
+        let positions: Vec<i64> = indices.iter().map(|&idx| row_pos_col.value(idx)).collect();
+
+        let delete_batch = make_position_delete_batch(&file_paths, &positions, delete_schema)?;
+        writers.write_deletes(delete_batch, None).await?;
+    } else {
+        // Partitioned: group deletes by partition key and write each group
+        // For simplicity, compute partition key for each row and group
+        let mut partition_groups: HashMap<String, (Vec<String>, Vec<i64>, PartitionKey)> =
+            HashMap::new();
+
+        for &idx in indices {
+            let partition_key = writers
+                .compute_partition_key_from_target_row(batch, idx, target_schema)?
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Expected partition key for partitioned table".into())
+                })?;
+
+            // Use partition key's string representation as group key
+            let key_str = format!("{:?}", partition_key.data());
+            let file_path = file_path_col.value(idx).to_string();
+            let pos = row_pos_col.value(idx);
+
+            let entry = partition_groups
+                .entry(key_str)
+                .or_insert_with(|| (Vec::new(), Vec::new(), partition_key.clone()));
+            entry.0.push(file_path);
+            entry.1.push(pos);
+        }
+
+        // Write each partition's deletes
+        for (_key_str, (file_paths, positions, partition_key)) in partition_groups {
+            let delete_batch =
+                make_position_delete_batch(&file_paths, &positions, delete_schema.clone())?;
+            writers
+                .write_deletes(delete_batch, Some(partition_key))
+                .await?;
         }
     }
 
@@ -1061,22 +1912,24 @@ async fn process_matched_rows(
 /// - If action is INSERT *: Write source data to data file
 /// - If action is INSERT with values: Evaluate expressions and write to data file
 ///
+/// For partitioned tables, data is automatically routed to the correct partition
+/// based on the partition key computed from the inserted row data.
+///
 /// # Arguments
 /// * `batch` - The joined batch containing both target and source columns
 /// * `target_key` - Prefixed target key column name
 /// * `source_key` - Prefixed source key column name
 /// * `target_schema` - Original target table schema (for output)
 /// * `when_not_matched` - WHEN NOT MATCHED clauses
-/// * `data_writer` - Data file writer for inserted rows
+/// * `writers` - Partition-aware writers for data files
 /// * `stats` - Statistics to update
 #[allow(clippy::too_many_arguments)]
 async fn process_not_matched_rows(
     batch: &RecordBatch,
-    target_key: &str,
-    source_key: &str,
+    join_keys: &[(String, String)],
     target_schema: &ArrowSchemaRef,
     when_not_matched: &[WhenNotMatchedClause],
-    data_writer: &mut Box<dyn IcebergWriter + Send>,
+    writers: &mut MergeWriters,
     stats: &mut MergeStats,
 ) -> DFResult<()> {
     if when_not_matched.is_empty() {
@@ -1085,22 +1938,31 @@ async fn process_not_matched_rows(
 
     let batch_schema = batch.schema();
 
-    // Find key columns
-    let target_key_idx = batch_schema
-        .index_of(target_key)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let source_key_idx = batch_schema
-        .index_of(source_key)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    // Find all key column indices for compound key support
+    let key_indices: Vec<(usize, usize)> = join_keys
+        .iter()
+        .map(|(t, s)| {
+            let target_idx = batch_schema
+                .index_of(t)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let source_idx = batch_schema
+                .index_of(s)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            Ok((target_idx, source_idx))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
 
-    let target_key_col = batch.column(target_key_idx);
-    let source_key_col = batch.column(source_key_idx);
-
-    // Collect all NOT_MATCHED row indices (target key null, source key non-null)
+    // Collect all NOT_MATCHED row indices (any target key null, all source keys non-null)
     let mut not_matched_indices: Vec<usize> = Vec::new();
     for row_idx in 0..batch.num_rows() {
-        let target_is_null = target_key_col.is_null(row_idx);
-        let source_is_null = source_key_col.is_null(row_idx);
+        // For compound keys: target is null if ANY target key is null
+        let target_is_null = key_indices
+            .iter()
+            .any(|(t_idx, _)| batch.column(*t_idx).is_null(row_idx));
+        // For compound keys: source is null if ANY source key is null
+        let source_is_null = key_indices
+            .iter()
+            .any(|(_, s_idx)| batch.column(*s_idx).is_null(row_idx));
 
         if target_is_null && !source_is_null {
             not_matched_indices.push(row_idx);
@@ -1143,10 +2005,8 @@ async fn process_not_matched_rows(
                     extract_source_data_for_insert(batch, &clause_indices, target_schema)?;
 
                 if data_batch.num_rows() > 0 {
-                    data_writer
-                        .write(data_batch)
-                        .await
-                        .map_err(to_datafusion_error)?;
+                    // write_data handles partition routing automatically
+                    writers.write_data(data_batch).await?;
                 }
 
                 stats.rows_inserted += clause_indices.len() as u64;
@@ -1157,10 +2017,8 @@ async fn process_not_matched_rows(
                     apply_insert_values(batch, &clause_indices, values, target_schema)?;
 
                 if data_batch.num_rows() > 0 {
-                    data_writer
-                        .write(data_batch)
-                        .await
-                        .map_err(to_datafusion_error)?;
+                    // write_data handles partition routing automatically
+                    writers.write_data(data_batch).await?;
                 }
 
                 stats.rows_inserted += clause_indices.len() as u64;
@@ -1177,6 +2035,9 @@ async fn process_not_matched_rows(
 /// - If action is DELETE: Write position delete only
 /// - If action is UPDATE: Write updated data + position delete
 ///
+/// For partitioned tables, position deletes and data files are routed to the correct partition
+/// based on the partition key computed from the target row data.
+///
 /// # Arguments
 /// * `batch` - The joined batch containing both target and source columns
 /// * `target_key` - Prefixed target key column name
@@ -1185,22 +2046,17 @@ async fn process_not_matched_rows(
 /// * `row_pos_col` - Prefixed row position metadata column name
 /// * `target_schema` - Original target table schema (for output)
 /// * `when_not_matched_by_source` - WHEN NOT MATCHED BY SOURCE clauses
-/// * `data_writer` - Data file writer for updated rows
-/// * `delete_writer` - Position delete file writer
-/// * `delete_schema` - Schema for position delete batches
+/// * `writers` - Partition-aware writers for data and delete files
 /// * `stats` - Statistics to update
 #[allow(clippy::too_many_arguments)]
 async fn process_not_matched_by_source_rows(
     batch: &RecordBatch,
-    target_key: &str,
-    source_key: &str,
+    join_keys: &[(String, String)],
     file_path_col: &str,
     row_pos_col: &str,
     target_schema: &ArrowSchemaRef,
     when_not_matched_by_source: &[WhenNotMatchedBySourceClause],
-    data_writer: &mut Box<dyn IcebergWriter + Send>,
-    delete_writer: &mut Box<dyn IcebergWriter + Send>,
-    delete_schema: &ArrowSchemaRef,
+    writers: &mut MergeWriters,
     stats: &mut MergeStats,
 ) -> DFResult<()> {
     if when_not_matched_by_source.is_empty() {
@@ -1209,13 +2065,19 @@ async fn process_not_matched_by_source_rows(
 
     let batch_schema = batch.schema();
 
-    // Find key columns
-    let target_key_idx = batch_schema
-        .index_of(target_key)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let source_key_idx = batch_schema
-        .index_of(source_key)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    // Find all key column indices for compound key support
+    let key_indices: Vec<(usize, usize)> = join_keys
+        .iter()
+        .map(|(t, s)| {
+            let target_idx = batch_schema
+                .index_of(t)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let source_idx = batch_schema
+                .index_of(s)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            Ok((target_idx, source_idx))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
 
     // Find metadata columns
     let file_path_idx = batch_schema
@@ -1225,8 +2087,6 @@ async fn process_not_matched_by_source_rows(
         .index_of(row_pos_col)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
-    let target_key_col = batch.column(target_key_idx);
-    let source_key_col = batch.column(source_key_idx);
     let file_path_col_arr = batch
         .column(file_path_idx)
         .as_any()
@@ -1238,11 +2098,17 @@ async fn process_not_matched_by_source_rows(
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| DataFusionError::Internal("row_pos column must be Int64Array".into()))?;
 
-    // Collect all NOT_MATCHED_BY_SOURCE row indices (target key non-null, source key null)
+    // Collect all NOT_MATCHED_BY_SOURCE row indices (all target keys non-null, any source key null)
     let mut not_matched_by_source_indices: Vec<usize> = Vec::new();
     for row_idx in 0..batch.num_rows() {
-        let target_is_null = target_key_col.is_null(row_idx);
-        let source_is_null = source_key_col.is_null(row_idx);
+        // For compound keys: target is null if ANY target key is null
+        let target_is_null = key_indices
+            .iter()
+            .any(|(t_idx, _)| batch.column(*t_idx).is_null(row_idx));
+        // For compound keys: source is null if ANY source key is null
+        let source_is_null = key_indices
+            .iter()
+            .any(|(_, s_idx)| batch.column(*s_idx).is_null(row_idx));
 
         if !target_is_null && source_is_null {
             not_matched_by_source_indices.push(row_idx);
@@ -1281,21 +2147,15 @@ async fn process_not_matched_by_source_rows(
         match &clause.action {
             NotMatchedBySourceAction::Delete => {
                 // For DELETE: only write position deletes
-                let file_paths: Vec<String> = clause_indices
-                    .iter()
-                    .map(|&idx| file_path_col_arr.value(idx).to_string())
-                    .collect();
-                let positions: Vec<i64> = clause_indices
-                    .iter()
-                    .map(|&idx| row_pos_col_arr.value(idx))
-                    .collect();
-
-                let delete_batch =
-                    make_position_delete_batch(&file_paths, &positions, delete_schema.clone())?;
-                delete_writer
-                    .write(delete_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                write_position_deletes_partitioned(
+                    batch,
+                    &clause_indices,
+                    file_path_col_arr,
+                    row_pos_col_arr,
+                    target_schema,
+                    writers,
+                )
+                .await?;
 
                 stats.rows_deleted += clause_indices.len() as u64;
             }
@@ -1309,28 +2169,19 @@ async fn process_not_matched_by_source_rows(
                 )?;
 
                 if data_batch.num_rows() > 0 {
-                    data_writer
-                        .write(data_batch)
-                        .await
-                        .map_err(to_datafusion_error)?;
+                    writers.write_data(data_batch).await?;
                 }
 
                 // Write position deletes for original rows
-                let file_paths: Vec<String> = clause_indices
-                    .iter()
-                    .map(|&idx| file_path_col_arr.value(idx).to_string())
-                    .collect();
-                let positions: Vec<i64> = clause_indices
-                    .iter()
-                    .map(|&idx| row_pos_col_arr.value(idx))
-                    .collect();
-
-                let delete_batch =
-                    make_position_delete_batch(&file_paths, &positions, delete_schema.clone())?;
-                delete_writer
-                    .write(delete_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                write_position_deletes_partitioned(
+                    batch,
+                    &clause_indices,
+                    file_path_col_arr,
+                    row_pos_col_arr,
+                    target_schema,
+                    writers,
+                )
+                .await?;
 
                 stats.rows_updated += clause_indices.len() as u64;
             }
@@ -1667,18 +2518,38 @@ fn apply_update_assignments(
 
 /// Extracts join key column names from the match condition.
 ///
-/// Expects a simple equality condition like `col("target.id") = col("source.id")`.
-/// Returns (target_key, source_key) column names.
-fn extract_join_keys(match_condition: &Expr) -> DFResult<(String, String)> {
-    match match_condition {
-        Expr::BinaryExpr(binary) => {
-            if binary.op != datafusion::logical_expr::Operator::Eq {
-                return Err(DataFusionError::Plan(format!(
-                    "MERGE ON condition must be an equality (=). Got: {:?}",
-                    binary.op
-                )));
-            }
+/// Supports both simple equality conditions like `col("target.id") = col("source.id")`
+/// and compound conditions like `col("target.id") = col("source.id") AND col("target.region") = col("source.region")`.
+///
+/// Returns a vector of (target_key, source_key) column name pairs.
+fn extract_join_keys(match_condition: &Expr) -> DFResult<Vec<(String, String)>> {
+    let mut keys = Vec::new();
+    extract_join_keys_recursive(match_condition, &mut keys)?;
 
+    if keys.is_empty() {
+        return Err(DataFusionError::Plan(
+            "MERGE ON condition must contain at least one equality predicate".to_string(),
+        ));
+    }
+
+    Ok(keys)
+}
+
+/// Recursively extracts join key pairs from an expression.
+/// Handles AND expressions and equality predicates.
+fn extract_join_keys_recursive(expr: &Expr, keys: &mut Vec<(String, String)>) -> DFResult<()> {
+    match expr {
+        // AND: recurse into both sides
+        Expr::BinaryExpr(binary)
+            if binary.op == datafusion::logical_expr::Operator::And =>
+        {
+            extract_join_keys_recursive(&binary.left, keys)?;
+            extract_join_keys_recursive(&binary.right, keys)?;
+        }
+        // Equality: extract key pair
+        Expr::BinaryExpr(binary)
+            if binary.op == datafusion::logical_expr::Operator::Eq =>
+        {
             let left_col = extract_column_name(&binary.left)?;
             let right_col = extract_column_name(&binary.right)?;
 
@@ -1704,13 +2575,24 @@ fn extract_join_keys(match_condition: &Expr) -> DFResult<(String, String)> {
                 (left_col, right_col)
             };
 
-            Ok((target_key, source_key))
+            keys.push((target_key, source_key));
         }
-        _ => Err(DataFusionError::Plan(format!(
-            "MERGE ON condition must be a binary equality expression. Got: {:?}",
-            match_condition
-        ))),
+        // Unsupported: OR conditions or complex expressions in join keys
+        Expr::BinaryExpr(binary)
+            if binary.op == datafusion::logical_expr::Operator::Or =>
+        {
+            return Err(DataFusionError::Plan(
+                "MERGE ON condition does not support OR predicates. Use AND to combine multiple equality conditions.".to_string(),
+            ));
+        }
+        _ => {
+            return Err(DataFusionError::Plan(format!(
+                "MERGE ON condition must be equality predicates (=) optionally combined with AND. Got: {:?}",
+                expr
+            )));
+        }
     }
+    Ok(())
 }
 
 /// Extracts column name from an expression.
@@ -1728,12 +2610,12 @@ fn extract_column_name(expr: &Expr) -> DFResult<String> {
 /// Performs a FULL OUTER JOIN between target and source batches.
 ///
 /// Uses DataFusion's DataFrame API for the join operation.
+/// Supports multiple join keys for compound key joins.
 async fn perform_full_outer_join(
     target_batches: &[RecordBatch],
     source_batches: &[RecordBatch],
     _target_schema: &ArrowSchemaRef,
-    target_key: &str,
-    source_key: &str,
+    join_keys: &[(String, String)],
 ) -> DFResult<Vec<RecordBatch>> {
     if target_batches.is_empty() && source_batches.is_empty() {
         return Ok(vec![]);
@@ -1814,16 +2696,26 @@ async fn perform_full_outer_join(
     let target_df = ctx.table("target").await?;
     let source_df = ctx.table("source").await?;
 
-    // Prefixed key column names
-    let prefixed_target_key = format!("{}{}", TARGET_PREFIX, target_key);
-    let prefixed_source_key = format!("{}{}", SOURCE_PREFIX, source_key);
+    // Prefixed key column names for compound keys
+    let prefixed_target_keys: Vec<String> = join_keys
+        .iter()
+        .map(|(t, _)| format!("{}{}", TARGET_PREFIX, t))
+        .collect();
+    let prefixed_source_keys: Vec<String> = join_keys
+        .iter()
+        .map(|(_, s)| format!("{}{}", SOURCE_PREFIX, s))
+        .collect();
 
-    // Perform FULL OUTER JOIN
+    // Convert to slices for join API
+    let target_key_refs: Vec<&str> = prefixed_target_keys.iter().map(|s| s.as_str()).collect();
+    let source_key_refs: Vec<&str> = prefixed_source_keys.iter().map(|s| s.as_str()).collect();
+
+    // Perform FULL OUTER JOIN with compound keys
     let joined_df = target_df.join(
         source_df,
         JoinType::Full,
-        &[&prefixed_target_key],
-        &[&prefixed_source_key],
+        &target_key_refs,
+        &source_key_refs,
         None,
     )?;
 
@@ -1839,47 +2731,67 @@ async fn perform_full_outer_join(
 /// 1. Determine classification based on NULL patterns in join keys
 /// 2. Apply WHEN clauses to determine action
 /// 3. Count actions for stats
+///
+/// With compound keys, a row is classified as MATCHED only if ALL target keys
+/// and ALL source keys are non-null.
 #[allow(dead_code)] // Reserved for future use in NOT MATCHED handling
 fn classify_and_count_actions(
     joined_batches: &[RecordBatch],
-    target_key: &str,
-    source_key: &str,
+    join_keys: &[(String, String)],
     when_matched: &[WhenMatchedClause],
     when_not_matched: &[WhenNotMatchedClause],
     when_not_matched_by_source: &[WhenNotMatchedBySourceClause],
 ) -> DFResult<MergeStats> {
     let mut stats = MergeStats::default();
 
-    let prefixed_target_key = format!("{}{}", TARGET_PREFIX, target_key);
-    let prefixed_source_key = format!("{}{}", SOURCE_PREFIX, source_key);
+    // Build prefixed key column names
+    let prefixed_keys: Vec<(String, String)> = join_keys
+        .iter()
+        .map(|(t, s)| {
+            (
+                format!("{}{}", TARGET_PREFIX, t),
+                format!("{}{}", SOURCE_PREFIX, s),
+            )
+        })
+        .collect();
 
     for batch in joined_batches {
-        // Find key columns
-        let target_key_idx = batch
-            .schema()
-            .index_of(&prefixed_target_key)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        let source_key_idx = batch
-            .schema()
-            .index_of(&prefixed_source_key)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-        let target_key_col = batch.column(target_key_idx);
-        let source_key_col = batch.column(source_key_idx);
+        // Find all key column indices
+        let key_indices: Vec<(usize, usize)> = prefixed_keys
+            .iter()
+            .map(|(t, s)| {
+                let target_idx = batch
+                    .schema()
+                    .index_of(t)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                let source_idx = batch
+                    .schema()
+                    .index_of(s)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                Ok((target_idx, source_idx))
+            })
+            .collect::<DFResult<Vec<_>>>()?;
 
         // Process each row
         for row_idx in 0..batch.num_rows() {
-            let target_is_null = target_key_col.is_null(row_idx);
-            let source_is_null = source_key_col.is_null(row_idx);
+            // For compound keys: target is null if ANY target key is null
+            // source is null if ANY source key is null
+            let target_is_null = key_indices
+                .iter()
+                .any(|(t_idx, _)| batch.column(*t_idx).is_null(row_idx));
+            let source_is_null = key_indices
+                .iter()
+                .any(|(_, s_idx)| batch.column(*s_idx).is_null(row_idx));
 
             // Classify the row
-            let classification = match RowClassification::from_join_nulls(target_is_null, source_is_null) {
-                Some(c) => c,
-                None => {
-                    // Both keys NULL - shouldn't happen in proper JOIN
-                    continue;
-                }
-            };
+            let classification =
+                match RowClassification::from_join_nulls(target_is_null, source_is_null) {
+                    Some(c) => c,
+                    None => {
+                        // Both keys NULL - shouldn't happen in proper JOIN
+                        continue;
+                    }
+                };
 
             // Determine action using WHEN clause evaluation
             let action = evaluate_when_clauses(

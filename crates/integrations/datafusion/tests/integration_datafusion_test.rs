@@ -2960,3 +2960,1088 @@ async fn test_merge_e2e_commit_persists() -> Result<()> {
 
     Ok(())
 }
+
+/// Test MERGE on a partitioned table.
+/// Verifies that MERGE properly handles partitioned tables by:
+/// 1. Updating rows in different partitions
+/// 2. Inserting new rows into correct partitions
+/// 3. Deleting rows from specific partitions
+/// 4. Writing partition-aware data and delete files
+#[tokio::test]
+async fn test_merge_partitioned_table() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_merge_partitioned".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema with partition column
+    // Schema: (id: Int, category: String, value: String) partitioned by category
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("partitioned_merge_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across multiple partitions:
+    // electronics: (1, 'electronics', 'laptop'), (2, 'electronics', 'phone')
+    // books: (3, 'books', 'novel'), (4, 'books', 'textbook')
+    ctx.sql(
+        "INSERT INTO catalog.test_merge_partitioned.partitioned_merge_table VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel'), \
+         (4, 'books', 'textbook')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Verify initial row count
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_merge_partitioned.partitioned_merge_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 4, "Should have 4 rows initially");
+
+    // Create source DataFrame for MERGE:
+    // - (2, 'electronics', 'smartphone'): matches id=2 -> UPDATE value
+    // - (5, 'clothing', 'shirt'): new row in new partition -> INSERT
+    // - id 1 (laptop) will be deleted (NOT_MATCHED_BY_SOURCE)
+    // - id 3 and 4 (books) will be deleted (NOT_MATCHED_BY_SOURCE)
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "id",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "category",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "value",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    let id_array = Arc::new(datafusion::arrow::array::Int32Array::from(vec![2, 5]))
+        as datafusion::arrow::array::ArrayRef;
+    let category_array = Arc::new(StringArray::from(vec!["electronics", "clothing"]))
+        as datafusion::arrow::array::ArrayRef;
+    let value_array = Arc::new(StringArray::from(vec!["smartphone", "shirt"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch = datafusion::arrow::array::RecordBatch::try_new(
+        source_schema.clone(),
+        vec![id_array, category_array, value_array],
+    )
+    .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("merge_source", source_table).unwrap();
+    let source_df = ctx.table("merge_source").await.unwrap();
+
+    // Create provider for programmatic merge
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "partitioned_merge_table",
+    )
+    .await?;
+
+    // Execute full CDC MERGE on partitioned table:
+    // - WHEN MATCHED -> UPDATE (explicit columns, excluding partition column)
+    // - WHEN NOT MATCHED -> INSERT *
+    // - WHEN NOT MATCHED BY SOURCE -> DELETE
+    // Note: We must use explicit update() rather than update_all() because
+    // update_all() doesn't allow updating partition columns
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.id").eq(df_col("source.id")))
+        .when_matched(None)
+        .update(vec![
+            ("value", df_col("source_value")),
+        ])
+        .when_not_matched(None)
+        .insert_all()
+        .when_not_matched_by_source(None)
+        .delete()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Expected classification:
+    // - Row (1, 'electronics', 'laptop'): NOT_MATCHED_BY_SOURCE -> DELETE
+    // - Row (2, 'electronics', 'phone'): MATCHED -> UPDATE to 'smartphone'
+    // - Row (3, 'books', 'novel'): NOT_MATCHED_BY_SOURCE -> DELETE
+    // - Row (4, 'books', 'textbook'): NOT_MATCHED_BY_SOURCE -> DELETE
+    // - Row (5, 'clothing', 'shirt'): NOT_MATCHED -> INSERT
+    assert_eq!(stats.rows_updated, 1, "Expected 1 row classified for UPDATE (id=2)");
+    assert_eq!(stats.rows_inserted, 1, "Expected 1 row classified for INSERT (id=5)");
+    assert_eq!(stats.rows_deleted, 3, "Expected 3 rows classified for DELETE (ids 1, 3, 4)");
+
+    // Reload table from catalog to verify commit persisted
+    let fresh_provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "partitioned_merge_table",
+    )
+    .await?;
+
+    ctx.deregister_table("fresh_partitioned_table").ok();
+    ctx.register_table("fresh_partitioned_table", Arc::new(fresh_provider)).unwrap();
+
+    // Query the freshly loaded table
+    let result = ctx
+        .sql("SELECT id, category, value FROM fresh_partitioned_table ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Should have 2 rows:
+    // (2, 'electronics', 'smartphone') - updated
+    // (5, 'clothing', 'shirt') - inserted
+    assert_eq!(result.len(), 1, "Should have one batch");
+    let batch = &result[0];
+    assert_eq!(batch.num_rows(), 2, "Should have 2 rows after MERGE");
+
+    let id_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let category_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let value_col = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify row 1: (2, 'electronics', 'smartphone') - updated
+    assert_eq!(id_col.value(0), 2);
+    assert_eq!(category_col.value(0), "electronics");
+    assert_eq!(value_col.value(0), "smartphone");
+
+    // Verify row 2: (5, 'clothing', 'shirt') - inserted
+    assert_eq!(id_col.value(1), 5);
+    assert_eq!(category_col.value(1), "clothing");
+    assert_eq!(value_col.value(1), "shirt");
+
+    Ok(())
+}
+
+/// Test MERGE on partitioned table with UPDATE that keeps rows in same partition.
+/// This is a simpler case where updates don't change the partition column.
+#[tokio::test]
+async fn test_merge_partitioned_update_only() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_merge_partitioned_upd".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema with partition column
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("partitioned_update_merge".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data
+    ctx.sql(
+        "INSERT INTO catalog.test_merge_partitioned_upd.partitioned_update_merge VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Create source: update values for ids 1 and 3 (in different partitions)
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "id",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "category",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "value",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    // Source updates both electronics and books partitions
+    let id_array = Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 3]))
+        as datafusion::arrow::array::ArrayRef;
+    let category_array = Arc::new(StringArray::from(vec!["electronics", "books"]))
+        as datafusion::arrow::array::ArrayRef;
+    let value_array = Arc::new(StringArray::from(vec!["gaming_laptop", "epic_novel"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch = datafusion::arrow::array::RecordBatch::try_new(
+        source_schema.clone(),
+        vec![id_array, category_array, value_array],
+    )
+    .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("upd_source", source_table).unwrap();
+    let source_df = ctx.table("upd_source").await.unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "partitioned_update_merge",
+    )
+    .await?;
+
+    // Execute MERGE with only WHEN MATCHED UPDATE
+    // Note: We must use explicit update() rather than update_all() because
+    // update_all() doesn't allow updating partition columns
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.id").eq(df_col("source.id")))
+        .when_matched(None)
+        .update(vec![
+            ("value", df_col("source_value")),
+        ])
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Should update 2 rows (ids 1 and 3)
+    assert_eq!(stats.rows_updated, 2, "Expected 2 rows updated");
+    assert_eq!(stats.rows_inserted, 0, "Expected 0 rows inserted");
+    assert_eq!(stats.rows_deleted, 0, "Expected 0 rows deleted");
+
+    // Verify data persisted correctly
+    let fresh_provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "partitioned_update_merge",
+    )
+    .await?;
+
+    ctx.deregister_table("fresh_table").ok();
+    ctx.register_table("fresh_table", Arc::new(fresh_provider)).unwrap();
+
+    let result = ctx
+        .sql("SELECT id, category, value FROM fresh_table ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1, "Should have one batch");
+    let batch = &result[0];
+    assert_eq!(batch.num_rows(), 3, "Should have 3 rows after MERGE");
+
+    let id_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let value_col = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify updates
+    assert_eq!(id_col.value(0), 1);
+    assert_eq!(value_col.value(0), "gaming_laptop"); // updated
+
+    assert_eq!(id_col.value(1), 2);
+    assert_eq!(value_col.value(1), "phone"); // unchanged
+
+    assert_eq!(id_col.value(2), 3);
+    assert_eq!(value_col.value(2), "epic_novel"); // updated
+
+    Ok(())
+}
+
+/// Test MERGE with compound join keys (two-column ON condition).
+/// Verifies that multi-column join conditions work correctly for matching.
+#[tokio::test]
+async fn test_merge_compound_join_key_two_cols() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_merge_compound_key".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema: (id, region, value) - compound key on (id, region)
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let creation = TableCreation::builder()
+        .name("compound_key_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data - same id can exist in different regions
+    // (1, 'us', 'laptop_us'), (1, 'eu', 'laptop_eu'), (2, 'us', 'phone_us')
+    ctx.sql(
+        "INSERT INTO catalog.test_merge_compound_key.compound_key_table VALUES \
+         (1, 'us', 'laptop_us'), \
+         (1, 'eu', 'laptop_eu'), \
+         (2, 'us', 'phone_us')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Verify initial row count
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_merge_compound_key.compound_key_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 3, "Should have 3 rows initially");
+
+    // Create source DataFrame for MERGE with compound key:
+    // - (1, 'us', 'laptop_us_updated'): matches (1, 'us') -> UPDATE
+    // - (3, 'us', 'tablet_us'): new compound key -> INSERT
+    // Note: (1, 'eu') and (2, 'us') are NOT_MATCHED_BY_SOURCE
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "id",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "region",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "value",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    let id_array = Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 3]))
+        as datafusion::arrow::array::ArrayRef;
+    let region_array = Arc::new(StringArray::from(vec!["us", "us"]))
+        as datafusion::arrow::array::ArrayRef;
+    let value_array = Arc::new(StringArray::from(vec!["laptop_us_updated", "tablet_us"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch = datafusion::arrow::array::RecordBatch::try_new(
+        source_schema.clone(),
+        vec![id_array, region_array, value_array],
+    )
+    .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("compound_source", source_table).unwrap();
+    let source_df = ctx.table("compound_source").await.unwrap();
+
+    // Create provider for programmatic merge
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "compound_key_table",
+    )
+    .await?;
+
+    // Execute MERGE with compound key: ON target.id = source.id AND target.region = source.region
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(
+            df_col("target.id")
+                .eq(df_col("source.id"))
+                .and(df_col("target.region").eq(df_col("source.region"))),
+        )
+        .when_matched(None)
+        .update(vec![("value", df_col("source_value"))])
+        .when_not_matched(None)
+        .insert_all()
+        .when_not_matched_by_source(None)
+        .delete()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Expected classification with compound key:
+    // - (1, 'us'): MATCHED -> UPDATE
+    // - (1, 'eu'): NOT_MATCHED_BY_SOURCE -> DELETE
+    // - (2, 'us'): NOT_MATCHED_BY_SOURCE -> DELETE
+    // - (3, 'us'): NOT_MATCHED -> INSERT
+    assert_eq!(stats.rows_updated, 1, "Expected 1 row updated (id=1, region=us)");
+    assert_eq!(stats.rows_inserted, 1, "Expected 1 row inserted (id=3, region=us)");
+    assert_eq!(stats.rows_deleted, 2, "Expected 2 rows deleted");
+
+    // Reload and verify final data
+    let fresh_provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "compound_key_table",
+    )
+    .await?;
+
+    ctx.deregister_table("fresh_compound").ok();
+    ctx.register_table("fresh_compound", Arc::new(fresh_provider)).unwrap();
+
+    let result = ctx
+        .sql("SELECT id, region, value FROM fresh_compound ORDER BY id, region")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1, "Should have one batch");
+    let batch = &result[0];
+    assert_eq!(batch.num_rows(), 2, "Should have 2 rows after MERGE");
+
+    let id_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let region_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let value_col = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Row 1: (1, 'us', 'laptop_us_updated')
+    assert_eq!(id_col.value(0), 1);
+    assert_eq!(region_col.value(0), "us");
+    assert_eq!(value_col.value(0), "laptop_us_updated");
+
+    // Row 2: (3, 'us', 'tablet_us')
+    assert_eq!(id_col.value(1), 3);
+    assert_eq!(region_col.value(1), "us");
+    assert_eq!(value_col.value(1), "tablet_us");
+
+    Ok(())
+}
+
+/// Test MERGE with compound join key - simple UPDATE only scenario.
+/// Verifies that compound keys correctly match rows for updates.
+#[tokio::test]
+async fn test_merge_compound_key_update_only() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_merge_compound_upd".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema: (id, region, value)
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let creation = TableCreation::builder()
+        .name("compound_upd_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data
+    ctx.sql(
+        "INSERT INTO catalog.test_merge_compound_upd.compound_upd_table VALUES \
+         (1, 'us', 'old_us'), \
+         (1, 'eu', 'old_eu'), \
+         (2, 'us', 'old_us2')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Create source: update values for (1, 'us') and (2, 'us')
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "id",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "region",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "value",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+    ]));
+
+    let id_array = Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2]))
+        as datafusion::arrow::array::ArrayRef;
+    let region_array = Arc::new(StringArray::from(vec!["us", "us"]))
+        as datafusion::arrow::array::ArrayRef;
+    let value_array = Arc::new(StringArray::from(vec!["new_us", "new_us2"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch = datafusion::arrow::array::RecordBatch::try_new(
+        source_schema.clone(),
+        vec![id_array, region_array, value_array],
+    )
+    .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("upd_compound_source", source_table).unwrap();
+    let source_df = ctx.table("upd_compound_source").await.unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "compound_upd_table",
+    )
+    .await?;
+
+    // Execute MERGE with only WHEN MATCHED UPDATE
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(
+            df_col("target.id")
+                .eq(df_col("source.id"))
+                .and(df_col("target.region").eq(df_col("source.region"))),
+        )
+        .when_matched(None)
+        .update(vec![("value", df_col("source_value"))])
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // Should update 2 rows (both us region rows matched)
+    // (1, 'eu') does not match because region differs
+    assert_eq!(stats.rows_updated, 2, "Expected 2 rows updated");
+    assert_eq!(stats.rows_inserted, 0, "Expected 0 rows inserted");
+    assert_eq!(stats.rows_deleted, 0, "Expected 0 rows deleted");
+
+    // Verify data
+    let fresh_provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "compound_upd_table",
+    )
+    .await?;
+
+    ctx.deregister_table("fresh_upd").ok();
+    ctx.register_table("fresh_upd", Arc::new(fresh_provider)).unwrap();
+
+    let result = ctx
+        .sql("SELECT id, region, value FROM fresh_upd ORDER BY id, region")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    let batch = &result[0];
+    assert_eq!(batch.num_rows(), 3, "Should still have 3 rows");
+
+    let id_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let region_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let value_col = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // (1, 'eu') unchanged
+    assert_eq!(id_col.value(0), 1);
+    assert_eq!(region_col.value(0), "eu");
+    assert_eq!(value_col.value(0), "old_eu");
+
+    // (1, 'us') updated
+    assert_eq!(id_col.value(1), 1);
+    assert_eq!(region_col.value(1), "us");
+    assert_eq!(value_col.value(1), "new_us");
+
+    // (2, 'us') updated
+    assert_eq!(id_col.value(2), 2);
+    assert_eq!(region_col.value(2), "us");
+    assert_eq!(value_col.value(2), "new_us2");
+
+    Ok(())
+}
+
+/// Tests that Dynamic Partition Pruning (DPP) is applied when source data
+/// touches only a single partition out of many.
+#[tokio::test]
+async fn test_merge_dpp_single_partition() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_merge_dpp_single".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema with partition column: (id: Int, region: String, value: String)
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "region", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("dpp_single_part_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across 3 partitions: us, eu, asia
+    ctx.sql(
+        "INSERT INTO catalog.test_merge_dpp_single.dpp_single_part_table VALUES \
+         (1, 'us', 'val1'), \
+         (2, 'us', 'val2'), \
+         (3, 'eu', 'val3'), \
+         (4, 'eu', 'val4'), \
+         (5, 'asia', 'val5'), \
+         (6, 'asia', 'val6')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Create source that only touches 'us' partition (1 out of 3 partitions)
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int32, false),
+        datafusion::arrow::datatypes::Field::new("region", datafusion::arrow::datatypes::DataType::Utf8, false),
+        datafusion::arrow::datatypes::Field::new("value", datafusion::arrow::datatypes::DataType::Utf8, false),
+    ]));
+
+    let id_array = Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 7]))
+        as datafusion::arrow::array::ArrayRef;
+    let region_array = Arc::new(StringArray::from(vec!["us", "us"]))
+        as datafusion::arrow::array::ArrayRef;
+    let value_array = Arc::new(StringArray::from(vec!["updated_val1", "new_val7"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch = datafusion::arrow::array::RecordBatch::try_new(
+        source_schema.clone(),
+        vec![id_array, region_array, value_array],
+    )
+    .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("dpp_source_single", source_table).unwrap();
+    let source_df = ctx.table("dpp_source_single").await.unwrap();
+
+    // Create provider and execute MERGE with join on partition column
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "dpp_single_part_table",
+    )
+    .await?;
+
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.region").eq(df_col("source.region")).and(df_col("target.id").eq(df_col("source.id"))))
+        .when_matched(None)
+        .update(vec![("value", df_col("source_value"))])
+        .when_not_matched(None)
+        .insert_all()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // DPP should be applied since join includes partition column 'region'
+    // and source only has 1 distinct region value ('us')
+    assert!(stats.dpp_applied, "DPP should be applied when source touches single partition");
+    assert_eq!(stats.dpp_partition_count, 1, "Should have pruned to 1 partition");
+    assert_eq!(stats.rows_updated, 1, "Expected 1 row updated (id=1)");
+    assert_eq!(stats.rows_inserted, 1, "Expected 1 row inserted (id=7)");
+
+    Ok(())
+}
+
+/// Tests that DPP is disabled when source data has high cardinality
+/// (exceeds dpp_max_partitions threshold).
+#[tokio::test]
+async fn test_merge_dpp_disabled_high_cardinality() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_merge_dpp_high_card".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema with partition column
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("dpp_high_card_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across 2 partitions initially
+    ctx.sql(
+        "INSERT INTO catalog.test_merge_dpp_high_card.dpp_high_card_table VALUES \
+         (1, 'cat_a', 'val1'), \
+         (2, 'cat_b', 'val2')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Create source with 1001+ distinct partition values to exceed default threshold
+    // Note: Default DPP_DEFAULT_MAX_PARTITIONS = 1000
+    let mut id_values = Vec::new();
+    let mut category_values = Vec::new();
+    let mut value_values = Vec::new();
+    for i in 0..1010 {
+        id_values.push(i + 100);
+        category_values.push(format!("cat_{}", i));
+        value_values.push(format!("new_val_{}", i));
+    }
+
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int32, false),
+        datafusion::arrow::datatypes::Field::new("category", datafusion::arrow::datatypes::DataType::Utf8, false),
+        datafusion::arrow::datatypes::Field::new("value", datafusion::arrow::datatypes::DataType::Utf8, false),
+    ]));
+
+    let id_array = Arc::new(datafusion::arrow::array::Int32Array::from(id_values))
+        as datafusion::arrow::array::ArrayRef;
+    let category_array = Arc::new(StringArray::from(category_values))
+        as datafusion::arrow::array::ArrayRef;
+    let value_array = Arc::new(StringArray::from(value_values))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch = datafusion::arrow::array::RecordBatch::try_new(
+        source_schema.clone(),
+        vec![id_array, category_array, value_array],
+    )
+    .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("dpp_source_high_card", source_table).unwrap();
+    let source_df = ctx.table("dpp_source_high_card").await.unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "dpp_high_card_table",
+    )
+    .await?;
+
+    // Execute MERGE - join includes partition column but source has too many distinct values
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.category").eq(df_col("source.category")).and(df_col("target.id").eq(df_col("source.id"))))
+        .when_matched(None)
+        .update(vec![("value", df_col("source_value"))])
+        .when_not_matched(None)
+        .insert_all()
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // DPP should NOT be applied due to high cardinality (>1000 distinct values)
+    // Note: partition_count still reports the extracted count even when DPP is disabled
+    assert!(!stats.dpp_applied, "DPP should be disabled when partition count exceeds threshold");
+    assert!(stats.dpp_partition_count > 1000, "Should report high partition count that triggered threshold");
+
+    Ok(())
+}
+
+/// Tests that DPP is not applied when the join key does not include a partition column.
+#[tokio::test]
+async fn test_merge_dpp_non_partition_join_key() -> Result<()> {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::col as df_col;
+    use iceberg_datafusion::merge::MergeStats;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_merge_dpp_non_part".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema partitioned by 'region', but we'll join on 'id' (non-partition column)
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "region", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("dpp_non_part_join_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across multiple partitions
+    ctx.sql(
+        "INSERT INTO catalog.test_merge_dpp_non_part.dpp_non_part_join_table VALUES \
+         (1, 'us', 'val1'), \
+         (2, 'eu', 'val2'), \
+         (3, 'asia', 'val3')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Create source - doesn't include partition column, just id
+    let source_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int32, false),
+        datafusion::arrow::datatypes::Field::new("value", datafusion::arrow::datatypes::DataType::Utf8, false),
+    ]));
+
+    let id_array = Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 4]))
+        as datafusion::arrow::array::ArrayRef;
+    let value_array = Arc::new(StringArray::from(vec!["updated_val1", "new_val4"]))
+        as datafusion::arrow::array::ArrayRef;
+    let source_batch = datafusion::arrow::array::RecordBatch::try_new(
+        source_schema.clone(),
+        vec![id_array, value_array],
+    )
+    .unwrap();
+
+    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    ctx.register_table("dpp_source_non_part", source_table).unwrap();
+    let source_df = ctx.table("dpp_source_non_part").await.unwrap();
+
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "dpp_non_part_join_table",
+    )
+    .await?;
+
+    // Execute MERGE joining only on 'id' - NOT a partition column
+    let stats: MergeStats = provider
+        .merge(source_df)
+        .await
+        .unwrap()
+        .on(df_col("target.id").eq(df_col("source.id")))
+        .when_matched(None)
+        .update(vec![("value", df_col("source_value"))])
+        .when_not_matched(None)
+        .insert(vec![
+            ("id", df_col("source_id")),
+            ("region", lit("unknown")),
+            ("value", df_col("source_value")),
+        ])
+        .execute(&ctx.state())
+        .await
+        .unwrap();
+
+    // DPP should NOT be applied since join key 'id' is not a partition column
+    assert!(!stats.dpp_applied, "DPP should not be applied when join key is not a partition column");
+    assert_eq!(stats.dpp_partition_count, 0, "Should report 0 partitions when DPP not applied");
+
+    // Verify the merge still works correctly
+    assert_eq!(stats.rows_updated, 1, "Expected 1 row updated (id=1)");
+    assert_eq!(stats.rows_inserted, 1, "Expected 1 row inserted (id=4)");
+
+    Ok(())
+}

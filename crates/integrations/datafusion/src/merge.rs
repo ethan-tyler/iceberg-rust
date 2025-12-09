@@ -112,6 +112,21 @@ pub struct MergeStats {
     pub files_added: u64,
     /// Number of data files logically removed (via position deletes)
     pub files_removed: u64,
+
+    // === Dynamic Partition Pruning (DPP) metrics ===
+    /// Whether DPP was applied to prune the target table scan.
+    ///
+    /// DPP is enabled when:
+    /// - The table is partitioned with identity transforms
+    /// - A join key is also a partition column
+    /// - The number of distinct partition values is below the threshold
+    pub dpp_applied: bool,
+    /// Number of distinct partition values found in source data.
+    ///
+    /// When `dpp_applied` is true, this indicates how many partitions
+    /// the target scan was pruned to. When false, this may indicate
+    /// the partition count that exceeded the threshold (if applicable).
+    pub dpp_partition_count: usize,
 }
 
 impl MergeStats {
@@ -208,6 +223,9 @@ pub struct WhenNotMatchedBySourceClause {
 ///     .execute(&session_state)
 ///     .await?;
 /// ```
+/// Configuration options for MERGE operations.
+pub use crate::physical_plan::merge::MergeConfig;
+
 pub struct MergeBuilder {
     table: Table,
     catalog: Arc<dyn Catalog>,
@@ -217,6 +235,7 @@ pub struct MergeBuilder {
     when_matched: Vec<WhenMatchedClause>,
     when_not_matched: Vec<WhenNotMatchedClause>,
     when_not_matched_by_source: Vec<WhenNotMatchedBySourceClause>,
+    merge_config: MergeConfig,
 }
 
 impl MergeBuilder {
@@ -236,7 +255,47 @@ impl MergeBuilder {
             when_matched: Vec::new(),
             when_not_matched: Vec::new(),
             when_not_matched_by_source: Vec::new(),
+            merge_config: MergeConfig::default(),
         }
+    }
+
+    /// Configures Dynamic Partition Pruning (DPP) for this MERGE operation.
+    ///
+    /// DPP optimizes MERGE performance by pruning target partitions based on
+    /// the partition values present in the source data. This reduces I/O by
+    /// only scanning partitions that could potentially match.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration options for DPP behavior.
+    ///
+    /// # Default Behavior
+    ///
+    /// By default, DPP is enabled with a maximum of 1000 partitions.
+    /// If the source data touches more than 1000 distinct partition values,
+    /// DPP is automatically disabled and a full scan is performed.
+    ///
+    /// # Limitations
+    ///
+    /// DPP currently only works when:
+    /// - The partition uses an identity transform (not bucket/truncate/etc.)
+    /// - The partition column is part of the join condition
+    /// - The data type is one of: Int32, Int64, String, Date
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg_datafusion::merge::MergeConfig;
+    ///
+    /// // Disable DPP entirely
+    /// builder.with_merge_config(MergeConfig::new().with_dpp(false))
+    ///
+    /// // Increase the partition threshold
+    /// builder.with_merge_config(MergeConfig::new().with_dpp_max_partitions(5000))
+    /// ```
+    pub fn with_merge_config(mut self, config: MergeConfig) -> Self {
+        self.merge_config = config;
+        self
     }
 
     /// Sets the ON condition for matching source and target rows.
@@ -531,7 +590,8 @@ impl MergeBuilder {
 
         use crate::physical_plan::merge::IcebergMergeExec;
         use crate::physical_plan::merge_commit::{
-            IcebergMergeCommitExec, MERGE_RESULT_DELETED_COL, MERGE_RESULT_INSERTED_COL,
+            IcebergMergeCommitExec, MERGE_RESULT_DELETED_COL, MERGE_RESULT_DPP_APPLIED_COL,
+            MERGE_RESULT_DPP_PARTITION_COUNT_COL, MERGE_RESULT_INSERTED_COL,
             MERGE_RESULT_UPDATED_COL,
         };
 
@@ -561,6 +621,7 @@ impl MergeBuilder {
             self.when_matched.clone(),
             self.when_not_matched.clone(),
             self.when_not_matched_by_source.clone(),
+            self.merge_config.clone(),
         ));
 
         // Build the commit layer (deserialize files -> commit via RowDelta)
@@ -629,6 +690,25 @@ impl MergeBuilder {
             })?
             .value(0);
 
+        // Parse DPP columns from result batch
+        let dpp_applied = batch
+            .column_by_name(MERGE_RESULT_DPP_APPLIED_COL)
+            .and_then(|col| {
+                col.as_any()
+                    .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+                    .map(|arr| arr.value(0))
+            })
+            .unwrap_or(false);
+
+        let dpp_partition_count = batch
+            .column_by_name(MERGE_RESULT_DPP_PARTITION_COUNT_COL)
+            .and_then(|col| {
+                col.as_any()
+                    .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                    .map(|arr| arr.value(0) as usize)
+            })
+            .unwrap_or(0);
+
         Ok(MergeStats {
             rows_inserted: inserted,
             rows_updated: updated,
@@ -637,6 +717,8 @@ impl MergeBuilder {
             rows_copied: 0,
             files_added: 0,
             files_removed: 0,
+            dpp_applied,
+            dpp_partition_count,
         })
     }
 

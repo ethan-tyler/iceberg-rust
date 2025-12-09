@@ -26,7 +26,7 @@ use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -44,7 +44,8 @@ use iceberg::Catalog;
 
 use super::merge::{
     MERGE_DATA_FILES_COL, MERGE_DELETE_FILES_COL, MERGE_DELETED_COUNT_COL,
-    MERGE_INSERTED_COUNT_COL, MERGE_UPDATED_COUNT_COL,
+    MERGE_DPP_APPLIED_COL, MERGE_DPP_PARTITION_COUNT_COL, MERGE_INSERTED_COUNT_COL,
+    MERGE_UPDATED_COUNT_COL,
 };
 use crate::to_datafusion_error;
 
@@ -52,6 +53,8 @@ use crate::to_datafusion_error;
 pub const MERGE_RESULT_INSERTED_COL: &str = "rows_inserted";
 pub const MERGE_RESULT_UPDATED_COL: &str = "rows_updated";
 pub const MERGE_RESULT_DELETED_COL: &str = "rows_deleted";
+pub const MERGE_RESULT_DPP_APPLIED_COL: &str = "dpp_applied";
+pub const MERGE_RESULT_DPP_PARTITION_COUNT_COL: &str = "dpp_partition_count";
 
 /// Execution plan for committing MERGE files to an Iceberg table.
 ///
@@ -126,19 +129,31 @@ impl IcebergMergeCommitExec {
             Field::new(MERGE_RESULT_INSERTED_COL, DataType::UInt64, false),
             Field::new(MERGE_RESULT_UPDATED_COL, DataType::UInt64, false),
             Field::new(MERGE_RESULT_DELETED_COL, DataType::UInt64, false),
+            Field::new(MERGE_RESULT_DPP_APPLIED_COL, DataType::Boolean, false),
+            Field::new(MERGE_RESULT_DPP_PARTITION_COUNT_COL, DataType::UInt64, false),
         ]))
     }
 
     /// Creates a record batch with merge statistics.
-    fn make_stats_batch(inserted: u64, updated: u64, deleted: u64) -> DFResult<RecordBatch> {
+    fn make_stats_batch(
+        inserted: u64,
+        updated: u64,
+        deleted: u64,
+        dpp_applied: bool,
+        dpp_partition_count: u64,
+    ) -> DFResult<RecordBatch> {
         let inserted_array = Arc::new(UInt64Array::from(vec![inserted])) as ArrayRef;
         let updated_array = Arc::new(UInt64Array::from(vec![updated])) as ArrayRef;
         let deleted_array = Arc::new(UInt64Array::from(vec![deleted])) as ArrayRef;
+        let dpp_applied_array = Arc::new(BooleanArray::from(vec![dpp_applied])) as ArrayRef;
+        let dpp_partition_count_array = Arc::new(UInt64Array::from(vec![dpp_partition_count])) as ArrayRef;
 
         RecordBatch::try_from_iter_with_nullable(vec![
             (MERGE_RESULT_INSERTED_COL, inserted_array, false),
             (MERGE_RESULT_UPDATED_COL, updated_array, false),
             (MERGE_RESULT_DELETED_COL, deleted_array, false),
+            (MERGE_RESULT_DPP_APPLIED_COL, dpp_applied_array, false),
+            (MERGE_RESULT_DPP_PARTITION_COUNT_COL, dpp_partition_count_array, false),
         ])
         .map_err(|e| {
             DataFusionError::ArrowError(
@@ -245,6 +260,8 @@ impl ExecutionPlan for IcebergMergeCommitExec {
             let mut total_inserted: u64 = 0;
             let mut total_updated: u64 = 0;
             let mut total_deleted: u64 = 0;
+            let mut dpp_applied: bool = false;
+            let mut dpp_partition_count: u64 = 0;
 
             // Execute and collect results from the input
             let mut batch_stream = input_plan.execute(0, context)?;
@@ -340,6 +357,47 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                         ))
                     })?;
 
+                // Extract DPP metrics
+                let dpp_applied_array = batch
+                    .column_by_name(MERGE_DPP_APPLIED_COL)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Expected '{}' column in input batch",
+                            MERGE_DPP_APPLIED_COL
+                        ))
+                    })?
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Expected '{}' column to be BooleanArray",
+                            MERGE_DPP_APPLIED_COL
+                        ))
+                    })?;
+
+                let dpp_partition_count_array = batch
+                    .column_by_name(MERGE_DPP_PARTITION_COUNT_COL)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Expected '{}' column in input batch",
+                            MERGE_DPP_PARTITION_COUNT_COL
+                        ))
+                    })?
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Expected '{}' column to be UInt64Array",
+                            MERGE_DPP_PARTITION_COUNT_COL
+                        ))
+                    })?;
+
+                // Capture DPP values (just use first row since DPP is per-merge)
+                if dpp_applied_array.len() > 0 {
+                    dpp_applied = dpp_applied_array.value(0);
+                    dpp_partition_count = dpp_partition_count_array.value(0);
+                }
+
                 // Parse data files from newline-delimited JSON
                 for data_files_str in data_files_array.iter().flatten() {
                     for json_line in data_files_str.lines() {
@@ -380,9 +438,9 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                 }
             }
 
-            // If no files were collected, return zero counts
+            // If no files were collected, return zero counts (but preserve DPP stats)
             if data_files.is_empty() && delete_files.is_empty() {
-                return Self::make_stats_batch(0, 0, 0);
+                return Self::make_stats_batch(0, 0, 0, dpp_applied, dpp_partition_count);
             }
 
             // Refresh table from catalog to get current state for commit
@@ -420,7 +478,7 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                 .await
                 .map_err(to_datafusion_error)?;
 
-            Self::make_stats_batch(total_inserted, total_updated, total_deleted)
+            Self::make_stats_batch(total_inserted, total_updated, total_deleted, dpp_applied, dpp_partition_count)
         })
         .boxed();
 
@@ -435,21 +493,25 @@ mod tests {
     #[test]
     fn test_output_schema() {
         let schema = IcebergMergeCommitExec::make_output_schema();
-        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.fields().len(), 5);
         assert_eq!(schema.field(0).name(), MERGE_RESULT_INSERTED_COL);
         assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
         assert_eq!(schema.field(1).name(), MERGE_RESULT_UPDATED_COL);
         assert_eq!(schema.field(1).data_type(), &DataType::UInt64);
         assert_eq!(schema.field(2).name(), MERGE_RESULT_DELETED_COL);
         assert_eq!(schema.field(2).data_type(), &DataType::UInt64);
+        assert_eq!(schema.field(3).name(), MERGE_RESULT_DPP_APPLIED_COL);
+        assert_eq!(schema.field(3).data_type(), &DataType::Boolean);
+        assert_eq!(schema.field(4).name(), MERGE_RESULT_DPP_PARTITION_COUNT_COL);
+        assert_eq!(schema.field(4).data_type(), &DataType::UInt64);
     }
 
     #[test]
     fn test_make_stats_batch() {
-        let batch = IcebergMergeCommitExec::make_stats_batch(10, 20, 30).unwrap();
+        let batch = IcebergMergeCommitExec::make_stats_batch(10, 20, 30, true, 2).unwrap();
 
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.num_columns(), 5);
 
         let inserted = batch
             .column(0)
@@ -471,11 +533,25 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(deleted.value(0), 30);
+
+        let dpp_applied = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(dpp_applied.value(0));
+
+        let dpp_count = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(dpp_count.value(0), 2);
     }
 
     #[test]
     fn test_make_stats_batch_zero() {
-        let batch = IcebergMergeCommitExec::make_stats_batch(0, 0, 0).unwrap();
+        let batch = IcebergMergeCommitExec::make_stats_batch(0, 0, 0, false, 0).unwrap();
         assert_eq!(batch.num_rows(), 1);
 
         let inserted = batch
@@ -484,5 +560,12 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(inserted.value(0), 0);
+
+        let dpp_applied = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(!dpp_applied.value(0));
     }
 }
