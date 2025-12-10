@@ -17,6 +17,7 @@
 
 //! Table API for Apache Iceberg
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
@@ -25,7 +26,8 @@ use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
-use crate::{Error, ErrorKind, Result, TableIdent};
+use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
 pub struct TableBuilder {
@@ -244,6 +246,248 @@ impl Table {
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
         ArrowReaderBuilder::new(self.file_io.clone())
     }
+
+    // =========================================================================
+    // Property Accessor Methods
+    // =========================================================================
+
+    /// Returns all table properties as a reference to the properties map.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let props = table.properties();
+    /// for (key, value) in props {
+    ///     println!("{} = {}", key, value);
+    /// }
+    /// ```
+    pub fn properties(&self) -> &HashMap<String, String> {
+        self.metadata.properties()
+    }
+
+    /// Returns a specific property value.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Property key to look up
+    ///
+    /// # Returns
+    ///
+    /// `Some(&str)` if the property exists, `None` otherwise
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// if let Some(mode) = table.property("write.delete.mode") {
+    ///     println!("Delete mode: {}", mode);
+    /// }
+    /// ```
+    pub fn property(&self, key: &str) -> Option<&str> {
+        self.metadata.properties().get(key).map(|s| s.as_str())
+    }
+
+    /// Returns a property value with a default fallback.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Property key to look up
+    /// * `default` - Default value if property doesn't exist
+    ///
+    /// # Returns
+    ///
+    /// Property value if exists, otherwise the default value
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mode = table.property_or("write.delete.mode", "copy-on-write");
+    /// ```
+    pub fn property_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
+        self.property(key).unwrap_or(default)
+    }
+
+    /// Returns a property value parsed as a specific type.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Property key to look up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(T))` if property exists and parses successfully
+    /// * `Ok(None)` if property doesn't exist
+    /// * `Err` if property exists but fails to parse
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let file_size: Option<i64> = table.property_as("write.target-file-size-bytes")?;
+    /// let enabled: Option<bool> = table.property_as("write.metadata.delete-after-commit.enabled")?;
+    /// ```
+    pub fn property_as<T: std::str::FromStr>(&self, key: &str) -> Result<Option<T>>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match self.property(key) {
+            Some(value) => value.parse::<T>().map(Some).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Failed to parse property '{}' value '{}': {}",
+                        key, value, e
+                    ),
+                )
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns a property value parsed as a specific type, with a default.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Property key to look up
+    /// * `default` - Default value if property doesn't exist
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(T)` - Parsed property value or default (on missing property)
+    /// * `Err` - If property exists but fails to parse
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let file_size: i64 = table.property_as_or("write.target-file-size-bytes", 536870912)?;
+    /// ```
+    pub fn property_as_or<T: std::str::FromStr>(&self, key: &str, default: T) -> Result<T>
+    where
+        T::Err: std::fmt::Display,
+    {
+        self.property_as(key).map(|opt| opt.unwrap_or(default))
+    }
+
+    // =========================================================================
+    // Property Update Methods
+    // =========================================================================
+
+    /// Creates a builder for updating table properties.
+    ///
+    /// This is a convenience method that wraps the transaction API for simple
+    /// property updates. For combining property updates with other operations,
+    /// use `Transaction::update_table_properties()` directly.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let updated_table = table.update_properties()
+    ///     .set("write.delete.mode", "merge-on-read")
+    ///     .remove("old.property")
+    ///     .commit(&catalog)
+    ///     .await?;
+    /// ```
+    pub fn update_properties(&self) -> TableUpdatePropertiesBuilder {
+        TableUpdatePropertiesBuilder::new(self.clone())
+    }
+}
+
+/// Builder for standalone table property updates.
+///
+/// This builder provides a convenient fluent API for updating table properties
+/// without manually creating a transaction. The catalog is only required at
+/// commit time, following the same pattern as `Transaction::commit()`.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let updated = table.update_properties()
+///     .set("write.delete.mode", "merge-on-read")
+///     .set("write.update.mode", "merge-on-read")
+///     .remove("deprecated.property")
+///     .commit(&catalog)
+///     .await?;
+/// ```
+pub struct TableUpdatePropertiesBuilder {
+    table: Table,
+    updates: HashMap<String, String>,
+    removals: HashSet<String>,
+}
+
+impl TableUpdatePropertiesBuilder {
+    /// Creates a new builder for the given table.
+    pub fn new(table: Table) -> Self {
+        Self {
+            table,
+            updates: HashMap::new(),
+            removals: HashSet::new(),
+        }
+    }
+
+    /// Sets a property key-value pair.
+    ///
+    /// If the key was previously marked for removal, it will be moved
+    /// to the update set instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Property key to set
+    /// * `value` - Property value to set
+    pub fn set(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let key = key.into();
+        self.removals.remove(&key);
+        self.updates.insert(key, value.into());
+        self
+    }
+
+    /// Marks a property key for removal.
+    ///
+    /// If the key was previously set in this builder, it will be moved
+    /// to the removal set instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Property key to remove
+    pub fn remove(mut self, key: impl Into<String>) -> Self {
+        let key = key.into();
+        self.updates.remove(&key);
+        self.removals.insert(key);
+        self
+    }
+
+    /// Commits the property updates to the catalog.
+    ///
+    /// If no updates or removals have been specified, returns the
+    /// original table without making any catalog calls.
+    ///
+    /// # Arguments
+    ///
+    /// * `catalog` - The catalog to commit the changes to
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A reserved property is being modified
+    /// - The same key is in both updates and removals (shouldn't happen with this API)
+    /// - The catalog commit fails
+    pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        if self.updates.is_empty() && self.removals.is_empty() {
+            // No changes, return current table
+            return Ok(self.table);
+        }
+
+        let tx = Transaction::new(&self.table);
+        let mut update_action = tx.update_table_properties();
+
+        for (key, value) in self.updates {
+            update_action = update_action.set(key, value);
+        }
+
+        for key in self.removals {
+            update_action = update_action.remove(key);
+        }
+
+        let tx = update_action.apply(tx)?;
+        tx.commit(catalog).await
+    }
 }
 
 /// `StaticTable` is a read-only table struct that can be created from a metadata file or from `TableMetaData` without a catalog.
@@ -416,5 +660,250 @@ mod tests {
             .unwrap();
         assert!(!table.readonly());
         assert_eq!(table.identifier.name(), "table");
+    }
+
+    /// Helper to create a table with properties for testing
+    async fn create_table_with_properties() -> Table {
+        // Use TableMetadataV1Compat.json which has properties set
+        let metadata_file_path = format!(
+            "{}/testdata/table_metadata/TableMetadataV1Compat.json",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        let file_io = FileIO::from_path(&metadata_file_path)
+            .unwrap()
+            .build()
+            .unwrap();
+        let metadata_file = file_io.new_input(&metadata_file_path).unwrap();
+        let metadata_file_content = metadata_file.read().await.unwrap();
+        let table_metadata =
+            serde_json::from_slice::<TableMetadata>(&metadata_file_content).unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table_with_props"]).unwrap();
+        Table::builder()
+            .metadata(table_metadata)
+            .metadata_location(metadata_file_path)
+            .identifier(identifier)
+            .file_io(file_io)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_properties_returns_all_properties() {
+        let table = create_table_with_properties().await;
+        let props = table.properties();
+        assert!(!props.is_empty());
+        assert!(props.contains_key("owner"));
+    }
+
+    #[tokio::test]
+    async fn test_property_returns_existing_value() {
+        let table = create_table_with_properties().await;
+        assert_eq!(table.property("owner"), Some("spark"));
+    }
+
+    #[tokio::test]
+    async fn test_property_returns_none_for_missing() {
+        let table = create_table_with_properties().await;
+        assert_eq!(table.property("nonexistent.property.key"), None);
+    }
+
+    #[tokio::test]
+    async fn test_property_or_returns_value_when_exists() {
+        let table = create_table_with_properties().await;
+        assert_eq!(table.property_or("owner", "default"), "spark");
+    }
+
+    #[tokio::test]
+    async fn test_property_or_returns_default_when_missing() {
+        let table = create_table_with_properties().await;
+        assert_eq!(
+            table.property_or("nonexistent.key", "default-value"),
+            "default-value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_property_as_parses_i64() {
+        let table = create_table_with_properties().await;
+        // history.expire.max-snapshot-age-ms is "18000000" in the test file
+        let value: Option<i64> = table
+            .property_as("history.expire.max-snapshot-age-ms")
+            .unwrap();
+        assert_eq!(value, Some(18000000));
+    }
+
+    #[tokio::test]
+    async fn test_property_as_parses_i32() {
+        let table = create_table_with_properties().await;
+        // write.metadata.previous-versions-max is "20" in the test file
+        let value: Option<i32> = table
+            .property_as("write.metadata.previous-versions-max")
+            .unwrap();
+        assert_eq!(value, Some(20));
+    }
+
+    #[tokio::test]
+    async fn test_property_as_returns_none_for_missing() {
+        let table = create_table_with_properties().await;
+        let value: Option<i64> = table.property_as("nonexistent.key").unwrap();
+        assert_eq!(value, None);
+    }
+
+    #[tokio::test]
+    async fn test_property_as_errors_on_invalid_parse() {
+        let table = create_table_with_properties().await;
+        // "owner" is "spark" which can't be parsed as i64
+        let result: Result<Option<i64>> = table.property_as("owner");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message().contains("Failed to parse property"));
+        assert!(err.message().contains("owner"));
+    }
+
+    #[tokio::test]
+    async fn test_property_as_or_returns_parsed_value() {
+        let table = create_table_with_properties().await;
+        let value: i64 = table
+            .property_as_or("history.expire.max-snapshot-age-ms", 0)
+            .unwrap();
+        assert_eq!(value, 18000000);
+    }
+
+    #[tokio::test]
+    async fn test_property_as_or_returns_default_when_missing() {
+        let table = create_table_with_properties().await;
+        let value: i64 = table.property_as_or("nonexistent.key", 999).unwrap();
+        assert_eq!(value, 999);
+    }
+
+    #[tokio::test]
+    async fn test_property_as_or_errors_on_invalid_parse() {
+        let table = create_table_with_properties().await;
+        // "owner" is "spark" which can't be parsed as i64
+        let result: Result<i64> = table.property_as_or("owner", 0);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // TableUpdatePropertiesBuilder Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_update_properties_builder_set() {
+        let table = create_table_with_properties().await;
+        let builder = table.update_properties();
+
+        // Set some properties
+        let builder = builder
+            .set("key1", "value1")
+            .set("key2", "value2");
+
+        // Verify the builder has the updates tracked
+        assert_eq!(builder.updates.len(), 2);
+        assert_eq!(builder.updates.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(builder.updates.get("key2"), Some(&"value2".to_string()));
+        assert!(builder.removals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_properties_builder_remove() {
+        let table = create_table_with_properties().await;
+        let builder = table.update_properties();
+
+        // Remove some properties
+        let builder = builder
+            .remove("key1")
+            .remove("key2");
+
+        // Verify the builder has the removals tracked
+        assert_eq!(builder.removals.len(), 2);
+        assert!(builder.removals.contains("key1"));
+        assert!(builder.removals.contains("key2"));
+        assert!(builder.updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_properties_builder_set_then_remove() {
+        let table = create_table_with_properties().await;
+        let builder = table.update_properties();
+
+        // Set a property then remove it
+        let builder = builder
+            .set("key1", "value1")
+            .remove("key1");
+
+        // Should be in removals, not updates
+        assert!(builder.updates.is_empty());
+        assert_eq!(builder.removals.len(), 1);
+        assert!(builder.removals.contains("key1"));
+    }
+
+    #[tokio::test]
+    async fn test_update_properties_builder_remove_then_set() {
+        let table = create_table_with_properties().await;
+        let builder = table.update_properties();
+
+        // Remove a property then set it
+        let builder = builder
+            .remove("key1")
+            .set("key1", "value1");
+
+        // Should be in updates, not removals
+        assert!(builder.removals.is_empty());
+        assert_eq!(builder.updates.len(), 1);
+        assert_eq!(builder.updates.get("key1"), Some(&"value1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_update_properties_builder_mixed_operations() {
+        let table = create_table_with_properties().await;
+        let builder = table.update_properties();
+
+        // Mix of set and remove operations
+        let builder = builder
+            .set("set1", "value1")
+            .set("set2", "value2")
+            .remove("remove1")
+            .remove("remove2")
+            .set("set3", "value3");
+
+        // Verify final state
+        assert_eq!(builder.updates.len(), 3);
+        assert_eq!(builder.removals.len(), 2);
+        assert_eq!(builder.updates.get("set1"), Some(&"value1".to_string()));
+        assert_eq!(builder.updates.get("set2"), Some(&"value2".to_string()));
+        assert_eq!(builder.updates.get("set3"), Some(&"value3".to_string()));
+        assert!(builder.removals.contains("remove1"));
+        assert!(builder.removals.contains("remove2"));
+    }
+
+    #[tokio::test]
+    async fn test_update_properties_builder_accepts_string_refs() {
+        let table = create_table_with_properties().await;
+
+        // Test that the API accepts &str, String, and other Into<String> types
+        let key: &str = "key";
+        let value: String = "value".to_string();
+
+        let builder = table.update_properties()
+            .set(key, &value)
+            .remove("other");
+
+        assert_eq!(builder.updates.len(), 1);
+        assert_eq!(builder.removals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_properties_builder_empty_returns_same_table() {
+        use crate::catalog::MockCatalog;
+
+        let table = create_table_with_properties().await;
+        let mock_catalog = MockCatalog::new();
+
+        // Empty builder should return same table without calling catalog
+        let result = table.update_properties().commit(&mock_catalog).await;
+        assert!(result.is_ok());
+        let returned_table = result.unwrap();
+        assert_eq!(returned_table.identifier(), table.identifier());
     }
 }

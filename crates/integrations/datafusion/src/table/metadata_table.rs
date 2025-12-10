@@ -57,6 +57,7 @@ impl TableProvider for IcebergMetadataTableProvider {
             MetadataTableType::History => metadata_table.history().schema(),
             MetadataTableType::Refs => metadata_table.refs().schema(),
             MetadataTableType::Files => metadata_table.files().schema(),
+            MetadataTableType::Properties => metadata_table.properties().schema(),
         };
         schema_to_arrow_schema(&schema).unwrap().into()
     }
@@ -85,6 +86,7 @@ impl IcebergMetadataTableProvider {
             MetadataTableType::History => metadata_table.history().scan().await,
             MetadataTableType::Refs => metadata_table.refs().scan().await,
             MetadataTableType::Files => metadata_table.files().scan().await,
+            MetadataTableType::Properties => metadata_table.properties().scan().await,
         }
         .map_err(to_datafusion_error)?;
         let stream = stream.map_err(to_datafusion_error);
