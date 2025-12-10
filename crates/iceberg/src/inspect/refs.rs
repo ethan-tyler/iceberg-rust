@@ -60,8 +60,16 @@ impl<'a> RefsTable<'a> {
             NestedField::required(2, "type", Type::Primitive(PrimitiveType::String)),
             NestedField::required(3, "snapshot_id", Type::Primitive(PrimitiveType::Long)),
             NestedField::optional(4, "max_ref_age_ms", Type::Primitive(PrimitiveType::Long)),
-            NestedField::optional(5, "min_snapshots_to_keep", Type::Primitive(PrimitiveType::Int)),
-            NestedField::optional(6, "max_snapshot_age_ms", Type::Primitive(PrimitiveType::Long)),
+            NestedField::optional(
+                5,
+                "min_snapshots_to_keep",
+                Type::Primitive(PrimitiveType::Int),
+            ),
+            NestedField::optional(
+                6,
+                "max_snapshot_age_ms",
+                Type::Primitive(PrimitiveType::Long),
+            ),
         ];
         crate::spec::Schema::builder()
             .with_fields(fields.into_iter().map(|f| f.into()))
@@ -101,7 +109,9 @@ impl<'a> RefsTable<'a> {
                     min_snapshots_to_keep.append_option(*min_snaps);
                     max_snapshot_age_ms.append_option(*max_snap_age);
                 }
-                SnapshotRetention::Tag { max_ref_age_ms: max_ref_age } => {
+                SnapshotRetention::Tag {
+                    max_ref_age_ms: max_ref_age,
+                } => {
                     ref_type.append_value("TAG");
                     snapshot_id.append_value(snapshot_ref.snapshot_id);
                     max_ref_age_ms.append_option(*max_ref_age);
