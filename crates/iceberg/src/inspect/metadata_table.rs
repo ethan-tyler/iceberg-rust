@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{HistoryTable, ManifestsTable, RefsTable, SnapshotsTable};
+use super::{FilesTable, HistoryTable, ManifestsTable, RefsTable, SnapshotsTable};
 use crate::table::Table;
 
 /// Metadata table is used to inspect a table's history, snapshots, and other metadata as a table.
@@ -38,6 +38,8 @@ pub enum MetadataTableType {
     History,
     /// [`RefsTable`]
     Refs,
+    /// [`FilesTable`]
+    Files,
 }
 
 impl MetadataTableType {
@@ -48,6 +50,7 @@ impl MetadataTableType {
             MetadataTableType::Manifests => "manifests",
             MetadataTableType::History => "history",
             MetadataTableType::Refs => "refs",
+            MetadataTableType::Files => "files",
         }
     }
 
@@ -67,6 +70,7 @@ impl TryFrom<&str> for MetadataTableType {
             "manifests" => Ok(Self::Manifests),
             "history" => Ok(Self::History),
             "refs" => Ok(Self::Refs),
+            "files" => Ok(Self::Files),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -96,5 +100,10 @@ impl<'a> MetadataTable<'a> {
     /// Get the refs table.
     pub fn refs(&self) -> RefsTable<'_> {
         RefsTable::new(self.0)
+    }
+
+    /// Get the files table.
+    pub fn files(&self) -> FilesTable<'_> {
+        FilesTable::new(self.0)
     }
 }
