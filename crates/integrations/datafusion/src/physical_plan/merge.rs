@@ -3120,7 +3120,7 @@ mod tests {
     #[test]
     fn test_output_schema() {
         let schema = IcebergMergeExec::make_output_schema();
-        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.fields().len(), 7);
         assert_eq!(schema.field(0).name(), MERGE_DATA_FILES_COL);
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
         assert_eq!(schema.field(1).name(), MERGE_DELETE_FILES_COL);
@@ -3131,6 +3131,10 @@ mod tests {
         assert_eq!(schema.field(3).data_type(), &DataType::UInt64);
         assert_eq!(schema.field(4).name(), MERGE_DELETED_COUNT_COL);
         assert_eq!(schema.field(4).data_type(), &DataType::UInt64);
+        assert_eq!(schema.field(5).name(), MERGE_DPP_APPLIED_COL);
+        assert_eq!(schema.field(5).data_type(), &DataType::Boolean);
+        assert_eq!(schema.field(6).name(), MERGE_DPP_PARTITION_COUNT_COL);
+        assert_eq!(schema.field(6).data_type(), &DataType::UInt64);
     }
 
     // ============================================================================
@@ -3373,7 +3377,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.num_rows(), 1);
-        assert_eq!(result.num_columns(), 5);
+        assert_eq!(result.num_columns(), 7);
 
         let inserted = result
             .column(2)
@@ -3395,5 +3399,19 @@ mod tests {
             .downcast_ref::<datafusion::arrow::array::UInt64Array>()
             .unwrap();
         assert_eq!(deleted.value(0), 3);
+
+        let dpp_applied = result
+            .column(5)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(dpp_applied.value(0));
+
+        let dpp_partition_count = result
+            .column(6)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(dpp_partition_count.value(0), 3);
     }
 }
