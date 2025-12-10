@@ -591,10 +591,7 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
                 }
 
                 // Check if this file's partition matches any partition we're replacing
-                if self
-                    .partitions_to_replace
-                    .contains(entry.data_file().partition())
-                {
+                if self.partitions_to_replace.contains(entry.data_file().partition()) {
                     // Create a delete entry for this file, preserving sequence info
                     let delete_entry = ManifestEntry::builder()
                         .status(ManifestStatus::Deleted)
@@ -629,7 +626,10 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
         // Include existing manifests that:
         // 1. Are delete manifests (always include - position/equality deletes)
         // 2. Are data manifests with different partition spec (partition evolution)
-        // 3. Are data manifests that DON'T contain files in partitions being replaced
+        // 3. Are data manifests that have NO files in partitions being replaced
+        //
+        // IMPORTANT: If a manifest has ANY files in replaced partitions, do NOT include it.
+        // The files to keep will be written to a new manifest via existing_entries().
         let mut result = Vec::new();
 
         for manifest_file in manifest_list.entries() {
@@ -645,29 +645,87 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
                 continue;
             }
 
-            // For data manifests with current partition spec, check if any files
-            // are NOT in partitions being replaced
+            // For data manifests with current partition spec, check if ANY files
+            // are in partitions being replaced
             let manifest = manifest_file
                 .load_manifest(snapshot_producer.table.file_io())
                 .await?;
 
-            let has_files_to_keep = manifest.entries().iter().any(|entry| {
+            let has_files_to_replace = manifest.entries().iter().any(|entry| {
                 entry.status() != ManifestStatus::Deleted
-                    && !self
+                    && self
                         .partitions_to_replace
                         .contains(entry.data_file().partition())
             });
 
-            // If manifest has files to keep, we include it.
-            // The deleted entries will be written to a separate manifest.
-            if has_files_to_keep {
+            // Only include if manifest has NO files in replaced partitions
+            if !has_files_to_replace {
                 result.push(manifest_file.clone());
             }
-            // If all files in this manifest are in replaced partitions,
-            // we don't include this manifest (all its files will be deleted)
         }
 
         Ok(result)
+    }
+
+    async fn existing_entries(
+        &self,
+        snapshot_producer: &SnapshotProducer<'_>,
+    ) -> Result<Vec<ManifestEntry>> {
+        let Some(snapshot) = snapshot_producer.table.metadata().current_snapshot() else {
+            return Ok(vec![]);
+        };
+
+        let manifest_list = snapshot
+            .load_manifest_list(
+                snapshot_producer.table.file_io(),
+                &snapshot_producer.table.metadata_ref(),
+            )
+            .await?;
+
+        let mut entries_to_keep = Vec::new();
+
+        for manifest_file in manifest_list.entries() {
+            // Skip non-data manifests
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+
+            // Skip manifests with different partition spec
+            if manifest_file.partition_spec_id != self.partition_spec.spec_id() {
+                continue;
+            }
+
+            let manifest = manifest_file
+                .load_manifest(snapshot_producer.table.file_io())
+                .await?;
+
+            // Check if this manifest has any files in replaced partitions
+            let has_files_to_replace = manifest.entries().iter().any(|entry| {
+                entry.status() != ManifestStatus::Deleted
+                    && self
+                        .partitions_to_replace
+                        .contains(entry.data_file().partition())
+            });
+
+            // Only process manifests that have files being replaced (mixed manifests)
+            if !has_files_to_replace {
+                continue;
+            }
+
+            // Collect entries that should be kept (not in replaced partitions)
+            for entry in manifest.entries() {
+                if entry.status() != ManifestStatus::Deleted
+                    && !self
+                        .partitions_to_replace
+                        .contains(entry.data_file().partition())
+                {
+                    // Clone the inner ManifestEntry from the Arc
+                    entries_to_keep.push(entry.as_ref().clone());
+                }
+            }
+        }
+
+        Ok(entries_to_keep)
     }
 }
 

@@ -23,9 +23,10 @@ use std::vec;
 
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::common::config::Dialect;
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion::prelude::{col, lit};
+use datafusion::prelude::{col, lit, SessionConfig};
 use expect_test::expect;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
@@ -4042,6 +4043,207 @@ async fn test_merge_dpp_non_partition_join_key() -> Result<()> {
     // Verify the merge still works correctly
     assert_eq!(stats.rows_updated, 1, "Expected 1 row updated (id=1)");
     assert_eq!(stats.rows_inserted, 1, "Expected 1 row inserted (id=4)");
+
+    Ok(())
+}
+
+// ==================== INSERT OVERWRITE Tests ====================
+
+/// Test INSERT OVERWRITE on an unpartitioned table.
+/// This should replace all existing data with the new data.
+#[tokio::test]
+async fn test_insert_overwrite_unpartitioned() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_insert_overwrite_unpartitioned".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    // Use SQLite dialect to support INSERT OVERWRITE syntax
+    let mut config = SessionConfig::new();
+    config.options_mut().sql_parser.dialect = Dialect::SQLite;
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert initial data
+    ctx.sql("INSERT INTO catalog.test_insert_overwrite_unpartitioned.my_table VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify initial data
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_insert_overwrite_unpartitioned.my_table ORDER BY foo1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+    // INSERT OVERWRITE should replace all data
+    let df = ctx
+        .sql("INSERT OVERWRITE catalog.test_insert_overwrite_unpartitioned.my_table VALUES (3, 'charlie'), (4, 'diana'), (5, 'eve')")
+        .await
+        .unwrap();
+
+    let overwrite_result = df.collect().await.unwrap();
+    assert_eq!(overwrite_result.len(), 1);
+    let rows_written = overwrite_result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(rows_written.value(0), 3, "Should report 3 rows written");
+
+    // Query the table to verify the data was replaced
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_insert_overwrite_unpartitioned.my_table ORDER BY foo1")
+        .await
+        .unwrap();
+
+    let batches = df.collect().await.unwrap();
+
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              3,
+              4,
+              5,
+            ],
+            foo2: StringArray
+            [
+              "charlie",
+              "diana",
+              "eve",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    Ok(())
+}
+
+/// Test INSERT OVERWRITE on a partitioned table.
+/// This should only replace data in the partitions touched by the new data.
+#[tokio::test]
+async fn test_insert_overwrite_partitioned() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_insert_overwrite_partitioned".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create a partitioned table (partitioned by foo1)
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "foo1", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "foo2", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(1, "foo1", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("my_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    // Use SQLite dialect to support INSERT OVERWRITE syntax
+    let mut config = SessionConfig::new();
+    config.options_mut().sql_parser.dialect = Dialect::SQLite;
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert initial data across multiple partitions
+    // Partition foo1=1: alice
+    // Partition foo1=2: bob
+    // Partition foo1=3: charlie
+    ctx.sql("INSERT INTO catalog.test_insert_overwrite_partitioned.my_table VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify initial data
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_insert_overwrite_partitioned.my_table ORDER BY foo1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+    // INSERT OVERWRITE with data only in partition foo1=2
+    // This should replace partition 2 but leave partitions 1 and 3 intact
+    let df = ctx
+        .sql("INSERT OVERWRITE catalog.test_insert_overwrite_partitioned.my_table VALUES (2, 'betty')")
+        .await
+        .unwrap();
+
+    let overwrite_result = df.collect().await.unwrap();
+    let rows_written = overwrite_result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(rows_written.value(0), 1, "Should report 1 row written");
+
+    // Query the table - partitions 1 and 3 should still have original data,
+    // partition 2 should have new data
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_insert_overwrite_partitioned.my_table ORDER BY foo1")
+        .await
+        .unwrap();
+
+    let batches = df.collect().await.unwrap();
+
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              1,
+              2,
+              3,
+            ],
+            foo2: StringArray
+            [
+              "alice",
+              "betty",
+              "charlie",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
 
     Ok(())
 }

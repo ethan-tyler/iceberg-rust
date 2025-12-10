@@ -88,6 +88,21 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+
+    /// Returns manifest entries that should be carried forward as EXISTING status.
+    ///
+    /// This is used when a manifest contains a mix of files: some to keep and some to replace.
+    /// Instead of including the original manifest (which would cause both Added and Deleted
+    /// entries for the same file), we return only the entries we want to keep.
+    /// These will be written to a new manifest with status=EXISTING.
+    ///
+    /// Default implementation returns empty (most operations don't need this).
+    fn existing_entries(
+        &self,
+        _snapshot_produce: &SnapshotProducer<'_>,
+    ) -> impl Future<Output = Result<Vec<ManifestEntry>>> + Send {
+        async { Ok(vec![]) }
+    }
 }
 
 pub(crate) struct DefaultManifestProcess;
@@ -501,7 +516,31 @@ impl<'a> SnapshotProducer<'a> {
 
         let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
         for entry in deleted_entries {
-            writer.add_entry(entry)?;
+            // Use add_delete_entry to properly set status=Deleted
+            // (add_entry would override status to Added)
+            writer.add_delete_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
+    /// Write manifest file for existing data file entries (files being carried forward).
+    ///
+    /// This is used when a manifest contains a mix of files: some to keep and some to replace.
+    /// The entries to keep are written to a new manifest with status=EXISTING.
+    pub(crate) async fn write_existing_data_manifest(
+        &mut self,
+        existing_entries: Vec<ManifestEntry>,
+    ) -> Result<ManifestFile> {
+        if existing_entries.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No existing entries to write",
+            ));
+        }
+
+        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        for entry in existing_entries {
+            writer.add_existing_entry(entry)?;
         }
         writer.write_manifest_file().await
     }
@@ -515,6 +554,10 @@ impl<'a> SnapshotProducer<'a> {
         let deleted_entries = snapshot_produce_operation.delete_entries(self).await?;
         let has_deleted_entries = !deleted_entries.is_empty();
 
+        // Get existing entries (files being carried forward from partially affected manifests)
+        let existing_entries = snapshot_produce_operation.existing_entries(self).await?;
+        let has_existing_entries = !existing_entries.is_empty();
+
         // Assert current snapshot producer contains new content to add to new snapshot.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
@@ -524,15 +567,27 @@ impl<'a> SnapshotProducer<'a> {
         let has_delete_files = !self.added_delete_files.is_empty();
         let has_properties = !self.snapshot_properties.is_empty();
 
-        if !has_data_files && !has_delete_files && !has_properties && !has_deleted_entries {
+        if !has_data_files
+            && !has_delete_files
+            && !has_properties
+            && !has_deleted_entries
+            && !has_existing_entries
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files, delete files, deleted entries, or snapshot properties found when write a manifest file",
+                "No added data files, delete files, deleted entries, existing entries, or snapshot properties found when write a manifest file",
             ));
         }
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
+
+        // Process existing data file entries (files being carried forward from mixed manifests).
+        // This creates a manifest with entries marked as EXISTING.
+        if has_existing_entries {
+            let existing_manifest = self.write_existing_data_manifest(existing_entries).await?;
+            manifest_files.push(existing_manifest);
+        }
 
         // Process deleted data file entries (files being removed from the table).
         // This creates a manifest with entries marked as DELETED.

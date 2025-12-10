@@ -55,6 +55,7 @@ use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::delete_commit::IcebergDeleteCommitExec;
 use crate::physical_plan::delete_scan::IcebergDeleteScanExec;
 use crate::physical_plan::delete_write::IcebergDeleteWriteExec;
+use crate::physical_plan::overwrite_commit::IcebergOverwriteCommitExec;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
@@ -320,7 +321,7 @@ impl TableProvider for IcebergTableProvider {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
+        insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Load fresh table metadata from catalog
         let table = self
@@ -358,12 +359,39 @@ impl TableProvider for IcebergTableProvider {
         // Merge the outputs of write_plan into one so we can commit all files together
         let coalesce_partitions = Arc::new(CoalescePartitionsExec::new(write_plan));
 
-        Ok(Arc::new(IcebergCommitExec::new(
-            table,
-            self.catalog.clone(),
-            coalesce_partitions,
-            self.schema.clone(),
-        )))
+        // Choose commit executor based on insert operation type
+        let commit_exec: Arc<dyn ExecutionPlan> = match insert_op {
+            InsertOp::Append => {
+                // Standard INSERT: append new files without modifying existing data
+                Arc::new(IcebergCommitExec::new(
+                    table,
+                    self.catalog.clone(),
+                    coalesce_partitions,
+                    self.schema.clone(),
+                ))
+            }
+            InsertOp::Overwrite => {
+                // INSERT OVERWRITE: replace partitions touched by the new data
+                // Uses ReplacePartitionsAction for dynamic partition replacement
+                Arc::new(IcebergOverwriteCommitExec::new(
+                    table,
+                    self.catalog.clone(),
+                    coalesce_partitions,
+                    self.schema.clone(),
+                ))
+            }
+            InsertOp::Replace => {
+                // REPLACE INTO: Not yet supported
+                // Could use OverwriteAction with explicit filter in the future
+                return Err(DataFusionError::NotImplemented(
+                    "REPLACE INTO is not yet supported for Iceberg tables. \
+                    Use INSERT OVERWRITE for partition-level replacement."
+                        .to_string(),
+                ));
+            }
+        };
+
+        Ok(commit_exec)
     }
 
     /// Returns the DML capabilities supported by this table.

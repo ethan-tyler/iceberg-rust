@@ -23,6 +23,7 @@ pub(crate) mod expr_to_predicate;
 pub(crate) mod merge;
 pub(crate) mod merge_commit;
 pub(crate) mod metadata_scan;
+pub(crate) mod overwrite_commit;
 pub(crate) mod project;
 pub(crate) mod repartition;
 pub(crate) mod scan;
