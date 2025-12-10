@@ -441,6 +441,78 @@ async fn test_metadata_table() -> Result<()> {
         None,
     );
 
+    // Test $history metadata table
+    let history = ctx
+        .sql("select * from catalog.ns.t1$history")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    check_record_batches(
+        history,
+        expect![[r#"
+            Field { "made_current_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+            Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
+            Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
+            Field { "is_current_ancestor": Boolean, metadata: {"PARQUET:field_id": "4"} }"#]],
+        expect![[r#"
+            made_current_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+            [
+            ],
+            snapshot_id: PrimitiveArray<Int64>
+            [
+            ],
+            parent_id: PrimitiveArray<Int64>
+            [
+            ],
+            is_current_ancestor: BooleanArray
+            [
+            ]"#]],
+        &[],
+        None,
+    );
+
+    // Test $refs metadata table
+    let refs = ctx
+        .sql("select * from catalog.ns.t1$refs")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    check_record_batches(
+        refs,
+        expect![[r#"
+            Field { "name": Utf8, metadata: {"PARQUET:field_id": "1"} },
+            Field { "type": Utf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "3"} },
+            Field { "max_ref_age_ms": nullable Int64, metadata: {"PARQUET:field_id": "4"} },
+            Field { "min_snapshots_to_keep": nullable Int32, metadata: {"PARQUET:field_id": "5"} },
+            Field { "max_snapshot_age_ms": nullable Int64, metadata: {"PARQUET:field_id": "6"} }"#]],
+        expect![[r#"
+            name: StringArray
+            [
+            ],
+            type: StringArray
+            [
+            ],
+            snapshot_id: PrimitiveArray<Int64>
+            [
+            ],
+            max_ref_age_ms: PrimitiveArray<Int64>
+            [
+            ],
+            min_snapshots_to_keep: PrimitiveArray<Int32>
+            [
+            ],
+            max_snapshot_age_ms: PrimitiveArray<Int64>
+            [
+            ]"#]],
+        &[],
+        None,
+    );
+
     Ok(())
 }
 

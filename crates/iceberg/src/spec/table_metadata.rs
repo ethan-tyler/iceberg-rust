@@ -303,6 +303,12 @@ impl TableMetadata {
         &self.metadata_log
     }
 
+    /// Returns all snapshot references (branches and tags).
+    #[inline]
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
+    }
+
     /// Get current snapshot
     #[inline]
     pub fn current_snapshot(&self) -> Option<&SnapshotRef> {
