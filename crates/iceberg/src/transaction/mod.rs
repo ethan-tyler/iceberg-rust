@@ -53,9 +53,13 @@
 mod action;
 
 pub use action::*;
+pub use overwrite::OverwriteAction;
+pub use replace_partitions::ReplacePartitionsAction;
 pub use row_delta::RowDeltaAction;
 mod append;
 mod delete;
+mod overwrite;
+mod replace_partitions;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -179,6 +183,76 @@ impl Transaction {
     /// ```
     pub fn row_delta(&self) -> RowDeltaAction {
         RowDeltaAction::new()
+    }
+
+    /// Creates a replace partitions action for dynamic partition replacement.
+    ///
+    /// This action implements Hive-compatible INSERT OVERWRITE semantics:
+    /// partitions are determined from the added files' partition values,
+    /// and ALL existing files in those partitions are atomically replaced.
+    ///
+    /// # Use Cases
+    ///
+    /// - Dynamic ETL pipelines where partitions are determined at runtime
+    /// - Idempotent partition refresh operations
+    /// - INSERT OVERWRITE with dynamic partition mode
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.replace_partitions()
+    ///     .add_data_files(new_files);
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    ///
+    /// # Partition Evolution
+    ///
+    /// Only files with the same partition spec ID as the current default
+    /// partition spec are replaced. Files written with older partition specs
+    /// are preserved.
+    pub fn replace_partitions(&self) -> ReplacePartitionsAction {
+        ReplacePartitionsAction::new()
+    }
+
+    /// Creates an overwrite action for filter-based data replacement.
+    ///
+    /// This action implements INSERT OVERWRITE semantics with an explicit filter:
+    /// files matching the filter are deleted and replaced with new files.
+    /// Unlike `replace_partitions()` where partitions are dynamically determined
+    /// from added files, this action takes an explicit row filter.
+    ///
+    /// # Use Cases
+    ///
+    /// - INSERT OVERWRITE with explicit WHERE clause
+    /// - Targeted data correction/replacement
+    /// - Conditional bulk delete operations
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::expr::Reference;
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    /// // Delete all data where date = '2024-01-01' and add new files
+    /// let filter = Reference::new("date").equal_to(Datum::string("2024-01-01"));
+    /// let action = tx.overwrite()
+    ///     .overwrite_filter(filter)
+    ///     .add_data_files(new_files);
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    ///
+    /// # Filter Semantics
+    ///
+    /// The filter is projected to partition predicates using `InclusiveProjection`,
+    /// meaning files are deleted if their partition **could contain** matching rows.
+    pub fn overwrite(&self) -> OverwriteAction {
+        OverwriteAction::new()
     }
 
     /// Creates replace sort order action.

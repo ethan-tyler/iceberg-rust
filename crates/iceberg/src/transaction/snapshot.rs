@@ -43,7 +43,7 @@ const META_ROOT_PATH: &str = "metadata";
 /// - Which existing manifest files should be included in the new snapshot
 /// - Which manifest entries should be marked as deleted
 ///
-/// # When it accomplishes
+/// # Usage in Snapshot Creation
 ///
 /// This trait is used during the snapshot creation process in [`SnapshotProducer::commit()`]:
 ///
@@ -57,8 +57,9 @@ const META_ROOT_PATH: &str = "metadata";
 ///    - An `Append` operation typically includes all existing manifests plus new ones
 ///    - An `Overwrite` operation might exclude manifests for partitions being overwritten
 ///
-/// 3. **Delete Entry Processing**: The `delete_entries()` method is intended for future delete
-///    operations to specify which manifest entries should be marked as deleted.
+/// 3. **Delete Entry Processing**: The `delete_entries()` method specifies which manifest
+///    entries should be marked as deleted. This is used by operations like `ReplacePartitions`
+///    and `Overwrite` to atomically remove existing data files while adding new ones.
 pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// Returns the operation type that will be recorded in the snapshot summary.
     ///
@@ -67,7 +68,9 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     fn operation(&self) -> Operation;
 
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
-    #[allow(unused)]
+    ///
+    /// These entries represent data files being removed from the table. They will be
+    /// written to a new manifest with status=DELETED to track the removal.
     fn delete_entries(
         &self,
         snapshot_produce: &SnapshotProducer,
@@ -481,11 +484,37 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    /// Write manifest file for deleted data file entries (files being removed from the table).
+    ///
+    /// This is used by operations like `ReplacePartitions` and `Overwrite` that need to
+    /// mark existing data files as deleted in a new manifest.
+    pub(crate) async fn write_deleted_data_manifest(
+        &mut self,
+        deleted_entries: Vec<ManifestEntry>,
+    ) -> Result<ManifestFile> {
+        if deleted_entries.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No deleted entries to write",
+            ));
+        }
+
+        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        for entry in deleted_entries {
+            writer.add_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
+        // Get entries to delete (files being removed from the table)
+        let deleted_entries = snapshot_produce_operation.delete_entries(self).await?;
+        let has_deleted_entries = !deleted_entries.is_empty();
+
         // Assert current snapshot producer contains new content to add to new snapshot.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
@@ -495,15 +524,22 @@ impl<'a> SnapshotProducer<'a> {
         let has_delete_files = !self.added_delete_files.is_empty();
         let has_properties = !self.snapshot_properties.is_empty();
 
-        if !has_data_files && !has_delete_files && !has_properties {
+        if !has_data_files && !has_delete_files && !has_properties && !has_deleted_entries {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files, delete files, or snapshot properties found when write a manifest file",
+                "No added data files, delete files, deleted entries, or snapshot properties found when write a manifest file",
             ));
         }
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
+
+        // Process deleted data file entries (files being removed from the table).
+        // This creates a manifest with entries marked as DELETED.
+        if has_deleted_entries {
+            let deleted_manifest = self.write_deleted_data_manifest(deleted_entries).await?;
+            manifest_files.push(deleted_manifest);
+        }
 
         // Process added data file entries.
         if has_data_files {
@@ -511,7 +547,7 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // Process added delete file entries.
+        // Process added delete file entries (position/equality deletes).
         if has_delete_files {
             let delete_manifest = self.write_delete_manifest().await?;
             manifest_files.push(delete_manifest);
