@@ -177,6 +177,7 @@ async fn test_provider_list_table_names() -> Result<()> {
             "my_table$history",
             "my_table$refs",
             "my_table$files",
+            "my_table$properties",
         ]
     "#]]
     .assert_debug_eq(&result);

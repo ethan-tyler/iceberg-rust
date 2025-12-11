@@ -243,6 +243,52 @@ pub(crate) async fn build_file_partition_map(
     Ok(file_partitions)
 }
 
+/// Checks if a table has partition evolution (multiple partition specs).
+///
+/// DML operations (UPDATE, DELETE, MERGE) do not yet fully support tables
+/// with partition evolution. This function detects such tables so that
+/// operations can return an appropriate error rather than producing
+/// incorrect results.
+///
+/// # Arguments
+///
+/// * `table` - The Iceberg table to check
+///
+/// # Returns
+///
+/// `true` if the table has more than one partition spec (partition evolution),
+/// `false` otherwise.
+pub(crate) fn has_partition_evolution(table: &Table) -> bool {
+    table.metadata().partition_specs_iter().len() > 1
+}
+
+/// Returns an error if the table has partition evolution.
+///
+/// This guard function should be called at the start of DML operations
+/// (UPDATE, DELETE, MERGE) to reject tables with partition evolution
+/// until full support is implemented.
+///
+/// # Arguments
+///
+/// * `table` - The Iceberg table to check
+/// * `operation` - Name of the operation (for error message)
+///
+/// # Returns
+///
+/// `Ok(())` if the table has a single partition spec,
+/// `Err(NotImplemented)` if the table has partition evolution.
+pub(crate) fn reject_partition_evolution(table: &Table, operation: &str) -> DFResult<()> {
+    if has_partition_evolution(table) {
+        return Err(DataFusionError::NotImplemented(format!(
+            "{} on tables with partition evolution is not yet supported. \
+             This table has {} partition specs.",
+            operation,
+            table.metadata().partition_specs_iter().len()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

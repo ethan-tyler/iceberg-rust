@@ -402,18 +402,13 @@ impl MergeBuilder {
         // Helper to find duplicates in a list of column names
         fn find_duplicate(columns: &[(String, Expr)]) -> Option<&str> {
             let mut seen = std::collections::HashSet::new();
-            for (col, _) in columns {
-                if !seen.insert(col.as_str()) {
-                    return Some(col);
-                }
-            }
-            None
+            columns.iter().map(|(col, _)| col).find(|&col| !seen.insert(col.as_str())).map(|v| v as _)
         }
 
         // Check WHEN MATCHED UPDATE clauses
         for (idx, clause) in when_matched.iter().enumerate() {
-            if let MatchedAction::Update(assignments) = &clause.action {
-                if let Some(dup) = find_duplicate(assignments) {
+            if let MatchedAction::Update(assignments) = &clause.action
+                && let Some(dup) = find_duplicate(assignments) {
                     return Err(DataFusionError::Plan(format!(
                         "Duplicate column '{}' in WHEN MATCHED clause #{}. \
                          Each column can only be assigned once per clause.",
@@ -421,13 +416,12 @@ impl MergeBuilder {
                         idx + 1
                     )));
                 }
-            }
         }
 
         // Check WHEN NOT MATCHED INSERT clauses
         for (idx, clause) in when_not_matched.iter().enumerate() {
-            if let NotMatchedAction::Insert(values) = &clause.action {
-                if let Some(dup) = find_duplicate(values) {
+            if let NotMatchedAction::Insert(values) = &clause.action
+                && let Some(dup) = find_duplicate(values) {
                     return Err(DataFusionError::Plan(format!(
                         "Duplicate column '{}' in WHEN NOT MATCHED clause #{}. \
                          Each column can only be specified once per INSERT.",
@@ -435,13 +429,12 @@ impl MergeBuilder {
                         idx + 1
                     )));
                 }
-            }
         }
 
         // Check WHEN NOT MATCHED BY SOURCE UPDATE clauses
         for (idx, clause) in when_not_matched_by_source.iter().enumerate() {
-            if let NotMatchedBySourceAction::Update(assignments) = &clause.action {
-                if let Some(dup) = find_duplicate(assignments) {
+            if let NotMatchedBySourceAction::Update(assignments) = &clause.action
+                && let Some(dup) = find_duplicate(assignments) {
                     return Err(DataFusionError::Plan(format!(
                         "Duplicate column '{}' in WHEN NOT MATCHED BY SOURCE clause #{}. \
                          Each column can only be assigned once per clause.",
@@ -449,7 +442,6 @@ impl MergeBuilder {
                         idx + 1
                     )));
                 }
-            }
         }
 
         Ok(())
@@ -512,15 +504,13 @@ impl MergeBuilder {
             match &clause.action {
                 MatchedAction::Update(assignments) => {
                     for (column_name, _) in assignments {
-                        if let Some(field) = iceberg_schema.field_by_name(column_name) {
-                            if partition_source_ids.contains(&field.id) {
+                        if let Some(field) = iceberg_schema.field_by_name(column_name)
+                            && partition_source_ids.contains(&field.id) {
                                 return Err(DataFusionError::Plan(format!(
-                                    "Cannot UPDATE partition column '{}' in MERGE. \
-                                     Updating partition columns would require moving rows between partitions.",
-                                    column_name
+                                    "Cannot UPDATE partition column '{column_name}' in MERGE. \
+                                     Updating partition columns would require moving rows between partitions."
                                 )));
                             }
-                        }
                     }
                 }
                 MatchedAction::UpdateAll => {
@@ -530,10 +520,9 @@ impl MergeBuilder {
                         let col_name = source_col.strip_prefix("source.").unwrap_or(source_col);
                         if partition_column_names.contains(col_name) {
                             return Err(DataFusionError::Plan(format!(
-                                "Cannot use UPDATE * (update_all) when source contains partition column '{}'. \
+                                "Cannot use UPDATE * (update_all) when source contains partition column '{col_name}'. \
                                  Updating partition columns would require moving rows between partitions. \
-                                 Use explicit .update([...]) instead, excluding partition columns.",
-                                col_name
+                                 Use explicit .update([...]) instead, excluding partition columns."
                             )));
                         }
                     }
@@ -546,15 +535,13 @@ impl MergeBuilder {
         for clause in &self.when_not_matched_by_source {
             if let NotMatchedBySourceAction::Update(assignments) = &clause.action {
                 for (column_name, _) in assignments {
-                    if let Some(field) = iceberg_schema.field_by_name(column_name) {
-                        if partition_source_ids.contains(&field.id) {
+                    if let Some(field) = iceberg_schema.field_by_name(column_name)
+                        && partition_source_ids.contains(&field.id) {
                             return Err(DataFusionError::Plan(format!(
-                                "Cannot UPDATE partition column '{}' in MERGE. \
-                                 Updating partition columns would require moving rows between partitions.",
-                                column_name
+                                "Cannot UPDATE partition column '{column_name}' in MERGE. \
+                                 Updating partition columns would require moving rows between partitions."
                             )));
                         }
-                    }
                 }
             }
         }
@@ -649,8 +636,7 @@ impl MergeBuilder {
             .column_by_name(MERGE_RESULT_INSERTED_COL)
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "Expected '{}' column in commit result",
-                    MERGE_RESULT_INSERTED_COL
+                    "Expected '{MERGE_RESULT_INSERTED_COL}' column in commit result"
                 ))
             })?
             .as_any()
@@ -664,8 +650,7 @@ impl MergeBuilder {
             .column_by_name(MERGE_RESULT_UPDATED_COL)
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "Expected '{}' column in commit result",
-                    MERGE_RESULT_UPDATED_COL
+                    "Expected '{MERGE_RESULT_UPDATED_COL}' column in commit result"
                 ))
             })?
             .as_any()
@@ -679,8 +664,7 @@ impl MergeBuilder {
             .column_by_name(MERGE_RESULT_DELETED_COL)
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "Expected '{}' column in commit result",
-                    MERGE_RESULT_DELETED_COL
+                    "Expected '{MERGE_RESULT_DELETED_COL}' column in commit result"
                 ))
             })?
             .as_any()

@@ -201,7 +201,7 @@ pub fn parse_predicate(where_clause: &str) -> DFResult<Expr> {
     use datafusion::sql::sqlparser::dialect::GenericDialect;
 
     // Parse the WHERE clause as part of a SELECT statement
-    let sql = format!("SELECT * FROM dummy WHERE {}", where_clause);
+    let sql = format!("SELECT * FROM dummy WHERE {where_clause}");
     let dialect = GenericDialect {};
 
     let statements = DFParser::parse_sql_with_dialect(&sql, &dialect)?;
@@ -212,26 +212,19 @@ pub fn parse_predicate(where_clause: &str) -> DFResult<Expr> {
     }
 
     // Extract the WHERE expression from the parsed statement
-    match &statements[0] {
-        datafusion::sql::parser::Statement::Statement(stmt) => {
-            if let datafusion::sql::sqlparser::ast::Statement::Query(query) = stmt.as_ref() {
-                if let datafusion::sql::sqlparser::ast::SetExpr::Select(select) =
-                    query.body.as_ref()
-                {
-                    if let Some(_selection) = &select.selection {
-                        // Convert SQL AST to DataFusion Expr
-                        // Note: This is a simplified conversion; a full implementation
-                        // would need schema context
-                        return Err(datafusion::error::DataFusionError::NotImplemented(
-                            "parse_predicate is not yet fully implemented. \
-                             Please construct predicates using col() and lit() functions."
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-        _ => {}
+    if let datafusion::sql::parser::Statement::Statement(stmt) = &statements[0]
+        && let datafusion::sql::sqlparser::ast::Statement::Query(query) = stmt.as_ref()
+        && let datafusion::sql::sqlparser::ast::SetExpr::Select(select) = query.body.as_ref()
+        && select.selection.is_some()
+    {
+        // Convert SQL AST to DataFusion Expr
+        // Note: This is a simplified conversion; a full implementation
+        // would need schema context
+        return Err(datafusion::error::DataFusionError::NotImplemented(
+            "parse_predicate is not yet fully implemented. \
+             Please construct predicates using col() and lit() functions."
+                .to_string(),
+        ));
     }
 
     Err(datafusion::error::DataFusionError::Plan(

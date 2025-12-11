@@ -72,7 +72,7 @@ use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, collect,
 };
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{StreamExt, TryStreamExt};
@@ -105,6 +105,7 @@ use crate::merge::{
 };
 use crate::partition_utils::{
     FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
+    reject_partition_evolution,
 };
 use crate::to_datafusion_error;
 
@@ -605,9 +606,8 @@ impl MergeWriters {
 
         let file_info = self.file_partition_map.get(file_path).ok_or_else(|| {
             DataFusionError::Internal(format!(
-                "No partition info found for file '{}'. This may indicate a consistency issue \
-                 between the scan and write phases.",
-                file_path
+                "No partition info found for file '{file_path}'. This may indicate a consistency issue \
+                 between the scan and write phases."
             ))
         })?;
 
@@ -781,57 +781,56 @@ impl IcebergMergeExec {
             let condition = clause
                 .condition
                 .as_ref()
-                .map(|c| format!(" AND {}", c))
+                .map(|c| format!(" AND {c}"))
                 .unwrap_or_default();
             let action = match &clause.action {
                 MatchedAction::Update(assignments) => {
                     let assigns: Vec<_> = assignments
                         .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
+                        .map(|(k, v)| format!("{k}={v}"))
                         .collect();
                     format!("UPDATE SET {}", assigns.join(", "))
                 }
                 MatchedAction::UpdateAll => "UPDATE *".to_string(),
                 MatchedAction::Delete => "DELETE".to_string(),
             };
-            parts.push(format!("WHEN MATCHED{} THEN {}", condition, action));
+            parts.push(format!("WHEN MATCHED{condition} THEN {action}"));
         }
 
         for clause in &self.when_not_matched {
             let condition = clause
                 .condition
                 .as_ref()
-                .map(|c| format!(" AND {}", c))
+                .map(|c| format!(" AND {c}"))
                 .unwrap_or_default();
             let action = match &clause.action {
                 NotMatchedAction::Insert(values) => {
-                    let vals: Vec<_> = values.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    let vals: Vec<_> = values.iter().map(|(k, v)| format!("{k}={v}")).collect();
                     format!("INSERT ({})", vals.join(", "))
                 }
                 NotMatchedAction::InsertAll => "INSERT *".to_string(),
             };
-            parts.push(format!("WHEN NOT MATCHED{} THEN {}", condition, action));
+            parts.push(format!("WHEN NOT MATCHED{condition} THEN {action}"));
         }
 
         for clause in &self.when_not_matched_by_source {
             let condition = clause
                 .condition
                 .as_ref()
-                .map(|c| format!(" AND {}", c))
+                .map(|c| format!(" AND {c}"))
                 .unwrap_or_default();
             let action = match &clause.action {
                 NotMatchedBySourceAction::Update(assignments) => {
                     let assigns: Vec<_> = assignments
                         .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
+                        .map(|(k, v)| format!("{k}={v}"))
                         .collect();
                     format!("UPDATE SET {}", assigns.join(", "))
                 }
                 NotMatchedBySourceAction::Delete => "DELETE".to_string(),
             };
             parts.push(format!(
-                "WHEN NOT MATCHED BY SOURCE{} THEN {}",
-                condition, action
+                "WHEN NOT MATCHED BY SOURCE{condition} THEN {action}"
             ));
         }
 
@@ -905,7 +904,7 @@ impl ExecutionPlan for IcebergMergeExec {
 
     fn execute(
         &self,
-        partition: usize,
+        _partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         // Clone data needed for the async block
@@ -924,7 +923,6 @@ impl ExecutionPlan for IcebergMergeExec {
                 table,
                 schema,
                 source,
-                partition,
                 context,
                 match_condition,
                 when_matched,
@@ -976,7 +974,6 @@ async fn execute_merge(
     table: Table,
     schema: ArrowSchemaRef,
     source: Arc<dyn ExecutionPlan>,
-    partition: usize,
     context: Arc<TaskContext>,
     match_condition: Expr,
     when_matched: Vec<WhenMatchedClause>,
@@ -984,12 +981,17 @@ async fn execute_merge(
     when_not_matched_by_source: Vec<WhenNotMatchedBySourceClause>,
     merge_config: MergeConfig,
 ) -> DFResult<RecordBatch> {
+    // Guard: Reject tables with partition evolution until full support is implemented
+    reject_partition_evolution(&table, "MERGE")?;
+
     // === Step 1: Extract join keys from match condition (supports compound keys) ===
     // We need join keys early for DPP computation
     let join_keys = extract_join_keys(&match_condition)?;
 
     // === Step 2: Materialize source data FIRST (required for DPP) ===
-    let source_batches = materialize_source(source, partition, context).await?;
+    // Note: collect() reads ALL partitions from the source, which is critical
+    // for multi-partition sources (repartitioned inputs, multi-file scans).
+    let source_batches = materialize_source(source, context).await?;
 
     // Memory warning for large MERGE operations (debug builds only)
     // Note: Streaming execution (Phase 3) will address memory bounds for very large merges
@@ -1073,15 +1075,15 @@ async fn execute_merge(
         .iter()
         .map(|(t, s)| {
             (
-                format!("{}{}", TARGET_PREFIX, t),
-                format!("{}{}", SOURCE_PREFIX, s),
+                format!("{TARGET_PREFIX}{t}"),
+                format!("{SOURCE_PREFIX}{s}"),
             )
         })
         .collect();
 
     // Metadata column names after prefix
-    let file_path_col_name = format!("{}{}", TARGET_PREFIX, MERGE_FILE_PATH_COL);
-    let row_pos_col_name = format!("{}{}", TARGET_PREFIX, MERGE_ROW_POS_COL);
+    let file_path_col_name = format!("{TARGET_PREFIX}{MERGE_FILE_PATH_COL}");
+    let row_pos_col_name = format!("{TARGET_PREFIX}{MERGE_ROW_POS_COL}");
 
     for batch in &joined_batches {
         // Process MATCHED rows (all keys non-null on both sides)
@@ -1133,8 +1135,7 @@ async fn execute_merge(
     // Serialize to JSON with partition spec wrapper for partition evolution support
     let partition_type = partition_types.get(&current_spec_id).ok_or_else(|| {
         DataFusionError::Internal(format!(
-            "Missing partition type for current partition spec {}",
-            current_spec_id
+            "Missing partition type for current partition spec {current_spec_id}"
         ))
     })?;
 
@@ -1370,8 +1371,7 @@ fn extract_distinct_values(
     let schema = batches[0].schema();
     let col_idx = schema.index_of(column_name).map_err(|_| {
         DataFusionError::Internal(format!(
-            "DPP: Source column '{}' not found in schema",
-            column_name
+            "DPP: Source column '{column_name}' not found in schema"
         ))
     })?;
 
@@ -1457,9 +1457,8 @@ fn extract_distinct_values(
                         // For unsupported types, skip DPP rather than fail
                         #[cfg(debug_assertions)]
                         eprintln!(
-                            "MERGE DPP: Skipping - unsupported data type {:?} for column '{}' \
-                         (supported: Int32, Int64, Utf8, LargeUtf8, Date32)",
-                            other, column_name
+                            "MERGE DPP: Skipping - unsupported data type {other:?} for column '{column_name}' \
+                         (supported: Int32, Int64, Utf8, LargeUtf8, Date32)"
                         );
                         return Ok(vec![]);
                     }
@@ -1541,14 +1540,16 @@ async fn scan_target_with_metadata(
 }
 
 /// Materializes source data from the execution plan.
+///
+/// This function collects data from ALL partitions of the source plan.
+/// This is critical because the source may have multiple partitions
+/// (e.g., from repartitioning or multi-file scans), and we must read
+/// all of them to avoid silently dropping source rows.
 async fn materialize_source(
     source: Arc<dyn ExecutionPlan>,
-    partition: usize,
     context: Arc<TaskContext>,
 ) -> DFResult<Vec<RecordBatch>> {
-    let stream = source.execute(partition, context)?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-    Ok(batches)
+    collect(source, context).await
 }
 /// Processes MATCHED rows from joined batch and writes files.
 ///
@@ -1761,9 +1762,9 @@ async fn write_position_deletes_partitioned(
         let delete_batch = make_position_delete_batch(&file_paths, &positions, delete_schema)?;
         writers.write_deletes(delete_batch, None).await?;
     } else {
-        // Partitioned: group deletes by partition key (from file's original partition)
-        // Use file partition map for partition-evolution-aware grouping
-        let mut partition_groups: HashMap<String, (Vec<String>, Vec<i64>, PartitionKey)> =
+        // Partitioned: group deletes by (spec_id, partition data) to handle partition evolution
+        // Files from different specs but identical partition values must remain separate
+        let mut partition_groups: HashMap<(i32, String), (Vec<String>, Vec<i64>, PartitionKey)> =
             HashMap::new();
 
         for &idx in indices {
@@ -1777,18 +1778,20 @@ async fn write_position_deletes_partitioned(
                     DataFusionError::Internal("Expected partition key for partitioned table".into())
                 })?;
 
-            // Use partition key's string representation as group key
-            let key_str = format!("{:?}", partition_key.data());
+            // Include spec_id in key to prevent mixing partitions from different specs
+            let spec_id = partition_key.spec().spec_id();
+            let data_str = format!("{:?}", partition_key.data());
+            let group_key = (spec_id, data_str);
 
             let entry = partition_groups
-                .entry(key_str)
+                .entry(group_key)
                 .or_insert_with(|| (Vec::new(), Vec::new(), partition_key.clone()));
             entry.0.push(file_path);
             entry.1.push(pos);
         }
 
         // Write each partition's deletes
-        for (_key_str, (file_paths, positions, partition_key)) in partition_groups {
+        for ((_spec_id, _data_str), (file_paths, positions, partition_key)) in partition_groups {
             let delete_batch =
                 make_position_delete_batch(&file_paths, &positions, delete_schema.clone())?;
             writers
@@ -2139,7 +2142,7 @@ fn apply_not_matched_by_source_update(
             columns.push(evaluated_col.clone());
         } else {
             // Use original target column value
-            let target_col_name = format!("{}{}", TARGET_PREFIX, column_name);
+            let target_col_name = format!("{TARGET_PREFIX}{column_name}");
             let idx = joined_batch
                 .schema()
                 .index_of(&target_col_name)
@@ -2261,13 +2264,12 @@ fn apply_insert_values(
             columns.push(evaluated_col.clone());
         } else {
             // Try source column as fallback
-            let source_col_name = format!("{}{}", SOURCE_PREFIX, column_name);
+            let source_col_name = format!("{SOURCE_PREFIX}{column_name}");
             if let Ok(idx) = joined_batch.schema().index_of(&source_col_name) {
                 columns.push(take(joined_batch.column(idx), &indices, None)?);
             } else {
                 return Err(DataFusionError::Plan(format!(
-                    "No value provided for column '{}' in INSERT",
-                    column_name
+                    "No value provided for column '{column_name}' in INSERT"
                 )));
             }
         }
@@ -2393,12 +2395,12 @@ fn apply_update_assignments(
             columns.push(evaluated_col.clone());
         } else {
             // Use original target column value
-            let target_col_name = format!("{}{}", TARGET_PREFIX, column_name);
+            let target_col_name = format!("{TARGET_PREFIX}{column_name}");
             if let Ok(idx) = joined_batch.schema().index_of(&target_col_name) {
                 columns.push(take(joined_batch.column(idx), &indices, None)?);
             } else {
                 // Try source column as fallback
-                let source_col_name = format!("{}{}", SOURCE_PREFIX, column_name);
+                let source_col_name = format!("{SOURCE_PREFIX}{column_name}");
                 let idx = joined_batch
                     .schema()
                     .index_of(&source_col_name)
@@ -2487,8 +2489,7 @@ fn extract_join_keys_recursive(expr: &Expr, keys: &mut Vec<(String, String)>) ->
         }
         _ => {
             return Err(DataFusionError::Plan(format!(
-                "MERGE ON condition must be equality predicates (=) optionally combined with AND. Got: {:?}",
-                expr
+                "MERGE ON condition must be equality predicates (=) optionally combined with AND. Got: {expr:?}"
             )));
         }
     }
@@ -2501,8 +2502,7 @@ fn extract_column_name(expr: &Expr) -> DFResult<String> {
         Expr::Column(col) => Ok(col.name.clone()),
         Expr::Alias(alias) => extract_column_name(&alias.expr),
         _ => Err(DataFusionError::Plan(format!(
-            "Expected column reference in ON condition. Got: {:?}",
-            expr
+            "Expected column reference in ON condition. Got: {expr:?}"
         ))),
     }
 }
@@ -2597,11 +2597,11 @@ async fn perform_full_outer_join(
     // Prefixed key column names for compound keys
     let prefixed_target_keys: Vec<String> = join_keys
         .iter()
-        .map(|(t, _)| format!("{}{}", TARGET_PREFIX, t))
+        .map(|(t, _)| format!("{TARGET_PREFIX}{t}"))
         .collect();
     let prefixed_source_keys: Vec<String> = join_keys
         .iter()
-        .map(|(_, s)| format!("{}{}", SOURCE_PREFIX, s))
+        .map(|(_, s)| format!("{SOURCE_PREFIX}{s}"))
         .collect();
 
     // Convert to slices for join API
@@ -2647,8 +2647,8 @@ fn classify_and_count_actions(
         .iter()
         .map(|(t, s)| {
             (
-                format!("{}{}", TARGET_PREFIX, t),
-                format!("{}{}", SOURCE_PREFIX, s),
+                format!("{TARGET_PREFIX}{t}"),
+                format!("{SOURCE_PREFIX}{s}"),
             )
         })
         .collect();

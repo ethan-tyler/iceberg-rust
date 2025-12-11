@@ -61,6 +61,7 @@ use uuid::Uuid;
 use super::delete_scan::{DELETE_FILE_PATH_COL, DELETE_POS_COL};
 use crate::partition_utils::{
     FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
+    reject_partition_evolution,
 };
 use crate::to_datafusion_error;
 
@@ -186,9 +187,8 @@ impl PartitionedDeleteCollector {
             .map(|info| PartitionGroupKey::new(info.spec_id, info.partition.clone()))
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "No partition info found for file '{}'. This may indicate a consistency issue \
-                     between the scan and write phases.",
-                    file_path
+                    "No partition info found for file '{file_path}'. This may indicate a consistency issue \
+                     between the scan and write phases."
                 ))
             })
     }
@@ -212,8 +212,7 @@ impl PartitionedDeleteCollector {
                     .find(|info| info.spec_id == key.spec_id && info.partition == key.partition)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Cannot find partition spec for partition key {:?}",
-                            key
+                            "Cannot find partition spec for partition key {key:?}"
                         ))
                     })?;
 
@@ -250,8 +249,7 @@ impl PartitionedDeleteCollector {
             .column_by_name(DELETE_FILE_PATH_COL)
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "Expected '{}' column in delete scan output",
-                    DELETE_FILE_PATH_COL
+                    "Expected '{DELETE_FILE_PATH_COL}' column in delete scan output"
                 ))
             })?
             .as_any()
@@ -264,8 +262,7 @@ impl PartitionedDeleteCollector {
             .column_by_name(DELETE_POS_COL)
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "Expected '{}' column in delete scan output",
-                    DELETE_POS_COL
+                    "Expected '{DELETE_POS_COL}' column in delete scan output"
                 ))
             })?
             .as_any()
@@ -460,6 +457,9 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        // Guard: Reject tables with partition evolution before expensive operations
+        reject_partition_evolution(&self.table, "DELETE")?;
+
         let table = self.table.clone();
         let partition_types = build_partition_type_map(&table)?;
         let format_version = table.metadata().format_version();
@@ -480,8 +480,6 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             let default_spec_id = default_partition_spec.spec_id();
 
             // Build file-to-partition mapping for partitioned tables
-            // Each file's partition spec is obtained from FileScanTask.partition_spec,
-            // which enables correct handling of tables with partition evolution.
             let file_partitions = if is_unpartitioned {
                 HashMap::new()
             } else {
@@ -577,8 +575,7 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                 .map(|(spec_id, df)| {
                     let partition_type = partition_types.get(&spec_id).ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Missing partition type for partition spec {}",
-                            spec_id
+                            "Missing partition type for partition spec {spec_id}"
                         ))
                     })?;
 
@@ -592,8 +589,7 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                     })
                     .map_err(|e| {
                         DataFusionError::Execution(format!(
-                            "Failed to serialize delete file metadata for spec {}: {e}",
-                            spec_id
+                            "Failed to serialize delete file metadata for spec {spec_id}: {e}"
                         ))
                     })
                 })

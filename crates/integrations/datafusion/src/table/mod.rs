@@ -491,8 +491,7 @@ impl TableProvider for IcebergTableProvider {
         for (column_name, _) in &assignments {
             if current_schema.field_with_name(column_name).is_err() {
                 return Err(DataFusionError::Plan(format!(
-                    "Column '{}' not found in table schema",
-                    column_name
+                    "Column '{column_name}' not found in table schema"
                 )));
             }
         }

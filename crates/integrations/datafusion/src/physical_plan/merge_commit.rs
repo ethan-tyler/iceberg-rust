@@ -286,16 +286,14 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     .column_by_name(MERGE_DATA_FILES_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            MERGE_DATA_FILES_COL
+                            "Expected '{MERGE_DATA_FILES_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be StringArray",
-                            MERGE_DATA_FILES_COL
+                            "Expected '{MERGE_DATA_FILES_COL}' column to be StringArray"
                         ))
                     })?;
 
@@ -304,16 +302,14 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     .column_by_name(MERGE_DELETE_FILES_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            MERGE_DELETE_FILES_COL
+                            "Expected '{MERGE_DELETE_FILES_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be StringArray",
-                            MERGE_DELETE_FILES_COL
+                            "Expected '{MERGE_DELETE_FILES_COL}' column to be StringArray"
                         ))
                     })?;
 
@@ -322,16 +318,14 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     .column_by_name(MERGE_INSERTED_COUNT_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            MERGE_INSERTED_COUNT_COL
+                            "Expected '{MERGE_INSERTED_COUNT_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be UInt64Array",
-                            MERGE_INSERTED_COUNT_COL
+                            "Expected '{MERGE_INSERTED_COUNT_COL}' column to be UInt64Array"
                         ))
                     })?;
 
@@ -339,16 +333,14 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     .column_by_name(MERGE_UPDATED_COUNT_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            MERGE_UPDATED_COUNT_COL
+                            "Expected '{MERGE_UPDATED_COUNT_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be UInt64Array",
-                            MERGE_UPDATED_COUNT_COL
+                            "Expected '{MERGE_UPDATED_COUNT_COL}' column to be UInt64Array"
                         ))
                     })?;
 
@@ -356,16 +348,14 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     .column_by_name(MERGE_DELETED_COUNT_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            MERGE_DELETED_COUNT_COL
+                            "Expected '{MERGE_DELETED_COUNT_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be UInt64Array",
-                            MERGE_DELETED_COUNT_COL
+                            "Expected '{MERGE_DELETED_COUNT_COL}' column to be UInt64Array"
                         ))
                     })?;
 
@@ -374,16 +364,14 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     .column_by_name(MERGE_DPP_APPLIED_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            MERGE_DPP_APPLIED_COL
+                            "Expected '{MERGE_DPP_APPLIED_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be BooleanArray",
-                            MERGE_DPP_APPLIED_COL
+                            "Expected '{MERGE_DPP_APPLIED_COL}' column to be BooleanArray"
                         ))
                     })?;
 
@@ -391,21 +379,19 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     .column_by_name(MERGE_DPP_PARTITION_COUNT_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            MERGE_DPP_PARTITION_COUNT_COL
+                            "Expected '{MERGE_DPP_PARTITION_COUNT_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be UInt64Array",
-                            MERGE_DPP_PARTITION_COUNT_COL
+                            "Expected '{MERGE_DPP_PARTITION_COUNT_COL}' column to be UInt64Array"
                         ))
                     })?;
 
                 // Capture DPP values (just use first row since DPP is per-merge)
-                if dpp_applied_array.len() > 0 {
+                if !dpp_applied_array.is_empty() {
                     dpp_applied = dpp_applied_array.value(0);
                     dpp_partition_count = dpp_partition_count_array.value(0);
                 }
@@ -497,10 +483,9 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                 let current = table.metadata().current_snapshot_id();
                 if current != Some(baseline) {
                     return Err(DataFusionError::Execution(format!(
-                        "MERGE conflict: table '{}' was modified by another transaction. \
-                         Expected snapshot {}, but current snapshot is {:?}. \
-                         Position deletes may be stale. Please retry the MERGE.",
-                        table_ident, baseline, current
+                        "MERGE conflict: table '{table_ident}' was modified by another transaction. \
+                         Expected snapshot {baseline}, but current snapshot is {current:?}. \
+                         Position deletes may be stale. Please retry the MERGE."
                     )));
                 }
             }

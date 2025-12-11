@@ -51,9 +51,12 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{StreamExt, TryStreamExt};
+use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataFileFormat, TableProperties, serialize_data_file_to_json};
+use iceberg::spec::{
+    DataFile, DataFileFormat, PartitionKey, TableProperties, serialize_data_file_to_json,
+};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
@@ -64,16 +67,59 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
+use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
-use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
+use crate::partition_utils::{
+    SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
+    reject_partition_evolution,
+};
 use crate::to_datafusion_error;
 
 /// Column name for serialized data files in output
 pub const UPDATE_DATA_FILES_COL: &str = "data_files";
+
+// Type aliases for the writers
+type DataFileWriterType = iceberg::writer::base_writer::data_file_writer::DataFileWriter<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+type DataFileWriterBuilderType = DataFileWriterBuilder<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+type PositionDeleteWriterType = iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+type PositionDeleteWriterBuilderType = PositionDeleteFileWriterBuilder<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+/// Data file writer that supports both partitioned and unpartitioned tables.
+enum UpdateDataWriter {
+    Unpartitioned(DataFileWriterType),
+    Partitioned(FanoutWriter<DataFileWriterBuilderType>),
+}
+
+/// Position delete writer that supports both partitioned and unpartitioned tables.
+enum UpdateDeleteWriter {
+    Unpartitioned(PositionDeleteWriterType),
+    Partitioned(FanoutWriter<PositionDeleteWriterBuilderType>),
+}
+
 /// Column name for serialized delete files in output
 pub const UPDATE_DELETE_FILES_COL: &str = "delete_files";
 /// Column name for update count in output
@@ -200,7 +246,7 @@ impl DisplayAs for IcebergUpdateExec {
         let assignments_display: Vec<String> = self
             .assignments
             .iter()
-            .map(|(col, expr)| format!("{} = {}", col, expr))
+            .map(|(col, expr)| format!("{col} = {expr}"))
             .collect();
 
         match t {
@@ -283,6 +329,9 @@ async fn execute_update(
     predicate: Option<Predicate>,
     filter_exprs: Vec<Expr>,
 ) -> DFResult<RecordBatch> {
+    // Guard: Reject tables with partition evolution before expensive scan
+    reject_partition_evolution(&table, "UPDATE")?;
+
     // Build the scan - predicate is used for file-level pruning
     let mut scan_builder = table.scan().select_all();
     if let Some(pred) = predicate {
@@ -306,11 +355,21 @@ async fn execute_update(
     }
 
     // Set up writers
-    // Build partition type map for proper serialization with partition evolution
+    // Build partition type map for proper serialization
     let partition_types = build_partition_type_map(&table)?;
-    let current_spec_id = table.metadata().default_partition_spec_id();
+    let partition_spec = table.metadata().default_partition_spec().clone();
+    let default_spec_id = partition_spec.spec_id();
+    let iceberg_schema = table.metadata().current_schema().clone();
+    let is_partitioned = !partition_spec.is_unpartitioned();
     let format_version = table.metadata().format_version();
     let file_io = table.file_io().clone();
+
+    // Build file partition map for partition-evolution-aware deletes
+    let file_partition_map = if is_partitioned {
+        build_file_partition_map(&table).await?
+    } else {
+        HashMap::new()
+    };
 
     let target_file_size = table
         .metadata()
@@ -319,18 +378,17 @@ async fn execute_update(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
 
-    // Create data file writer
+    // Create location generator
     let location_generator =
         DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
+
+    // === Data file writer ===
     let data_file_name_generator = DefaultFileNameGenerator::new(
         format!("update-data-{}", Uuid::now_v7()),
         None,
         DataFileFormat::Parquet,
     );
-    let parquet_writer = ParquetWriterBuilder::new(
-        WriterProperties::default(),
-        table.metadata().current_schema().clone(),
-    );
+    let parquet_writer = ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone());
     let data_rolling_writer = RollingFileWriterBuilder::new(
         parquet_writer.clone(),
         target_file_size,
@@ -339,12 +397,8 @@ async fn execute_update(
         data_file_name_generator,
     );
     let data_file_builder = DataFileWriterBuilder::new(data_rolling_writer);
-    let mut data_file_writer = data_file_builder
-        .build(None)
-        .await
-        .map_err(to_datafusion_error)?;
 
-    // Create position delete file writer
+    // === Position delete file writer ===
     let delete_config = PositionDeleteWriterConfig::new();
     let delete_schema = delete_config.delete_schema().clone();
 
@@ -386,16 +440,64 @@ async fn execute_update(
     );
     let delete_file_builder =
         PositionDeleteFileWriterBuilder::new(delete_rolling_writer, delete_config.clone());
-    let mut delete_file_writer = delete_file_builder
-        .build(None)
-        .await
-        .map_err(to_datafusion_error)?;
+
+    // Create partition splitter if partitioned
+    let partition_splitter = if is_partitioned {
+        Some(
+            RecordBatchPartitionSplitter::try_new_with_computed_values(
+                iceberg_schema.clone(),
+                partition_spec.clone(),
+            )
+            .map_err(to_datafusion_error)?,
+        )
+    } else {
+        None
+    };
+
+    // Create writers based on partition status
+    let (mut data_writer, mut delete_writer) = if is_partitioned {
+        (
+            UpdateDataWriter::Partitioned(FanoutWriter::new(data_file_builder)),
+            UpdateDeleteWriter::Partitioned(FanoutWriter::new(delete_file_builder)),
+        )
+    } else {
+        (
+            UpdateDataWriter::Unpartitioned(
+                data_file_builder
+                    .build(None)
+                    .await
+                    .map_err(to_datafusion_error)?,
+            ),
+            UpdateDeleteWriter::Unpartitioned(
+                delete_file_builder
+                    .build(None)
+                    .await
+                    .map_err(to_datafusion_error)?,
+            ),
+        )
+    };
 
     let mut total_count = 0u64;
 
     // Process each file
     for task in file_scan_tasks {
         let file_path = task.data_file_path().to_string();
+
+        // Get the file's partition info for delete routing
+        let file_partition_key = if is_partitioned {
+            let info = file_partition_map.get(&file_path).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "No partition info found for file '{file_path}'. This may indicate a consistency issue."
+                ))
+            })?;
+            Some(PartitionKey::new(
+                (*info.partition_spec).clone(),
+                iceberg_schema.clone(),
+                info.partition.clone(),
+            ))
+        } else {
+            None
+        };
 
         // Clear task predicate to read ALL rows for position tracking
         let mut task_without_predicate = task;
@@ -446,19 +548,19 @@ async fn execute_update(
                 let transformed_batch =
                     transform_batch(&matching_batch, &physical_assignments, &schema)?;
 
-                // Write transformed rows to data file
-                data_file_writer
-                    .write(transformed_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                // Write transformed rows to data file (with partition awareness)
+                write_data_batch(
+                    &mut data_writer,
+                    transformed_batch,
+                    partition_splitter.as_ref(),
+                )
+                .await?;
 
-                // Write position deletes for original rows
+                // Write position deletes for original rows (with partition awareness)
                 let delete_batch =
                     make_position_delete_batch(&file_path, &positions, delete_schema.clone())?;
-                delete_file_writer
-                    .write(delete_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                write_delete_batch(&mut delete_writer, delete_batch, file_partition_key.as_ref())
+                    .await?;
 
                 total_count += positions.len() as u64;
             }
@@ -490,19 +592,19 @@ async fn execute_update(
                 let transformed_batch =
                     transform_batch(&matching_batch, &physical_assignments, &schema)?;
 
-                // Write transformed rows to data file
-                data_file_writer
-                    .write(transformed_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                // Write transformed rows to data file (with partition awareness)
+                write_data_batch(
+                    &mut data_writer,
+                    transformed_batch,
+                    partition_splitter.as_ref(),
+                )
+                .await?;
 
-                // Write position deletes for original rows
+                // Write position deletes for original rows (with partition awareness)
                 let delete_batch =
                     make_position_delete_batch(&file_path, &positions, delete_schema.clone())?;
-                delete_file_writer
-                    .write(delete_batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                write_delete_batch(&mut delete_writer, delete_batch, file_partition_key.as_ref())
+                    .await?;
 
                 total_count += positions.len() as u64;
             }
@@ -512,20 +614,16 @@ async fn execute_update(
     }
 
     // Close writers and collect files
-    let data_files = data_file_writer
-        .close()
-        .await
-        .map_err(to_datafusion_error)?;
-    let delete_files = delete_file_writer
-        .close()
-        .await
-        .map_err(to_datafusion_error)?;
+    let data_files = close_data_writer(data_writer).await?;
+    let delete_files = close_delete_writer(delete_writer).await?;
 
-    // Serialize to JSON with partition spec wrapper for partition evolution support
-    let partition_type = partition_types.get(&current_spec_id).ok_or_else(|| {
+    // Serialize to JSON with partition spec wrapper
+    // Using default_spec_id for all files is safe here because:
+    // 1. Tables with partition evolution are rejected by reject_partition_evolution() above
+    // 2. Single-spec tables: all files use the same (default) partition spec
+    let partition_type = partition_types.get(&default_spec_id).ok_or_else(|| {
         DataFusionError::Internal(format!(
-            "Missing partition type for current partition spec {}",
-            current_spec_id
+            "Missing partition type for default partition spec {default_spec_id}"
         ))
     })?;
 
@@ -535,7 +633,7 @@ async fn execute_update(
             let file_json = serialize_data_file_to_json(df, partition_type, format_version)
                 .map_err(to_datafusion_error)?;
             serde_json::to_string(&SerializedFileWithSpec {
-                spec_id: current_spec_id,
+                spec_id: default_spec_id,
                 file_json,
             })
             .map_err(|e| {
@@ -552,7 +650,7 @@ async fn execute_update(
             let file_json = serialize_data_file_to_json(df, partition_type, format_version)
                 .map_err(to_datafusion_error)?;
             serde_json::to_string(&SerializedFileWithSpec {
-                spec_id: current_spec_id,
+                spec_id: default_spec_id,
                 file_json,
             })
             .map_err(|e| {
@@ -675,8 +773,7 @@ fn transform_batch(
             // Keep original column value
             let original_col = batch.column_by_name(column_name).ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "Column '{}' not found in source batch",
-                    column_name
+                    "Column '{column_name}' not found in source batch"
                 ))
             })?;
             columns.push(original_col.clone());
@@ -709,6 +806,77 @@ fn make_position_delete_batch(
             Some("Failed to create position delete batch".to_string()),
         )
     })
+}
+
+/// Writes a data batch to the appropriate writer, handling partitioned and unpartitioned cases.
+async fn write_data_batch(
+    writer: &mut UpdateDataWriter,
+    batch: RecordBatch,
+    splitter: Option<&RecordBatchPartitionSplitter>,
+) -> DFResult<()> {
+    match writer {
+        UpdateDataWriter::Unpartitioned(w) => {
+            w.write(batch).await.map_err(to_datafusion_error)?;
+        }
+        UpdateDataWriter::Partitioned(w) => {
+            let splitter = splitter.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Partition splitter required for partitioned tables".to_string(),
+                )
+            })?;
+            let partitioned_batches = splitter.split(&batch).map_err(to_datafusion_error)?;
+            for (partition_key, batch) in partitioned_batches {
+                w.write(partition_key, batch).await.map_err(to_datafusion_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes a delete batch to the appropriate writer, handling partitioned and unpartitioned cases.
+async fn write_delete_batch(
+    writer: &mut UpdateDeleteWriter,
+    batch: RecordBatch,
+    partition_key: Option<&PartitionKey>,
+) -> DFResult<()> {
+    match writer {
+        UpdateDeleteWriter::Unpartitioned(w) => {
+            w.write(batch).await.map_err(to_datafusion_error)?;
+        }
+        UpdateDeleteWriter::Partitioned(w) => {
+            let pk = partition_key.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Partition key required for partitioned tables".to_string(),
+                )
+            })?;
+            w.write(pk.clone(), batch).await.map_err(to_datafusion_error)?;
+        }
+    }
+    Ok(())
+}
+
+/// Closes the data writer and returns all data files written.
+async fn close_data_writer(writer: UpdateDataWriter) -> DFResult<Vec<DataFile>> {
+    match writer {
+        UpdateDataWriter::Unpartitioned(mut w) => {
+            w.close().await.map_err(to_datafusion_error)
+        }
+        UpdateDataWriter::Partitioned(w) => {
+            w.close().await.map_err(to_datafusion_error)
+        }
+    }
+}
+
+/// Closes the delete writer and returns all delete files written.
+async fn close_delete_writer(writer: UpdateDeleteWriter) -> DFResult<Vec<DataFile>> {
+    match writer {
+        UpdateDeleteWriter::Unpartitioned(mut w) => {
+            w.close().await.map_err(to_datafusion_error)
+        }
+        UpdateDeleteWriter::Partitioned(w) => {
+            w.close().await.map_err(to_datafusion_error)
+        }
+    }
 }
 
 #[cfg(test)]

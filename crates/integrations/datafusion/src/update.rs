@@ -204,18 +204,16 @@ impl UpdateBuilder {
             // Column must exist
             let field = iceberg_schema.field_by_name(column_name).ok_or_else(|| {
                 DataFusionError::Plan(format!(
-                    "Column '{}' not found in table schema",
-                    column_name
+                    "Column '{column_name}' not found in table schema"
                 ))
             })?;
 
             // Cannot update partition source columns
             if partition_source_ids.contains(&field.id) {
                 return Err(DataFusionError::Plan(format!(
-                    "Cannot UPDATE partition column '{}'. Updating partition columns would \
+                    "Cannot UPDATE partition column '{column_name}'. Updating partition columns would \
                      require moving rows between partitions, which is not supported. \
-                     Consider using DELETE + INSERT instead.",
-                    column_name
+                     Consider using DELETE + INSERT instead."
                 )));
             }
 

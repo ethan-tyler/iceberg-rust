@@ -333,9 +333,8 @@ async fn scan_file_for_deletes(
                                 // We MUST fail here rather than silently skip - users need to know
                                 // their DELETE predicate couldn't be evaluated on all files.
                                 Err(format!(
-                                    "Cannot evaluate DELETE predicate on file '{}': {}. \
-                                     This may indicate schema evolution incompatibility.",
-                                    file_path, e
+                                    "Cannot evaluate DELETE predicate on file '{file_path}': {e}. \
+                                     This may indicate schema evolution incompatibility."
                                 ))
                             }
                         }

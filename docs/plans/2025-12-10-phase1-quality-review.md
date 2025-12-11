@@ -274,6 +274,9 @@ fn unpartitioned(default_spec_id: i32) -> Self {
 | **Unpartitioned spec_id** | ✅ Fixed | `PartitionGroupKey::unpartitioned()` now accepts actual spec_id |
 | **MERGE partition evolution** | ✅ Fixed | Uses `get_partition_key_for_file()` from file partition map |
 | **Shared partition utilities** | ✅ Added | `FilePartitionInfo` and `build_file_partition_map()` in partition_utils.rs |
+| **Partition evolution guards** | ✅ Added | `reject_partition_evolution()` guards in UPDATE, DELETE, MERGE |
+| **UPDATE partition-aware writers** | ✅ Added | FanoutWriter + RecordBatchPartitionSplitter for partitioned tables |
+| **MERGE delete grouping** | ✅ Fixed | Include spec_id in partition grouping key |
 
 ## Remaining Work
 
@@ -294,6 +297,9 @@ Phase 1 DataFusion layer fixes are **complete**. The following improvements were
 1. Position delete files now use correct spec_id for unpartitioned tables
 2. MERGE operations use file's original partition info (not recomputed)
 3. Shared partition utilities for partition-evolution-aware operations
+4. Explicit `reject_partition_evolution()` guards in UPDATE, DELETE, MERGE
+5. UPDATE now uses partition-aware writers (FanoutWriter) for partitioned tables
+6. MERGE delete grouping includes spec_id to prevent mixing partitions from different specs
 
 **Full partition evolution support** requires additional work in the core iceberg transaction layer. The existing `#[ignore]` tests should remain ignored until that work is complete.
 

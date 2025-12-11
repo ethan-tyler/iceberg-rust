@@ -253,16 +253,14 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     .column_by_name(UPDATE_DATA_FILES_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            UPDATE_DATA_FILES_COL
+                            "Expected '{UPDATE_DATA_FILES_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be StringArray",
-                            UPDATE_DATA_FILES_COL
+                            "Expected '{UPDATE_DATA_FILES_COL}' column to be StringArray"
                         ))
                     })?;
 
@@ -271,16 +269,14 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     .column_by_name(UPDATE_DELETE_FILES_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            UPDATE_DELETE_FILES_COL
+                            "Expected '{UPDATE_DELETE_FILES_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be StringArray",
-                            UPDATE_DELETE_FILES_COL
+                            "Expected '{UPDATE_DELETE_FILES_COL}' column to be StringArray"
                         ))
                     })?;
 
@@ -289,16 +285,14 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     .column_by_name(UPDATE_COUNT_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            UPDATE_COUNT_COL
+                            "Expected '{UPDATE_COUNT_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be UInt64Array",
-                            UPDATE_COUNT_COL
+                            "Expected '{UPDATE_COUNT_COL}' column to be UInt64Array"
                         ))
                     })?;
 
@@ -387,10 +381,9 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                 let current = table.metadata().current_snapshot_id();
                 if current != Some(baseline) {
                     return Err(DataFusionError::Execution(format!(
-                        "UPDATE conflict: table '{}' was modified by another transaction. \
-                         Expected snapshot {}, but current snapshot is {:?}. \
-                         Position deletes may be stale. Please retry the UPDATE.",
-                        table_ident, baseline, current
+                        "UPDATE conflict: table '{table_ident}' was modified by another transaction. \
+                         Expected snapshot {baseline}, but current snapshot is {current:?}. \
+                         Position deletes may be stale. Please retry the UPDATE."
                     )));
                 }
             }

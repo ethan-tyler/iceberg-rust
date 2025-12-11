@@ -243,16 +243,14 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
                     .column_by_name(DELETE_FILES_COL_NAME)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            DELETE_FILES_COL_NAME
+                            "Expected '{DELETE_FILES_COL_NAME}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be StringArray",
-                            DELETE_FILES_COL_NAME
+                            "Expected '{DELETE_FILES_COL_NAME}' column to be StringArray"
                         ))
                     })?;
 
@@ -309,10 +307,9 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
                 let current = table.metadata().current_snapshot_id();
                 if current != Some(baseline) {
                     return Err(DataFusionError::Execution(format!(
-                        "DELETE conflict: table '{}' was modified by another transaction. \
-                         Expected snapshot {}, but current snapshot is {:?}. \
-                         Position deletes may be stale. Please retry the DELETE.",
-                        table_ident, baseline, current
+                        "DELETE conflict: table '{table_ident}' was modified by another transaction. \
+                         Expected snapshot {baseline}, but current snapshot is {current:?}. \
+                         Position deletes may be stale. Please retry the DELETE."
                     )));
                 }
             }
