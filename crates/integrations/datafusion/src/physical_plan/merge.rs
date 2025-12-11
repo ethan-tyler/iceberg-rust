@@ -77,8 +77,8 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::RecordBatchPartitionSplitter;
-use iceberg::scan::FileScanTask;
 use iceberg::expr::{Predicate, Reference};
+use iceberg::scan::FileScanTask;
 use iceberg::spec::{
     DataFile, DataFileFormat, PartitionKey, PartitionSpecRef, PrimitiveType, SchemaRef,
     TableProperties, Transform, serialize_data_file_to_json,
@@ -94,8 +94,8 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::partitioning::PartitioningWriter;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -104,6 +104,7 @@ use crate::merge::{
     MatchedAction, MergeStats, NotMatchedAction, NotMatchedBySourceAction, WhenMatchedClause,
     WhenNotMatchedBySourceClause, WhenNotMatchedClause,
 };
+use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
 use crate::to_datafusion_error;
 
 /// Internal metadata column name for file path (added during scan)
@@ -353,17 +354,15 @@ type DataFileWriterType = iceberg::writer::base_writer::data_file_writer::DataFi
     DefaultFileNameGenerator,
 >;
 
-type PositionDeleteWriterType = iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<
-    ParquetWriterBuilder,
-    DefaultLocationGenerator,
-    DefaultFileNameGenerator,
->;
+type PositionDeleteWriterType =
+    iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<
+        ParquetWriterBuilder,
+        DefaultLocationGenerator,
+        DefaultFileNameGenerator,
+    >;
 
-type DataFileWriterBuilderType = DataFileWriterBuilder<
-    ParquetWriterBuilder,
-    DefaultLocationGenerator,
-    DefaultFileNameGenerator,
->;
+type DataFileWriterBuilderType =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
 type PositionDeleteWriterBuilderType = PositionDeleteFileWriterBuilder<
     ParquetWriterBuilder,
@@ -427,10 +426,8 @@ impl MergeWriters {
             None,
             DataFileFormat::Parquet,
         );
-        let parquet_writer = ParquetWriterBuilder::new(
-            WriterProperties::default(),
-            iceberg_schema.clone(),
-        );
+        let parquet_writer =
+            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone());
         let data_rolling_writer = RollingFileWriterBuilder::new(
             parquet_writer.clone(),
             target_file_size,
@@ -570,10 +567,7 @@ impl MergeWriters {
                         "Partition key required for delete writes on partitioned table".into(),
                     )
                 })?;
-                writer
-                    .write(key, batch)
-                    .await
-                    .map_err(to_datafusion_error)
+                writer.write(key, batch).await.map_err(to_datafusion_error)
             }
         }
     }
@@ -618,35 +612,29 @@ impl MergeWriters {
 
             // Find the column in the batch (with target_ prefix)
             let col_name = format!("{}{}", TARGET_PREFIX, source_field.name);
-            let col_idx = batch
-                .schema()
-                .index_of(&col_name)
-                .map_err(|_| {
-                    DataFusionError::Internal(format!(
-                        "Partition column {} not found in batch",
-                        col_name
-                    ))
-                })?;
+            let col_idx = batch.schema().index_of(&col_name).map_err(|_| {
+                DataFusionError::Internal(format!(
+                    "Partition column {} not found in batch",
+                    col_name
+                ))
+            })?;
 
             let col = batch.column(col_idx);
 
             // Get the primitive type from the source field
-            let primitive_type = source_field
-                .field_type
-                .as_primitive_type()
-                .ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "Partition source field {} is not a primitive type",
-                        source_field.name
-                    ))
-                })?;
+            let primitive_type = source_field.field_type.as_primitive_type().ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Partition source field {} is not a primitive type",
+                    source_field.name
+                ))
+            })?;
 
             // Extract the datum (literal + type) from the column
             let datum = extract_datum_from_column(col, row_idx, primitive_type)?;
 
             // Create transform function and apply it
-            let transform_fn = create_transform_function(&field.transform)
-                .map_err(to_datafusion_error)?;
+            let transform_fn =
+                create_transform_function(&field.transform).map_err(to_datafusion_error)?;
             let transformed = transform_fn
                 .transform_literal(&datum)
                 .map_err(to_datafusion_error)?
@@ -882,24 +870,20 @@ impl IcebergMergeExec {
         let deleted_array = Arc::new(datafusion::arrow::array::UInt64Array::from(vec![
             stats.rows_deleted,
         ])) as ArrayRef;
-        let dpp_applied_array =
-            Arc::new(BooleanArray::from(vec![stats.dpp_applied])) as ArrayRef;
-        let dpp_partition_count_array = Arc::new(datafusion::arrow::array::UInt64Array::from(
-            vec![stats.dpp_partition_count as u64],
-        )) as ArrayRef;
+        let dpp_applied_array = Arc::new(BooleanArray::from(vec![stats.dpp_applied])) as ArrayRef;
+        let dpp_partition_count_array = Arc::new(datafusion::arrow::array::UInt64Array::from(vec![
+            stats.dpp_partition_count as u64,
+        ])) as ArrayRef;
 
-        RecordBatch::try_new(
-            Self::make_output_schema(),
-            vec![
-                data_files_array,
-                delete_files_array,
-                inserted_array,
-                updated_array,
-                deleted_array,
-                dpp_applied_array,
-                dpp_partition_count_array,
-            ],
-        )
+        RecordBatch::try_new(Self::make_output_schema(), vec![
+            data_files_array,
+            delete_files_array,
+            inserted_array,
+            updated_array,
+            deleted_array,
+            dpp_applied_array,
+            dpp_partition_count_array,
+        ])
         .map_err(|e| {
             DataFusionError::ArrowError(
                 Box::new(e),
@@ -1071,7 +1055,10 @@ impl ExecutionPlan for IcebergMergeExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }
 
@@ -1116,22 +1103,6 @@ async fn execute_merge(
     when_not_matched_by_source: Vec<WhenNotMatchedBySourceClause>,
     merge_config: MergeConfig,
 ) -> DFResult<RecordBatch> {
-    // === Safety Check: Partition spec evolution guard ===
-    // MERGE operations with partitioned tables currently only support tables with
-    // a single partition spec. Tables that have undergone partition evolution may
-    // have data files written with different partition specs, which could lead to
-    // incorrect partition routing for position deletes.
-    let partition_spec_count = table.metadata().partition_specs_iter().count();
-    if partition_spec_count > 1 && !table.metadata().default_partition_spec().is_unpartitioned() {
-        return Err(DataFusionError::NotImplemented(format!(
-            "MERGE on partitioned tables with partition evolution is not yet supported. \
-             Table '{}' has {} partition specs. MERGE requires all data to use the same \
-             partition spec to ensure position deletes are correctly routed.",
-            table.identifier(),
-            partition_spec_count
-        )));
-    }
-
     // === Step 1: Extract join keys from match condition (supports compound keys) ===
     // We need join keys early for DPP computation
     let join_keys = extract_join_keys(&match_condition)?;
@@ -1139,18 +1110,25 @@ async fn execute_merge(
     // === Step 2: Materialize source data FIRST (required for DPP) ===
     let source_batches = materialize_source(source, partition, context).await?;
 
-    // Memory warning for large MERGE operations
+    // Memory warning for large MERGE operations (debug builds only)
     // Note: Streaming execution (Phase 3) will address memory bounds for very large merges
-    let source_row_count: usize = source_batches.iter().map(|b| b.num_rows()).sum();
-    const LARGE_MERGE_THRESHOLD: usize = 1_000_000;
-    if source_row_count > LARGE_MERGE_THRESHOLD {
-        eprintln!(
-            "MERGE: Large source dataset ({} rows). Memory usage may be significant. \
-             Consider batching source data for very large merges. \
-             DPP is {} to help reduce target scan scope.",
-            source_row_count,
-            if merge_config.enable_dpp { "enabled" } else { "disabled" }
-        );
+    #[cfg(debug_assertions)]
+    {
+        let source_row_count: usize = source_batches.iter().map(|b| b.num_rows()).sum();
+        const LARGE_MERGE_THRESHOLD: usize = 1_000_000;
+        if source_row_count > LARGE_MERGE_THRESHOLD {
+            eprintln!(
+                "MERGE: Large source dataset ({} rows). Memory usage may be significant. \
+                 Consider batching source data for very large merges. \
+                 DPP is {} to help reduce target scan scope.",
+                source_row_count,
+                if merge_config.enable_dpp {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+        }
     }
 
     if source_batches.is_empty() && when_not_matched_by_source.is_empty() {
@@ -1182,8 +1160,7 @@ async fn execute_merge(
     let dpp_partition_count = dpp_result.partition_count;
 
     // === Step 4: Scan target table with metadata columns (with DPP filter) ===
-    let target_batches =
-        scan_target_with_metadata(&table, &schema, dpp_result.predicate).await?;
+    let target_batches = scan_target_with_metadata(&table, &schema, dpp_result.predicate).await?;
 
     if target_batches.is_empty() && when_not_matched.is_empty() {
         // No target rows and no INSERT clause - nothing to do
@@ -1197,13 +1174,8 @@ async fn execute_merge(
     }
 
     // === Step 5: Perform FULL OUTER JOIN ===
-    let joined_batches = perform_full_outer_join(
-        &target_batches,
-        &source_batches,
-        &schema,
-        &join_keys,
-    )
-    .await?;
+    let joined_batches =
+        perform_full_outer_join(&target_batches, &source_batches, &schema, &join_keys).await?;
 
     // === Step 6: Set up partition-aware writers for file output ===
     let mut writers = MergeWriters::new(&table).await?;
@@ -1270,23 +1242,54 @@ async fn execute_merge(
     }
 
     // === Step 8: Close writers and collect files ===
-    let partition_type = table.metadata().default_partition_type().clone();
+    // Build partition type map for proper serialization with partition evolution
+    let partition_types = build_partition_type_map(&table)?;
+    let current_spec_id = table.metadata().default_partition_spec_id();
     let format_version = table.metadata().format_version();
 
     let (data_files, delete_files) = writers.close().await?;
 
-    // Serialize to JSON
+    // Serialize to JSON with partition spec wrapper for partition evolution support
+    let partition_type = partition_types.get(&current_spec_id).ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "Missing partition type for current partition spec {}",
+            current_spec_id
+        ))
+    })?;
+
     let data_files_json: Vec<String> = data_files
         .into_iter()
-        .map(|df| serialize_data_file_to_json(df, &partition_type, format_version))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(to_datafusion_error)?;
+        .map(|df| {
+            let file_json = serialize_data_file_to_json(df, partition_type, format_version)
+                .map_err(to_datafusion_error)?;
+            serde_json::to_string(&SerializedFileWithSpec {
+                spec_id: current_spec_id,
+                file_json,
+            })
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to serialize data file metadata: {e}"
+                ))
+            })
+        })
+        .collect::<DFResult<Vec<_>>>()?;
 
     let delete_files_json: Vec<String> = delete_files
         .into_iter()
-        .map(|df| serialize_data_file_to_json(df, &partition_type, format_version))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(to_datafusion_error)?;
+        .map(|df| {
+            let file_json = serialize_data_file_to_json(df, partition_type, format_version)
+                .map_err(to_datafusion_error)?;
+            serde_json::to_string(&SerializedFileWithSpec {
+                spec_id: current_spec_id,
+                file_json,
+            })
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to serialize delete file metadata: {e}"
+                ))
+            })
+        })
+        .collect::<DFResult<Vec<_>>>()?;
 
     // Update file counts in stats
     stats.files_added = data_files_json.len() as u64;
@@ -1418,7 +1421,11 @@ fn compute_dpp_filter(
                 eprintln!(
                     "MERGE DPP: Not applicable - join keys [{}] do not include partition columns [{}]",
                     join_key_names.join(", "),
-                    partition_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    partition_names
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             return Ok(DppResult {
@@ -1469,8 +1476,9 @@ fn extract_distinct_values(
     batches: &[RecordBatch],
     column_name: &str,
 ) -> DFResult<Vec<iceberg::spec::Datum>> {
-    use datafusion::arrow::array::*;
     use std::collections::HashSet;
+
+    use datafusion::arrow::array::*;
 
     if batches.is_empty() {
         return Ok(vec![]);
@@ -1500,79 +1508,80 @@ fn extract_distinct_values(
                 continue;
             }
 
-            let datum = match &data_type {
-                DataType::Int32 => {
-                    let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                        DataFusionError::Internal("Expected Int32Array".into())
-                    })?;
-                    let val = arr.value(row_idx);
-                    let key = val.to_string();
-                    if seen_strings.insert(key) {
-                        Some(iceberg::spec::Datum::int(val))
-                    } else {
-                        None
-                    }
-                }
-                DataType::Int64 => {
-                    let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                        DataFusionError::Internal("Expected Int64Array".into())
-                    })?;
-                    let val = arr.value(row_idx);
-                    let key = val.to_string();
-                    if seen_strings.insert(key) {
-                        Some(iceberg::spec::Datum::long(val))
-                    } else {
-                        None
-                    }
-                }
-                DataType::Utf8 => {
-                    let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                        DataFusionError::Internal("Expected StringArray".into())
-                    })?;
-                    let val = arr.value(row_idx);
-                    if seen_strings.insert(val.to_string()) {
-                        Some(iceberg::spec::Datum::string(val))
-                    } else {
-                        None
-                    }
-                }
-                DataType::LargeUtf8 => {
-                    let arr = col
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .ok_or_else(|| {
-                            DataFusionError::Internal("Expected LargeStringArray".into())
+            let datum =
+                match &data_type {
+                    DataType::Int32 => {
+                        let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                            DataFusionError::Internal("Expected Int32Array".into())
                         })?;
-                    let val = arr.value(row_idx);
-                    if seen_strings.insert(val.to_string()) {
-                        Some(iceberg::spec::Datum::string(val))
-                    } else {
-                        None
+                        let val = arr.value(row_idx);
+                        let key = val.to_string();
+                        if seen_strings.insert(key) {
+                            Some(iceberg::spec::Datum::int(val))
+                        } else {
+                            None
+                        }
                     }
-                }
-                DataType::Date32 => {
-                    let arr = col.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
-                        DataFusionError::Internal("Expected Date32Array".into())
-                    })?;
-                    let val = arr.value(row_idx);
-                    let key = val.to_string();
-                    if seen_strings.insert(key) {
-                        Some(iceberg::spec::Datum::date(val))
-                    } else {
-                        None
+                    DataType::Int64 => {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                            DataFusionError::Internal("Expected Int64Array".into())
+                        })?;
+                        let val = arr.value(row_idx);
+                        let key = val.to_string();
+                        if seen_strings.insert(key) {
+                            Some(iceberg::spec::Datum::long(val))
+                        } else {
+                            None
+                        }
                     }
-                }
-                other => {
-                    // For unsupported types, skip DPP rather than fail
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "MERGE DPP: Skipping - unsupported data type {:?} for column '{}' \
+                    DataType::Utf8 => {
+                        let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                            DataFusionError::Internal("Expected StringArray".into())
+                        })?;
+                        let val = arr.value(row_idx);
+                        if seen_strings.insert(val.to_string()) {
+                            Some(iceberg::spec::Datum::string(val))
+                        } else {
+                            None
+                        }
+                    }
+                    DataType::LargeUtf8 => {
+                        let arr =
+                            col.as_any()
+                                .downcast_ref::<LargeStringArray>()
+                                .ok_or_else(|| {
+                                    DataFusionError::Internal("Expected LargeStringArray".into())
+                                })?;
+                        let val = arr.value(row_idx);
+                        if seen_strings.insert(val.to_string()) {
+                            Some(iceberg::spec::Datum::string(val))
+                        } else {
+                            None
+                        }
+                    }
+                    DataType::Date32 => {
+                        let arr = col.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
+                            DataFusionError::Internal("Expected Date32Array".into())
+                        })?;
+                        let val = arr.value(row_idx);
+                        let key = val.to_string();
+                        if seen_strings.insert(key) {
+                            Some(iceberg::spec::Datum::date(val))
+                        } else {
+                            None
+                        }
+                    }
+                    other => {
+                        // For unsupported types, skip DPP rather than fail
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "MERGE DPP: Skipping - unsupported data type {:?} for column '{}' \
                          (supported: Int32, Int64, Utf8, LargeUtf8, Date32)",
-                        other, column_name
-                    );
-                    return Ok(vec![]);
-                }
-            };
+                            other, column_name
+                        );
+                        return Ok(vec![]);
+                    }
+                };
 
             if let Some(d) = datum {
                 values.push(d);
@@ -1626,8 +1635,8 @@ async fn scan_target_with_metadata(
         let reader = iceberg::arrow::ArrowReaderBuilder::new(file_io.clone()).build();
 
         // Read batches from this file
-        let task_stream = Box::pin(futures::stream::iter(vec![Ok(task)]))
-            as iceberg::scan::FileScanTaskStream;
+        let task_stream =
+            Box::pin(futures::stream::iter(vec![Ok(task)])) as iceberg::scan::FileScanTaskStream;
         let mut batch_stream = reader
             .read(task_stream)
             .map_err(to_datafusion_error)?
@@ -2399,7 +2408,10 @@ fn extract_source_data_for_update(
 
     // Build indices array for filtering
     let indices = datafusion::arrow::array::UInt32Array::from(
-        matched_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        matched_indices
+            .iter()
+            .map(|&i| i as u32)
+            .collect::<Vec<_>>(),
     );
 
     // For each target column, find corresponding source column
@@ -2446,7 +2458,10 @@ fn apply_update_assignments(
 
     // Build indices array for filtering
     let indices = datafusion::arrow::array::UInt32Array::from(
-        matched_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        matched_indices
+            .iter()
+            .map(|&i| i as u32)
+            .collect::<Vec<_>>(),
     );
 
     // Build assignment map for quick lookup (reserved for condition evaluation)
@@ -2540,23 +2555,22 @@ fn extract_join_keys(match_condition: &Expr) -> DFResult<Vec<(String, String)>> 
 fn extract_join_keys_recursive(expr: &Expr, keys: &mut Vec<(String, String)>) -> DFResult<()> {
     match expr {
         // AND: recurse into both sides
-        Expr::BinaryExpr(binary)
-            if binary.op == datafusion::logical_expr::Operator::And =>
-        {
+        Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::And => {
             extract_join_keys_recursive(&binary.left, keys)?;
             extract_join_keys_recursive(&binary.right, keys)?;
         }
         // Equality: extract key pair
-        Expr::BinaryExpr(binary)
-            if binary.op == datafusion::logical_expr::Operator::Eq =>
-        {
+        Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Eq => {
             let left_col = extract_column_name(&binary.left)?;
             let right_col = extract_column_name(&binary.right)?;
 
             // Determine which is target and which is source based on prefix
             let (target_key, source_key) = if left_col.starts_with("target.") {
                 (
-                    left_col.strip_prefix("target.").unwrap().to_string(),
+                    left_col
+                        .strip_prefix("target.")
+                        .expect("prefix check guarantees 'target.' exists")
+                        .to_string(),
                     right_col
                         .strip_prefix("source.")
                         .unwrap_or(&right_col)
@@ -2564,7 +2578,10 @@ fn extract_join_keys_recursive(expr: &Expr, keys: &mut Vec<(String, String)>) ->
                 )
             } else if right_col.starts_with("target.") {
                 (
-                    right_col.strip_prefix("target.").unwrap().to_string(),
+                    right_col
+                        .strip_prefix("target.")
+                        .expect("prefix check guarantees 'target.' exists")
+                        .to_string(),
                     left_col
                         .strip_prefix("source.")
                         .unwrap_or(&left_col)
@@ -2578,9 +2595,7 @@ fn extract_join_keys_recursive(expr: &Expr, keys: &mut Vec<(String, String)>) ->
             keys.push((target_key, source_key));
         }
         // Unsupported: OR conditions or complex expressions in join keys
-        Expr::BinaryExpr(binary)
-            if binary.op == datafusion::logical_expr::Operator::Or =>
-        {
+        Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
             return Err(DataFusionError::Plan(
                 "MERGE ON condition does not support OR predicates. Use AND to combine multiple equality conditions.".to_string(),
             ));
@@ -2678,15 +2693,13 @@ async fn perform_full_outer_join(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
     // Create MemTables
-    let target_table = Arc::new(MemTable::try_new(
-        prefixed_target_schema.clone(),
-        vec![prefixed_target_batches],
-    )?);
+    let target_table = Arc::new(MemTable::try_new(prefixed_target_schema.clone(), vec![
+        prefixed_target_batches,
+    ])?);
 
-    let source_table = Arc::new(MemTable::try_new(
-        prefixed_source_schema.clone(),
-        vec![prefixed_source_batches],
-    )?);
+    let source_table = Arc::new(MemTable::try_new(prefixed_source_schema.clone(), vec![
+        prefixed_source_batches,
+    ])?);
 
     // Register tables
     ctx.register_table("target", target_table)?;
@@ -2973,7 +2986,12 @@ fn add_metadata_columns(
     let row_pos_array = Arc::new(Int64Array::from(positions)) as ArrayRef;
 
     // Build new schema with metadata columns
-    let mut fields: Vec<Field> = batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
     fields.push(Field::new(MERGE_FILE_PATH_COL, DataType::Utf8, false));
     fields.push(Field::new(MERGE_ROW_POS_COL, DataType::Int64, false));
     let new_schema = Arc::new(ArrowSchema::new(fields));
@@ -3114,8 +3132,9 @@ fn make_position_delete_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use datafusion::prelude::lit;
+
+    use super::*;
 
     #[test]
     fn test_output_schema() {
@@ -3190,12 +3209,7 @@ mod tests {
             action: MatchedAction::Update(vec![("col".to_string(), lit(1))]),
         }];
 
-        let action = evaluate_when_clauses(
-            RowClassification::Matched,
-            &when_matched,
-            &[],
-            &[],
-        );
+        let action = evaluate_when_clauses(RowClassification::Matched, &when_matched, &[], &[]);
 
         match action {
             MergeAction::Update(assignments) => {
@@ -3213,12 +3227,7 @@ mod tests {
             action: MatchedAction::UpdateAll,
         }];
 
-        let action = evaluate_when_clauses(
-            RowClassification::Matched,
-            &when_matched,
-            &[],
-            &[],
-        );
+        let action = evaluate_when_clauses(RowClassification::Matched, &when_matched, &[], &[]);
 
         assert!(matches!(action, MergeAction::UpdateAll));
     }
@@ -3230,12 +3239,7 @@ mod tests {
             action: MatchedAction::Delete,
         }];
 
-        let action = evaluate_when_clauses(
-            RowClassification::Matched,
-            &when_matched,
-            &[],
-            &[],
-        );
+        let action = evaluate_when_clauses(RowClassification::Matched, &when_matched, &[], &[]);
 
         assert!(matches!(action, MergeAction::Delete));
     }
@@ -3247,12 +3251,8 @@ mod tests {
             action: NotMatchedAction::InsertAll,
         }];
 
-        let action = evaluate_when_clauses(
-            RowClassification::NotMatched,
-            &[],
-            &when_not_matched,
-            &[],
-        );
+        let action =
+            evaluate_when_clauses(RowClassification::NotMatched, &[], &when_not_matched, &[]);
 
         assert!(matches!(action, MergeAction::Insert));
     }
@@ -3277,12 +3277,7 @@ mod tests {
     #[test]
     fn test_evaluate_when_clauses_no_matching_clause() {
         // No clauses defined - should return NoAction
-        let action = evaluate_when_clauses(
-            RowClassification::Matched,
-            &[],
-            &[],
-            &[],
-        );
+        let action = evaluate_when_clauses(RowClassification::Matched, &[], &[], &[]);
 
         assert!(matches!(action, MergeAction::NoAction));
     }
@@ -3301,12 +3296,7 @@ mod tests {
             },
         ];
 
-        let action = evaluate_when_clauses(
-            RowClassification::Matched,
-            &when_matched,
-            &[],
-            &[],
-        );
+        let action = evaluate_when_clauses(RowClassification::Matched, &when_matched, &[], &[]);
 
         // First clause (Delete) should win
         assert!(matches!(action, MergeAction::Delete));
@@ -3319,9 +3309,11 @@ mod tests {
     #[test]
     fn test_add_metadata_columns() {
         // Create a simple batch
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
         let id_array = Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![id_array]).unwrap();
 

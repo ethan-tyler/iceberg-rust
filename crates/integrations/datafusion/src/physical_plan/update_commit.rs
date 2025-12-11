@@ -37,12 +37,14 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
+use iceberg::Catalog;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::Catalog;
+use iceberg::writer::base_writer::position_delete_writer::position_delete_schema;
 
 use super::update::{UPDATE_COUNT_COL, UPDATE_DATA_FILES_COL, UPDATE_DELETE_FILES_COL};
+use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
 use crate::to_datafusion_error;
 
 /// Column name for the count of updated rows in output
@@ -127,13 +129,17 @@ impl IcebergUpdateCommitExec {
     fn make_count_batch(count: u64) -> DFResult<RecordBatch> {
         let count_array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
 
-        RecordBatch::try_from_iter_with_nullable(vec![(UPDATE_RESULT_COUNT_COL, count_array, false)])
-            .map_err(|e| {
-                DataFusionError::ArrowError(
-                    Box::new(e),
-                    Some("Failed to make update count batch".to_string()),
-                )
-            })
+        RecordBatch::try_from_iter_with_nullable(vec![(
+            UPDATE_RESULT_COUNT_COL,
+            count_array,
+            false,
+        )])
+        .map_err(|e| {
+            DataFusionError::ArrowError(
+                Box::new(e),
+                Some("Failed to make update count batch".to_string()),
+            )
+        })
     }
 }
 
@@ -224,9 +230,11 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
         // Note: We don't clone the table here because we refresh it from the catalog
         // at commit time to get the latest state for validation.
 
-        let spec_id = self.table.metadata().default_partition_spec_id();
-        let partition_type = self.table.metadata().default_partition_type().clone();
+        // Build partition type map for proper deserialization with partition evolution
+        let partition_types = build_partition_type_map(&self.table)?;
         let current_schema = self.table.metadata().current_schema().clone();
+        let delete_schema = position_delete_schema(self.table.metadata().current_schema_id())
+            .map_err(to_datafusion_error)?;
 
         // Process the input and commit files
         let stream = futures::stream::once(async move {
@@ -294,14 +302,29 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                         ))
                     })?;
 
-                // Parse data files from newline-delimited JSON
+                // Parse data files from newline-delimited JSON with partition spec wrapper
                 for data_files_str in data_files_array.iter().flatten() {
                     for json_line in data_files_str.lines() {
                         if !json_line.trim().is_empty() {
+                            let serialized: SerializedFileWithSpec =
+                                serde_json::from_str(json_line).map_err(|e| {
+                                    DataFusionError::Execution(format!(
+                                        "Failed to parse data file payload: {e}"
+                                    ))
+                                })?;
+
+                            let partition_type =
+                                partition_types.get(&serialized.spec_id).ok_or_else(|| {
+                                    DataFusionError::Execution(format!(
+                                        "Partition spec {} not found while committing update",
+                                        serialized.spec_id
+                                    ))
+                                })?;
+
                             let df = deserialize_data_file_from_json(
-                                json_line,
-                                spec_id,
-                                &partition_type,
+                                &serialized.file_json,
+                                serialized.spec_id,
+                                partition_type,
                                 &current_schema,
                             )
                             .map_err(to_datafusion_error)?;
@@ -310,15 +333,30 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     }
                 }
 
-                // Parse delete files from newline-delimited JSON
+                // Parse delete files from newline-delimited JSON with partition spec wrapper
                 for delete_files_str in delete_files_array.iter().flatten() {
                     for json_line in delete_files_str.lines() {
                         if !json_line.trim().is_empty() {
+                            let serialized: SerializedFileWithSpec =
+                                serde_json::from_str(json_line).map_err(|e| {
+                                    DataFusionError::Execution(format!(
+                                        "Failed to parse delete file payload: {e}"
+                                    ))
+                                })?;
+
+                            let partition_type =
+                                partition_types.get(&serialized.spec_id).ok_or_else(|| {
+                                    DataFusionError::Execution(format!(
+                                        "Partition spec {} not found while committing update",
+                                        serialized.spec_id
+                                    ))
+                                })?;
+
                             let df = deserialize_data_file_from_json(
-                                json_line,
-                                spec_id,
-                                &partition_type,
-                                &current_schema,
+                                &serialized.file_json,
+                                serialized.spec_id,
+                                partition_type,
+                                &delete_schema,
                             )
                             .map_err(to_datafusion_error)?;
                             delete_files.push(df);
@@ -376,7 +414,10 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema,
+            stream,
+        )))
     }
 }
 

@@ -59,6 +59,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::delete_scan::{DELETE_FILE_PATH_COL, DELETE_POS_COL};
+use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
 use crate::to_datafusion_error;
 
 /// Column name for serialized delete files in output
@@ -122,12 +123,18 @@ struct FilePartitionInfo {
 }
 
 /// Type alias for the position delete writer builder.
-type DeleteWriterBuilder =
-    PositionDeleteFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+type DeleteWriterBuilder = PositionDeleteFileWriterBuilder<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
 
 /// Type alias for the position delete writer used in partitioned delete collection.
-type PartitionDeleteWriter =
-    PositionDeleteFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+type PartitionDeleteWriter = PositionDeleteFileWriter<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
 
 /// Collects position deletes grouped by partition and manages writers.
 ///
@@ -303,19 +310,24 @@ impl PartitionedDeleteCollector {
                     })?;
 
             let writer = self.get_or_create_writer(&key).await?;
-            writer.write(delete_batch).await.map_err(to_datafusion_error)?;
+            writer
+                .write(delete_batch)
+                .await
+                .map_err(to_datafusion_error)?;
         }
 
         Ok(())
     }
 
     /// Closes all writers and returns the generated delete files.
-    async fn close(self) -> DFResult<Vec<iceberg::spec::DataFile>> {
+    async fn close(self) -> DFResult<Vec<(i32, iceberg::spec::DataFile)>> {
         let mut all_delete_files = Vec::new();
 
-        for (_key, mut writer) in self.writers {
+        for (key, mut writer) in self.writers {
             let delete_files = writer.close().await.map_err(to_datafusion_error)?;
-            all_delete_files.extend(delete_files);
+            for df in delete_files {
+                all_delete_files.push((key.spec_id, df));
+            }
         }
 
         Ok(all_delete_files)
@@ -451,7 +463,7 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let table = self.table.clone();
-        let partition_type = table.metadata().default_partition_type().clone();
+        let partition_types = build_partition_type_map(&table)?;
         let format_version = table.metadata().format_version();
         let result_schema = self.result_schema.clone();
 
@@ -561,9 +573,28 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             // Serialize delete files to JSON
             let delete_files_json: Vec<String> = delete_files
                 .into_iter()
-                .map(|df| {
-                    serialize_data_file_to_json(df, &partition_type, format_version)
-                        .map_err(to_datafusion_error)
+                .map(|(spec_id, df)| {
+                    let partition_type = partition_types.get(&spec_id).ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Missing partition type for partition spec {}",
+                            spec_id
+                        ))
+                    })?;
+
+                    let data_file_json =
+                        serialize_data_file_to_json(df, partition_type, format_version)
+                            .map_err(to_datafusion_error)?;
+
+                    serde_json::to_string(&SerializedFileWithSpec {
+                        spec_id,
+                        file_json: data_file_json,
+                    })
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to serialize delete file metadata for spec {}: {e}",
+                            spec_id
+                        ))
+                    })
                 })
                 .collect::<DFResult<Vec<String>>>()?;
 
@@ -571,7 +602,10 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(result_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            result_schema,
+            stream,
+        )))
     }
 }
 

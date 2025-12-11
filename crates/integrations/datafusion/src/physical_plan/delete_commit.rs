@@ -36,12 +36,14 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
+use iceberg::Catalog;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::Catalog;
+use iceberg::writer::base_writer::position_delete_writer::position_delete_schema;
 
 use super::delete_write::DELETE_FILES_COL_NAME;
+use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
 use crate::to_datafusion_error;
 
 /// Column name for the count of deleted rows in output
@@ -222,9 +224,9 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
         // Note: We don't clone the table here because we refresh it from the catalog
         // at commit time to get the latest state for validation.
 
-        let spec_id = self.table.metadata().default_partition_spec_id();
-        let partition_type = self.table.metadata().default_partition_type().clone();
-        let current_schema = self.table.metadata().current_schema().clone();
+        let partition_types = build_partition_type_map(&self.table)?;
+        let delete_schema = position_delete_schema(self.table.metadata().current_schema_id())
+            .map_err(to_datafusion_error)?;
 
         // Process the input and commit delete files
         let stream = futures::stream::once(async move {
@@ -259,8 +261,28 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
                     .into_iter()
                     .flatten()
                     .map(|f| -> DFResult<DataFile> {
-                        deserialize_data_file_from_json(f, spec_id, &partition_type, &current_schema)
-                            .map_err(to_datafusion_error)
+                        let serialized: SerializedFileWithSpec =
+                            serde_json::from_str(f).map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to parse delete file payload: {e}"
+                                ))
+                            })?;
+
+                        let partition_type =
+                            partition_types.get(&serialized.spec_id).ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "Partition spec {} not found while committing deletes",
+                                    serialized.spec_id
+                                ))
+                            })?;
+
+                        deserialize_data_file_from_json(
+                            &serialized.file_json,
+                            serialized.spec_id,
+                            partition_type,
+                            &delete_schema,
+                        )
+                        .map_err(to_datafusion_error)
                     })
                     .collect::<DFResult<Vec<_>>>()?;
 
@@ -312,7 +334,10 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema,
+            stream,
+        )))
     }
 }
 

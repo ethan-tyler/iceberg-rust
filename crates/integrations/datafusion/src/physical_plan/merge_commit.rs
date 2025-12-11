@@ -37,16 +37,17 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
+use iceberg::Catalog;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::Catalog;
+use iceberg::writer::base_writer::position_delete_writer::position_delete_schema;
 
 use super::merge::{
-    MERGE_DATA_FILES_COL, MERGE_DELETE_FILES_COL, MERGE_DELETED_COUNT_COL,
-    MERGE_DPP_APPLIED_COL, MERGE_DPP_PARTITION_COUNT_COL, MERGE_INSERTED_COUNT_COL,
-    MERGE_UPDATED_COUNT_COL,
+    MERGE_DATA_FILES_COL, MERGE_DELETE_FILES_COL, MERGE_DELETED_COUNT_COL, MERGE_DPP_APPLIED_COL,
+    MERGE_DPP_PARTITION_COUNT_COL, MERGE_INSERTED_COUNT_COL, MERGE_UPDATED_COUNT_COL,
 };
+use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
 use crate::to_datafusion_error;
 
 /// Output column names for merge result
@@ -130,7 +131,11 @@ impl IcebergMergeCommitExec {
             Field::new(MERGE_RESULT_UPDATED_COL, DataType::UInt64, false),
             Field::new(MERGE_RESULT_DELETED_COL, DataType::UInt64, false),
             Field::new(MERGE_RESULT_DPP_APPLIED_COL, DataType::Boolean, false),
-            Field::new(MERGE_RESULT_DPP_PARTITION_COUNT_COL, DataType::UInt64, false),
+            Field::new(
+                MERGE_RESULT_DPP_PARTITION_COUNT_COL,
+                DataType::UInt64,
+                false,
+            ),
         ]))
     }
 
@@ -146,14 +151,19 @@ impl IcebergMergeCommitExec {
         let updated_array = Arc::new(UInt64Array::from(vec![updated])) as ArrayRef;
         let deleted_array = Arc::new(UInt64Array::from(vec![deleted])) as ArrayRef;
         let dpp_applied_array = Arc::new(BooleanArray::from(vec![dpp_applied])) as ArrayRef;
-        let dpp_partition_count_array = Arc::new(UInt64Array::from(vec![dpp_partition_count])) as ArrayRef;
+        let dpp_partition_count_array =
+            Arc::new(UInt64Array::from(vec![dpp_partition_count])) as ArrayRef;
 
         RecordBatch::try_from_iter_with_nullable(vec![
             (MERGE_RESULT_INSERTED_COL, inserted_array, false),
             (MERGE_RESULT_UPDATED_COL, updated_array, false),
             (MERGE_RESULT_DELETED_COL, deleted_array, false),
             (MERGE_RESULT_DPP_APPLIED_COL, dpp_applied_array, false),
-            (MERGE_RESULT_DPP_PARTITION_COUNT_COL, dpp_partition_count_array, false),
+            (
+                MERGE_RESULT_DPP_PARTITION_COUNT_COL,
+                dpp_partition_count_array,
+                false,
+            ),
         ])
         .map_err(|e| {
             DataFusionError::ArrowError(
@@ -249,9 +259,11 @@ impl ExecutionPlan for IcebergMergeCommitExec {
         let baseline_snapshot_id = self.baseline_snapshot_id;
         let table_ident = self.table.identifier().clone();
 
-        let spec_id = self.table.metadata().default_partition_spec_id();
-        let partition_type = self.table.metadata().default_partition_type().clone();
+        // Build partition type map for proper deserialization with partition evolution
+        let partition_types = build_partition_type_map(&self.table)?;
         let current_schema = self.table.metadata().current_schema().clone();
+        let delete_schema = position_delete_schema(self.table.metadata().current_schema_id())
+            .map_err(to_datafusion_error)?;
 
         // Process the input and commit files
         let stream = futures::stream::once(async move {
@@ -398,14 +410,29 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     dpp_partition_count = dpp_partition_count_array.value(0);
                 }
 
-                // Parse data files from newline-delimited JSON
+                // Parse data files from newline-delimited JSON with partition spec wrapper
                 for data_files_str in data_files_array.iter().flatten() {
                     for json_line in data_files_str.lines() {
                         if !json_line.trim().is_empty() {
+                            let serialized: SerializedFileWithSpec =
+                                serde_json::from_str(json_line).map_err(|e| {
+                                    DataFusionError::Execution(format!(
+                                        "Failed to parse data file payload: {e}"
+                                    ))
+                                })?;
+
+                            let partition_type =
+                                partition_types.get(&serialized.spec_id).ok_or_else(|| {
+                                    DataFusionError::Execution(format!(
+                                        "Partition spec {} not found while committing merge",
+                                        serialized.spec_id
+                                    ))
+                                })?;
+
                             let df = deserialize_data_file_from_json(
-                                json_line,
-                                spec_id,
-                                &partition_type,
+                                &serialized.file_json,
+                                serialized.spec_id,
+                                partition_type,
                                 &current_schema,
                             )
                             .map_err(to_datafusion_error)?;
@@ -414,15 +441,30 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                     }
                 }
 
-                // Parse delete files from newline-delimited JSON
+                // Parse delete files from newline-delimited JSON with partition spec wrapper
                 for delete_files_str in delete_files_array.iter().flatten() {
                     for json_line in delete_files_str.lines() {
                         if !json_line.trim().is_empty() {
+                            let serialized: SerializedFileWithSpec =
+                                serde_json::from_str(json_line).map_err(|e| {
+                                    DataFusionError::Execution(format!(
+                                        "Failed to parse delete file payload: {e}"
+                                    ))
+                                })?;
+
+                            let partition_type =
+                                partition_types.get(&serialized.spec_id).ok_or_else(|| {
+                                    DataFusionError::Execution(format!(
+                                        "Partition spec {} not found while committing merge",
+                                        serialized.spec_id
+                                    ))
+                                })?;
+
                             let df = deserialize_data_file_from_json(
-                                json_line,
-                                spec_id,
-                                &partition_type,
-                                &current_schema,
+                                &serialized.file_json,
+                                serialized.spec_id,
+                                partition_type,
+                                &delete_schema,
                             )
                             .map_err(to_datafusion_error)?;
                             delete_files.push(df);
@@ -478,11 +520,20 @@ impl ExecutionPlan for IcebergMergeCommitExec {
                 .await
                 .map_err(to_datafusion_error)?;
 
-            Self::make_stats_batch(total_inserted, total_updated, total_deleted, dpp_applied, dpp_partition_count)
+            Self::make_stats_batch(
+                total_inserted,
+                total_updated,
+                total_deleted,
+                dpp_applied,
+                dpp_partition_count,
+            )
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }
 

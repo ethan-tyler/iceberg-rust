@@ -53,11 +53,13 @@
 mod action;
 
 pub use action::*;
+pub use evolve_partition::EvolvePartitionAction;
 pub use overwrite::OverwriteAction;
 pub use replace_partitions::ReplacePartitionsAction;
 pub use row_delta::RowDeltaAction;
 mod append;
 mod delete;
+mod evolve_partition;
 mod overwrite;
 mod replace_partitions;
 mod row_delta;
@@ -268,6 +270,35 @@ impl Transaction {
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
+    }
+
+    /// Creates a partition evolution action.
+    ///
+    /// This action allows adding a new partition spec to the table and optionally
+    /// setting it as the default for new writes. Existing data files retain their
+    /// original partition spec.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::spec::{Transform, UnboundPartitionSpec};
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    ///
+    /// // Add a new partition spec and set it as default
+    /// let new_spec = UnboundPartitionSpec::builder()
+    ///     .add_partition_field(1, "year", Transform::Year)?
+    ///     .build();
+    ///
+    /// let action = tx.evolve_partition_spec()
+    ///     .add_spec(new_spec)
+    ///     .set_default();
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    pub fn evolve_partition_spec(&self) -> EvolvePartitionAction {
+        EvolvePartitionAction::new()
     }
 
     /// Commit transaction.

@@ -30,10 +30,15 @@
 //!
 //! # Known Limitations
 //!
-//! - **Partition evolution**: DELETE on tables with multiple partition specs (partition
-//!   evolution) returns `NotImplemented`. This guard prevents producing incorrect delete
-//!   files that would use the wrong partition spec.
 //! - **V1 tables**: Position deletes require Iceberg format version 2.
+//!
+//! # Partition Evolution
+//!
+//! DELETE file serialization tracks partition spec IDs via [`crate::partition_utils`],
+//! enabling correct serialization/deserialization across DataFusion executors. However,
+//! **full DML support for tables with evolved partition specs is not yet implemented**.
+//! Operations that span files from multiple partition specs may fail with errors like
+//! "Partition value is not compatible with partition type".
 //!
 //! # Usage
 //!
@@ -210,7 +215,8 @@ pub fn parse_predicate(where_clause: &str) -> DFResult<Expr> {
     match &statements[0] {
         datafusion::sql::parser::Statement::Statement(stmt) => {
             if let datafusion::sql::sqlparser::ast::Statement::Query(query) = stmt.as_ref() {
-                if let datafusion::sql::sqlparser::ast::SetExpr::Select(select) = query.body.as_ref()
+                if let datafusion::sql::sqlparser::ast::SetExpr::Select(select) =
+                    query.body.as_ref()
                 {
                     if let Some(_selection) = &select.selection {
                         // Convert SQL AST to DataFusion Expr

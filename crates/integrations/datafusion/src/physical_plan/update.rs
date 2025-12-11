@@ -39,13 +39,16 @@ use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use datafusion::common::DFSchema;
+use datafusion::common::DataFusionError;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::planner::create_physical_expr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
@@ -66,6 +69,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
 use crate::to_datafusion_error;
 
 /// Column name for serialized data files in output
@@ -167,10 +171,11 @@ impl IcebergUpdateExec {
         let count_array =
             Arc::new(datafusion::arrow::array::UInt64Array::from(vec![count])) as ArrayRef;
 
-        RecordBatch::try_new(
-            Self::make_output_schema(),
-            vec![data_files_array, delete_files_array, count_array],
-        )
+        RecordBatch::try_new(Self::make_output_schema(), vec![
+            data_files_array,
+            delete_files_array,
+            count_array,
+        ])
         .map_err(|e| {
             DataFusionError::ArrowError(
                 Box::new(e),
@@ -263,7 +268,10 @@ impl ExecutionPlan for IcebergUpdateExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }
 
@@ -298,7 +306,9 @@ async fn execute_update(
     }
 
     // Set up writers
-    let partition_type = table.metadata().default_partition_type().clone();
+    // Build partition type map for proper serialization with partition evolution
+    let partition_types = build_partition_type_map(&table)?;
+    let current_spec_id = table.metadata().default_partition_spec_id();
     let format_version = table.metadata().format_version();
     let file_io = table.file_io().clone();
 
@@ -393,9 +403,8 @@ async fn execute_update(
 
         // Read batches from this file - stream to prevent OOM
         let reader = iceberg::arrow::ArrowReaderBuilder::new(file_io.clone()).build();
-        let task_stream =
-            Box::pin(futures::stream::iter(vec![Ok(task_without_predicate)]))
-                as iceberg::scan::FileScanTaskStream;
+        let task_stream = Box::pin(futures::stream::iter(vec![Ok(task_without_predicate)]))
+            as iceberg::scan::FileScanTaskStream;
         let mut batch_stream = reader
             .read(task_stream)
             .map_err(to_datafusion_error)?
@@ -444,11 +453,8 @@ async fn execute_update(
                     .map_err(to_datafusion_error)?;
 
                 // Write position deletes for original rows
-                let delete_batch = make_position_delete_batch(
-                    &file_path,
-                    &positions,
-                    delete_schema.clone(),
-                )?;
+                let delete_batch =
+                    make_position_delete_batch(&file_path, &positions, delete_schema.clone())?;
                 delete_file_writer
                     .write(delete_batch)
                     .await
@@ -491,11 +497,8 @@ async fn execute_update(
                     .map_err(to_datafusion_error)?;
 
                 // Write position deletes for original rows
-                let delete_batch = make_position_delete_batch(
-                    &file_path,
-                    &positions,
-                    delete_schema.clone(),
-                )?;
+                let delete_batch =
+                    make_position_delete_batch(&file_path, &positions, delete_schema.clone())?;
                 delete_file_writer
                     .write(delete_batch)
                     .await
@@ -518,18 +521,47 @@ async fn execute_update(
         .await
         .map_err(to_datafusion_error)?;
 
-    // Serialize to JSON
+    // Serialize to JSON with partition spec wrapper for partition evolution support
+    let partition_type = partition_types.get(&current_spec_id).ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "Missing partition type for current partition spec {}",
+            current_spec_id
+        ))
+    })?;
+
     let data_files_json: Vec<String> = data_files
         .into_iter()
-        .map(|df| serialize_data_file_to_json(df, &partition_type, format_version))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(to_datafusion_error)?;
+        .map(|df| {
+            let file_json = serialize_data_file_to_json(df, partition_type, format_version)
+                .map_err(to_datafusion_error)?;
+            serde_json::to_string(&SerializedFileWithSpec {
+                spec_id: current_spec_id,
+                file_json,
+            })
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to serialize data file metadata: {e}"
+                ))
+            })
+        })
+        .collect::<DFResult<Vec<_>>>()?;
 
     let delete_files_json: Vec<String> = delete_files
         .into_iter()
-        .map(|df| serialize_data_file_to_json(df, &partition_type, format_version))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(to_datafusion_error)?;
+        .map(|df| {
+            let file_json = serialize_data_file_to_json(df, partition_type, format_version)
+                .map_err(to_datafusion_error)?;
+            serde_json::to_string(&SerializedFileWithSpec {
+                spec_id: current_spec_id,
+                file_json,
+            })
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to serialize delete file metadata: {e}"
+                ))
+            })
+        })
+        .collect::<DFResult<Vec<_>>>()?;
 
     IcebergUpdateExec::make_result_batch(data_files_json, delete_files_json, total_count)
 }
@@ -556,7 +588,11 @@ fn build_physical_expressions(
             .cloned()
             .reduce(|a, b| a.and(b))
             .unwrap();
-        Some(create_physical_expr(&combined, &df_schema, &execution_props)?)
+        Some(create_physical_expr(
+            &combined,
+            &df_schema,
+            &execution_props,
+        )?)
     };
 
     // Build physical assignment expressions

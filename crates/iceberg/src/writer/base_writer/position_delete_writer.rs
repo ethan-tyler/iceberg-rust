@@ -36,6 +36,51 @@ pub const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2147483546;
 /// Field ID for pos column in position delete files.
 pub const POSITION_DELETE_POS_FIELD_ID: i32 = 2147483545;
 
+use crate::spec::{NestedField, PrimitiveType, Schema, Type};
+
+/// Creates the Iceberg schema for position delete files.
+///
+/// Position delete files have a spec-defined schema with two required fields:
+/// - `file_path` (String): The path to the data file containing the deleted row
+/// - `pos` (Long): The 0-based position (row number) within the data file
+///
+/// The field IDs are fixed by the Iceberg spec:
+/// - file_path: 2147483546
+/// - pos: 2147483545
+///
+/// # Arguments
+///
+/// * `schema_id` - The schema ID to assign to the returned schema (typically the
+///   table's current schema ID)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use iceberg::writer::base_writer::position_delete_writer::position_delete_schema;
+///
+/// let schema = position_delete_schema(1)?;
+/// assert_eq!(schema.fields().len(), 2);
+/// ```
+pub fn position_delete_schema(schema_id: i32) -> crate::Result<Schema> {
+    Schema::builder()
+        .with_schema_id(schema_id)
+        .with_fields(vec![
+            NestedField::required(
+                POSITION_DELETE_FILE_PATH_FIELD_ID,
+                "file_path",
+                Type::Primitive(PrimitiveType::String),
+            )
+            .into(),
+            NestedField::required(
+                POSITION_DELETE_POS_FIELD_ID,
+                "pos",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into(),
+        ])
+        .build()
+}
+
 /// Config for `PositionDeleteFileWriter`.
 #[derive(Clone, Debug)]
 pub struct PositionDeleteWriterConfig {
@@ -209,8 +254,7 @@ where
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Position delete file_path column must have field ID metadata (expected {})",
-                        POSITION_DELETE_FILE_PATH_FIELD_ID
+                        "Position delete file_path column must have field ID metadata (expected {POSITION_DELETE_FILE_PATH_FIELD_ID})"
                     ),
                 )
             })?;
@@ -220,8 +264,7 @@ where
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Position delete file_path field ID must be {}, got {}",
-                    expected_file_path_id, file_path_field_id
+                    "Position delete file_path field ID must be {expected_file_path_id}, got {file_path_field_id}"
                 ),
             ));
         }
@@ -233,8 +276,7 @@ where
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Position delete pos column must have field ID metadata (expected {})",
-                        POSITION_DELETE_POS_FIELD_ID
+                        "Position delete pos column must have field ID metadata (expected {POSITION_DELETE_POS_FIELD_ID})"
                     ),
                 )
             })?;
@@ -244,8 +286,7 @@ where
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Position delete pos field ID must be {}, got {}",
-                    expected_pos_id, pos_field_id
+                    "Position delete pos field ID must be {expected_pos_id}, got {pos_field_id}"
                 ),
             ));
         }
