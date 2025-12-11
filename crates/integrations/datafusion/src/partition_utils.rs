@@ -56,11 +56,15 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use datafusion::common::{DataFusionError, Result as DFResult};
-use iceberg::spec::{PartitionSpec, StructType, TableMetadata};
+use futures::TryStreamExt;
+use iceberg::spec::{PartitionSpec, Struct, StructType, TableMetadata};
 use iceberg::table::Table;
 use serde::{Deserialize, Serialize};
+
+use crate::to_datafusion_error;
 
 /// Wrapper for serialized data files that preserves partition spec ID.
 ///
@@ -160,6 +164,83 @@ fn partition_type_for_spec(spec: &PartitionSpec, metadata: &TableMetadata) -> Op
                 .schemas_iter()
                 .find_map(|schema| spec.partition_type(schema).ok())
         })
+}
+
+/// Information about a data file's partition, used to route deletes to the correct writer.
+///
+/// This struct captures the partition information from a file's manifest entry,
+/// which is essential for partition-evolution-aware operations. When a table has
+/// evolved its partition spec, files may have different partition specs, and we
+/// need to preserve the original spec_id and partition values when writing
+/// position delete files.
+#[derive(Clone, Debug)]
+pub(crate) struct FilePartitionInfo {
+    /// The partition spec ID under which the file was written
+    pub(crate) spec_id: i32,
+    /// The partition values (struct of partition field values)
+    pub(crate) partition: Struct,
+    /// The partition spec (needed to build PartitionKey for writer)
+    pub(crate) partition_spec: Arc<PartitionSpec>,
+}
+
+/// Builds a mapping from file path to partition info by scanning all manifests.
+///
+/// This function scans the table's current snapshot to get all data files and their
+/// associated partition information. This mapping is used during delete/update/merge
+/// operations to route position deletes to the correct partition-specific delete file.
+///
+/// # Partition Evolution Support
+///
+/// Each file's partition spec is obtained from the `FileScanTask.partition_spec` field,
+/// which carries the spec under which the file was originally written. This enables
+/// correct handling of tables with partition evolution - position delete files are
+/// written with the same spec_id as the data files they reference.
+///
+/// # Arguments
+///
+/// * `table` - The Iceberg table to scan
+///
+/// # Returns
+///
+/// A HashMap mapping file path to FilePartitionInfo for all data files in the
+/// current snapshot.
+pub(crate) async fn build_file_partition_map(
+    table: &Table,
+) -> DFResult<HashMap<String, FilePartitionInfo>> {
+    use iceberg::scan::FileScanTask;
+
+    let mut file_partitions = HashMap::new();
+
+    // Build a scan to get all files in the current snapshot
+    let scan = table
+        .scan()
+        .select_all()
+        .build()
+        .map_err(to_datafusion_error)?;
+
+    // Get all file scan tasks
+    let file_tasks: Vec<FileScanTask> = scan
+        .plan_files()
+        .await
+        .map_err(to_datafusion_error)?
+        .try_collect()
+        .await
+        .map_err(to_datafusion_error)?;
+
+    // Build mapping from file path to partition info
+    for task in file_tasks {
+        if let (Some(partition), Some(partition_spec)) = (task.partition, task.partition_spec) {
+            let info = FilePartitionInfo {
+                spec_id: partition_spec.spec_id(),
+                partition,
+                partition_spec,
+            };
+
+            file_partitions.insert(task.data_file_path, info);
+        }
+    }
+
+    Ok(file_partitions)
 }
 
 #[cfg(test)]

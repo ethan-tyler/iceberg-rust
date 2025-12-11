@@ -267,31 +267,34 @@ fn unpartitioned(default_spec_id: i32) -> Self {
 
 ---
 
-## Recommended Next Steps
+## Fixes Applied
 
-### Immediate (Before Production Use)
+| Issue | Status | Details |
+|-------|--------|---------|
+| **Unpartitioned spec_id** | ✅ Fixed | `PartitionGroupKey::unpartitioned()` now accepts actual spec_id |
+| **MERGE partition evolution** | ✅ Fixed | Uses `get_partition_key_for_file()` from file partition map |
+| **Shared partition utilities** | ✅ Added | `FilePartitionInfo` and `build_file_partition_map()` in partition_utils.rs |
+
+## Remaining Work
+
+Full partition evolution support for DML operations requires additional fixes in the core iceberg transaction layer (`crates/iceberg/src/transaction/snapshot.rs`). The partition validation during commit assumes all files use the current partition spec, which fails for tables with evolved partition specs.
 
 | Priority | Issue | Action |
 |----------|-------|--------|
-| **P0** | Unpartitioned spec_id | Fix `PartitionGroupKey::unpartitioned()` to accept actual spec_id |
-| **P0** | MERGE partition evolution | Update `compute_partition_key_from_target_row` to use per-file spec/partition |
-| **P0** | Test coverage | Add multi-spec integration test for UPDATE/DELETE/MERGE |
-
-### Follow-up (Phase 2)
-
-| Priority | Issue | Action |
-|----------|-------|--------|
-| **P1** | Remove partition evolution guards | After fixes, enable DML on evolved tables |
-| **P1** | Cross-engine validation | Test that Spark/Trino can read tables modified by iceberg-rust |
+| **P0** | Transaction layer spec_id handling | Update commit path to handle files with different spec_ids |
+| **P1** | Multi-spec integration tests | Enable `#[ignore]` tests after transaction layer fixes |
+| **P1** | Cross-engine validation | Test Spark/Trino interoperability |
 
 ---
 
 ## Conclusion
 
-Phase 1 is **substantially complete** but has **critical partition evolution bugs** that must be fixed before production use on tables with evolved partition specs. For single-spec tables (the common case), the implementation is production-ready.
+Phase 1 DataFusion layer fixes are **complete**. The following improvements were made:
 
-The three identified issues are well-scoped and can be addressed in a focused follow-up sprint.
+1. Position delete files now use correct spec_id for unpartitioned tables
+2. MERGE operations use file's original partition info (not recomputed)
+3. Shared partition utilities for partition-evolution-aware operations
 
-**Recommendation:**
-1. Fix the three partition evolution issues before enabling `#[ignore]` tests
-2. Then proceed to Phase 2 planning
+**Full partition evolution support** requires additional work in the core iceberg transaction layer. The existing `#[ignore]` tests should remain ignored until that work is complete.
+
+For **single-spec tables** (the common case), the implementation is **production-ready**.

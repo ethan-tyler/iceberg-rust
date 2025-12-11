@@ -80,11 +80,10 @@ use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::expr::{Predicate, Reference};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
-    DataFile, DataFileFormat, PartitionKey, PartitionSpecRef, PrimitiveType, SchemaRef,
-    TableProperties, Transform, serialize_data_file_to_json,
+    DataFile, DataFileFormat, PartitionKey, SchemaRef, TableProperties, Transform,
+    serialize_data_file_to_json,
 };
 use iceberg::table::Table;
-use iceberg::transform::create_transform_function;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
@@ -104,7 +103,9 @@ use crate::merge::{
     MatchedAction, MergeStats, NotMatchedAction, NotMatchedBySourceAction, WhenMatchedClause,
     WhenNotMatchedBySourceClause, WhenNotMatchedClause,
 };
-use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
+use crate::partition_utils::{
+    FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
+};
 use crate::to_datafusion_error;
 
 /// Internal metadata column name for file path (added during scan)
@@ -383,10 +384,10 @@ struct MergeWriters {
     delete_writer: MergeDeleteWriter,
     /// Schema for position delete batches
     delete_schema: ArrowSchemaRef,
-    /// Partition spec for computing partition keys
-    partition_spec: PartitionSpecRef,
     /// Iceberg schema for partition key computation
     iceberg_schema: SchemaRef,
+    /// Mapping from file path to partition info (for partition evolution support)
+    file_partition_map: HashMap<String, FilePartitionInfo>,
 }
 
 /// Data file writer that supports both partitioned and unpartitioned tables.
@@ -408,6 +409,13 @@ impl MergeWriters {
         let partition_spec = table.metadata().default_partition_spec().clone();
         let iceberg_schema = table.metadata().current_schema().clone();
         let is_partitioned = !partition_spec.is_unpartitioned();
+
+        // Build file partition map for partition-evolution-aware deletes
+        let file_partition_map = if is_partitioned {
+            build_file_partition_map(table).await?
+        } else {
+            HashMap::new()
+        };
 
         let target_file_size = table
             .metadata()
@@ -521,8 +529,8 @@ impl MergeWriters {
             partition_splitter,
             delete_writer,
             delete_schema,
-            partition_spec,
             iceberg_schema,
+            file_partition_map,
         })
     }
 
@@ -582,77 +590,31 @@ impl MergeWriters {
         self.partition_splitter.is_some()
     }
 
-    /// Computes partition key from a row in the joined batch (using target columns).
+    /// Gets the partition key for a file path from the file partition map.
     ///
-    /// This is used for position deletes on partitioned tables - we need to know
-    /// which partition the deleted row belongs to.
-    fn compute_partition_key_from_target_row(
-        &self,
-        batch: &RecordBatch,
-        row_idx: usize,
-        _target_schema: &ArrowSchemaRef,
-    ) -> DFResult<Option<PartitionKey>> {
+    /// This method is partition-evolution-aware: it uses the file's original
+    /// partition spec and partition values from the manifest, rather than
+    /// recomputing them from the current partition spec.
+    ///
+    /// For unpartitioned tables, returns None.
+    /// For partitioned tables, looks up the file in the file_partition_map.
+    fn get_partition_key_for_file(&self, file_path: &str) -> DFResult<Option<PartitionKey>> {
         if !self.is_partitioned() {
             return Ok(None);
         }
 
-        // Extract partition values from the target row columns
-        // The partition columns are in the batch with target_ prefix
-        let mut partition_values = Vec::new();
-        for field in self.partition_spec.fields() {
-            let source_field = self
-                .iceberg_schema
-                .field_by_id(field.source_id)
-                .ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "Partition source field {} not found in schema",
-                        field.source_id
-                    ))
-                })?;
+        let file_info = self.file_partition_map.get(file_path).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "No partition info found for file '{}'. This may indicate a consistency issue \
+                 between the scan and write phases.",
+                file_path
+            ))
+        })?;
 
-            // Find the column in the batch (with target_ prefix)
-            let col_name = format!("{}{}", TARGET_PREFIX, source_field.name);
-            let col_idx = batch.schema().index_of(&col_name).map_err(|_| {
-                DataFusionError::Internal(format!(
-                    "Partition column {} not found in batch",
-                    col_name
-                ))
-            })?;
-
-            let col = batch.column(col_idx);
-
-            // Get the primitive type from the source field
-            let primitive_type = source_field.field_type.as_primitive_type().ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "Partition source field {} is not a primitive type",
-                    source_field.name
-                ))
-            })?;
-
-            // Extract the datum (literal + type) from the column
-            let datum = extract_datum_from_column(col, row_idx, primitive_type)?;
-
-            // Create transform function and apply it
-            let transform_fn =
-                create_transform_function(&field.transform).map_err(to_datafusion_error)?;
-            let transformed = transform_fn
-                .transform_literal(&datum)
-                .map_err(to_datafusion_error)?
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Transform produced null for partition value".into())
-                })?;
-
-            // Convert datum's primitive literal to Literal for the partition struct
-            let literal = iceberg::spec::Literal::Primitive(transformed.literal().clone());
-            partition_values.push(literal);
-        }
-
-        let partition_struct =
-            iceberg::spec::Struct::from_iter(partition_values.into_iter().map(Some));
         Ok(Some(PartitionKey::new(
-            (*self.partition_spec).clone(),
+            (*file_info.partition_spec).clone(),
             self.iceberg_schema.clone(),
-            partition_struct,
+            file_info.partition.clone(),
         )))
     }
 
@@ -678,87 +640,6 @@ impl MergeWriters {
 
         Ok((data_files, delete_files))
     }
-}
-
-/// Extracts a Datum (value + type) from an array column at the given row index.
-///
-/// This is used for partition key computation where we need both the value and its type
-/// to properly apply transforms.
-fn extract_datum_from_column(
-    col: &ArrayRef,
-    row_idx: usize,
-    primitive_type: &PrimitiveType,
-) -> DFResult<iceberg::spec::Datum> {
-    use datafusion::arrow::array::*;
-
-    if col.is_null(row_idx) {
-        return Err(DataFusionError::Internal(
-            "Cannot extract partition value from null".into(),
-        ));
-    }
-
-    let datum = match primitive_type {
-        PrimitiveType::Int => {
-            let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                DataFusionError::Internal("Expected Int32Array for Int type".into())
-            })?;
-            iceberg::spec::Datum::int(arr.value(row_idx))
-        }
-        PrimitiveType::Long => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                DataFusionError::Internal("Expected Int64Array for Long type".into())
-            })?;
-            iceberg::spec::Datum::long(arr.value(row_idx))
-        }
-        PrimitiveType::String => {
-            // Try both StringArray and LargeStringArray
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                iceberg::spec::Datum::string(arr.value(row_idx))
-            } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-                iceberg::spec::Datum::string(arr.value(row_idx))
-            } else {
-                return Err(DataFusionError::Internal(
-                    "Expected StringArray or LargeStringArray for String type".into(),
-                ));
-            }
-        }
-        PrimitiveType::Date => {
-            let arr = col.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
-                DataFusionError::Internal("Expected Date32Array for Date type".into())
-            })?;
-            iceberg::spec::Datum::date(arr.value(row_idx))
-        }
-        PrimitiveType::Timestamp => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "Expected TimestampMicrosecondArray for Timestamp type".into(),
-                    )
-                })?;
-            iceberg::spec::Datum::timestamp_micros(arr.value(row_idx))
-        }
-        PrimitiveType::Timestamptz => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "Expected TimestampMicrosecondArray for Timestamptz type".into(),
-                    )
-                })?;
-            iceberg::spec::Datum::timestamptz_micros(arr.value(row_idx))
-        }
-        _ => {
-            return Err(DataFusionError::NotImplemented(format!(
-                "Partition value extraction not implemented for {:?}",
-                primitive_type
-            )));
-        }
-    };
-
-    Ok(datum)
 }
 
 /// Execution plan for MERGE operations using Copy-on-Write semantics.
@@ -1852,14 +1733,15 @@ async fn process_matched_rows(
 /// Writes position deletes with partition awareness.
 ///
 /// For unpartitioned tables, writes all deletes at once.
-/// For partitioned tables, groups deletes by partition key and writes each group separately.
+/// For partitioned tables, groups deletes by partition key (from file's original partition)
+/// and writes each group separately. This is partition-evolution-aware.
 #[allow(clippy::too_many_arguments)]
 async fn write_position_deletes_partitioned(
-    batch: &RecordBatch,
+    _batch: &RecordBatch,
     indices: &[usize],
     file_path_col: &StringArray,
     row_pos_col: &Int64Array,
-    target_schema: &ArrowSchemaRef,
+    _target_schema: &ArrowSchemaRef,
     writers: &mut MergeWriters,
 ) -> DFResult<()> {
     if indices.is_empty() {
@@ -1879,22 +1761,24 @@ async fn write_position_deletes_partitioned(
         let delete_batch = make_position_delete_batch(&file_paths, &positions, delete_schema)?;
         writers.write_deletes(delete_batch, None).await?;
     } else {
-        // Partitioned: group deletes by partition key and write each group
-        // For simplicity, compute partition key for each row and group
+        // Partitioned: group deletes by partition key (from file's original partition)
+        // Use file partition map for partition-evolution-aware grouping
         let mut partition_groups: HashMap<String, (Vec<String>, Vec<i64>, PartitionKey)> =
             HashMap::new();
 
         for &idx in indices {
+            let file_path = file_path_col.value(idx).to_string();
+            let pos = row_pos_col.value(idx);
+
+            // Get partition key from file's original partition info (not computed from row values)
             let partition_key = writers
-                .compute_partition_key_from_target_row(batch, idx, target_schema)?
+                .get_partition_key_for_file(&file_path)?
                 .ok_or_else(|| {
                     DataFusionError::Internal("Expected partition key for partitioned table".into())
                 })?;
 
             // Use partition key's string representation as group key
             let key_str = format!("{:?}", partition_key.data());
-            let file_path = file_path_col.value(idx).to_string();
-            let pos = row_pos_col.value(idx);
 
             let entry = partition_groups
                 .entry(key_str)

@@ -40,9 +40,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, execute_input_stream,
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use iceberg::spec::{
-    DataFileFormat, PartitionSpec, SchemaRef as IcebergSchemaRef, Struct, TableProperties,
+    DataFileFormat, SchemaRef as IcebergSchemaRef, Struct, TableProperties,
     serialize_data_file_to_json,
 };
 use iceberg::table::Table;
@@ -59,7 +59,9 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::delete_scan::{DELETE_FILE_PATH_COL, DELETE_POS_COL};
-use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
+use crate::partition_utils::{
+    FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
+};
 use crate::to_datafusion_error;
 
 /// Column name for serialized delete files in output
@@ -88,9 +90,12 @@ impl PartitionGroupKey {
     }
 
     /// Creates a key for unpartitioned tables.
-    fn unpartitioned() -> Self {
+    ///
+    /// Uses the actual default partition spec ID rather than assuming 0,
+    /// to correctly handle tables that have evolved from partitioned to unpartitioned.
+    fn unpartitioned(default_spec_id: i32) -> Self {
         Self {
-            spec_id: 0,
+            spec_id: default_spec_id,
             partition: Struct::empty(),
         }
     }
@@ -109,17 +114,6 @@ impl Hash for PartitionGroupKey {
         self.spec_id.hash(state);
         self.partition.hash(state);
     }
-}
-
-/// Information about a data file's partition, used to route deletes to the correct writer.
-#[derive(Clone, Debug)]
-struct FilePartitionInfo {
-    /// The partition spec ID
-    spec_id: i32,
-    /// The partition values
-    partition: Struct,
-    /// The partition spec (needed to build PartitionKey for writer)
-    partition_spec: Arc<PartitionSpec>,
 }
 
 /// Type alias for the position delete writer builder.
@@ -153,6 +147,8 @@ struct PartitionedDeleteCollector {
     table_schema: IcebergSchemaRef,
     /// Whether the table is unpartitioned
     is_unpartitioned: bool,
+    /// The default partition spec ID (used for unpartitioned tables)
+    default_spec_id: i32,
 }
 
 impl PartitionedDeleteCollector {
@@ -163,6 +159,7 @@ impl PartitionedDeleteCollector {
         delete_config: PositionDeleteWriterConfig,
         table_schema: IcebergSchemaRef,
         is_unpartitioned: bool,
+        default_spec_id: i32,
     ) -> Self {
         Self {
             writers: HashMap::new(),
@@ -171,16 +168,17 @@ impl PartitionedDeleteCollector {
             delete_config,
             table_schema,
             is_unpartitioned,
+            default_spec_id,
         }
     }
 
     /// Gets the partition key for a given file path.
     ///
-    /// For unpartitioned tables, returns the unpartitioned key.
+    /// For unpartitioned tables, returns the unpartitioned key with the actual default spec ID.
     /// For partitioned tables, looks up the partition from the file mapping.
     fn get_partition_key(&self, file_path: &str) -> DFResult<PartitionGroupKey> {
         if self.is_unpartitioned {
-            return Ok(PartitionGroupKey::unpartitioned());
+            return Ok(PartitionGroupKey::unpartitioned(self.default_spec_id));
         }
 
         self.file_partitions
@@ -477,7 +475,9 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
 
         // Create the write stream
         let stream = futures::stream::once(async move {
-            let is_unpartitioned = table.metadata().default_partition_spec().is_unpartitioned();
+            let default_partition_spec = table.metadata().default_partition_spec();
+            let is_unpartitioned = default_partition_spec.is_unpartitioned();
+            let default_spec_id = default_partition_spec.spec_id();
 
             // Build file-to-partition mapping for partitioned tables
             // Each file's partition spec is obtained from FileScanTask.partition_spec,
@@ -558,6 +558,7 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                 delete_config,
                 table_schema,
                 is_unpartitioned,
+                default_spec_id,
             );
 
             // Process input batches
@@ -607,52 +608,6 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             stream,
         )))
     }
-}
-
-/// Builds a mapping from file path to partition info by scanning all manifests.
-///
-/// This function scans the table's current snapshot to get all data files and their
-/// associated partition information. This mapping is used during delete writing to
-/// route position deletes to the correct partition-specific delete file.
-///
-/// Supports partition evolution: each file's partition spec is obtained from the
-/// `FileScanTask.partition_spec` field, which carries the spec under which the file
-/// was originally written.
-async fn build_file_partition_map(table: &Table) -> DFResult<HashMap<String, FilePartitionInfo>> {
-    use iceberg::scan::FileScanTask;
-
-    let mut file_partitions = HashMap::new();
-
-    // Build a scan to get all files in the current snapshot
-    let scan = table
-        .scan()
-        .select_all()
-        .build()
-        .map_err(to_datafusion_error)?;
-
-    // Get all file scan tasks
-    let file_tasks: Vec<FileScanTask> = scan
-        .plan_files()
-        .await
-        .map_err(to_datafusion_error)?
-        .try_collect()
-        .await
-        .map_err(to_datafusion_error)?;
-
-    // Build mapping from file path to partition info
-    for task in file_tasks {
-        if let (Some(partition), Some(partition_spec)) = (task.partition, task.partition_spec) {
-            let info = FilePartitionInfo {
-                spec_id: partition_spec.spec_id(),
-                partition,
-                partition_spec,
-            };
-
-            file_partitions.insert(task.data_file_path, info);
-        }
-    }
-
-    Ok(file_partitions)
 }
 
 #[cfg(test)]
