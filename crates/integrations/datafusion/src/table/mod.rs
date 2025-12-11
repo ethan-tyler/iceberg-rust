@@ -135,11 +135,7 @@ impl IcebergTableProvider {
     ///     .await?;
     /// println!("Deleted {} rows", deleted_count);
     /// ```
-    pub async fn delete(
-        &self,
-        _state: &dyn Session,
-        predicate: Option<Expr>,
-    ) -> DFResult<u64> {
+    pub async fn delete(&self, _state: &dyn Session, predicate: Option<Expr>) -> DFResult<u64> {
         use datafusion::execution::context::TaskContext;
         use datafusion::physical_plan::collect;
 
@@ -164,10 +160,7 @@ impl IcebergTableProvider {
         ));
 
         // Step 2: Write position delete files
-        let delete_write = Arc::new(IcebergDeleteWriteExec::new(
-            table.clone(),
-            delete_scan,
-        ));
+        let delete_write = Arc::new(IcebergDeleteWriteExec::new(table.clone(), delete_scan));
 
         // Step 3: Coalesce partitions for single commit
         let coalesce = Arc::new(CoalescePartitionsExec::new(delete_write));
@@ -224,7 +217,11 @@ impl IcebergTableProvider {
     pub async fn update(&self) -> Result<UpdateBuilder> {
         // Load fresh table metadata from catalog
         let table = self.catalog.load_table(&self.table_ident).await?;
-        Ok(UpdateBuilder::new(table, self.catalog.clone(), self.schema.clone()))
+        Ok(UpdateBuilder::new(
+            table,
+            self.catalog.clone(),
+            self.schema.clone(),
+        ))
     }
 
     /// Creates a MergeBuilder for MERGE (UPSERT) operations on the table.

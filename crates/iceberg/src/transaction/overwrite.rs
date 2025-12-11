@@ -357,7 +357,7 @@ impl OverwriteAction {
             let snapshot = table.metadata().snapshot_by_id(current).ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!("Snapshot {} not found in table metadata", current),
+                    format!("Snapshot {current} not found in table metadata"),
                 )
             })?;
 
@@ -369,8 +369,7 @@ impl OverwriteAction {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
-                            "validate_from_snapshot {} is not an ancestor of current snapshot {}",
-                            start_snapshot_id, current_id
+                            "validate_from_snapshot {start_snapshot_id} is not an ancestor of current snapshot {current_id}"
                         ),
                     ));
                 }
@@ -397,7 +396,7 @@ impl OverwriteAction {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Snapshot {} not found", snapshot_id),
+                        format!("Snapshot {snapshot_id} not found"),
                     )
                 })?;
 
@@ -428,8 +427,7 @@ impl OverwriteAction {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
                             format!(
-                                "Conflicting data file added in snapshot {}: {} in partition {:?}",
-                                snapshot_id,
+                                "Conflicting data file added in snapshot {snapshot_id}: {} in partition {:?}",
                                 entry.data_file().file_path(),
                                 entry.data_file().partition()
                             ),
@@ -458,7 +456,7 @@ impl OverwriteAction {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Snapshot {} not found", snapshot_id),
+                        format!("Snapshot {snapshot_id} not found"),
                     )
                 })?;
 
@@ -547,7 +545,7 @@ impl TransactionAction for OverwriteAction {
 
         // Create the partition filter from the row filter
         let partition_filter =
-            self.create_partition_filter(&schema, &partition_spec, self.case_sensitive)?;
+            self.create_partition_filter(schema, partition_spec, self.case_sensitive)?;
 
         // Perform conflict detection if enabled
         if self.validate_no_conflicting_data || self.validate_no_conflicting_deletes {
@@ -569,7 +567,7 @@ impl TransactionAction for OverwriteAction {
                     table,
                     &snapshots_since,
                     &partition_filter,
-                    &partition_spec,
+                    partition_spec,
                 )
                 .await?;
             }
@@ -579,7 +577,7 @@ impl TransactionAction for OverwriteAction {
                     table,
                     &snapshots_since,
                     &partition_filter,
-                    &partition_spec,
+                    partition_spec,
                 )
                 .await?;
             }
@@ -1015,9 +1013,10 @@ mod tests {
         let result = Arc::new(action).commit(&table).await;
         assert!(result.is_err());
         match result {
-            Err(err) => assert!(err
-                .to_string()
-                .contains("Added file does not match overwrite filter")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("Added file does not match overwrite filter")
+            ),
             Ok(_) => panic!("Expected error"),
         }
     }

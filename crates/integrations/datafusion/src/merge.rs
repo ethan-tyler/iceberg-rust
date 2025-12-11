@@ -78,13 +78,13 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
-use iceberg::table::Table;
+use datafusion::physical_plan::ExecutionPlan;
 use iceberg::Catalog;
+use iceberg::table::Table;
 
 /// Statistics returned after a MERGE operation completes.
 ///
@@ -476,7 +476,11 @@ impl MergeBuilder {
         }
 
         // Check for duplicate column assignments in WHEN clauses
-        Self::check_duplicate_assignments(&self.when_matched, &self.when_not_matched, &self.when_not_matched_by_source)?;
+        Self::check_duplicate_assignments(
+            &self.when_matched,
+            &self.when_not_matched,
+            &self.when_not_matched_by_source,
+        )?;
 
         // Validate partition column updates are not allowed
         let partition_spec = self.table.metadata().default_partition_spec();
@@ -500,11 +504,7 @@ impl MergeBuilder {
         // Build map of partition column names
         let partition_column_names: std::collections::HashSet<String> = partition_source_ids
             .iter()
-            .filter_map(|id| {
-                iceberg_schema
-                    .field_by_id(*id)
-                    .map(|f| f.name.to_string())
-            })
+            .filter_map(|id| iceberg_schema.field_by_id(*id).map(|f| f.name.to_string()))
             .collect();
 
         // Check UPDATE assignments in WHEN MATCHED clauses

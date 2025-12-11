@@ -30,6 +30,7 @@ use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, 
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
+use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::planner::create_physical_expr;
@@ -39,7 +40,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use datafusion::common::DFSchema;
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
@@ -297,8 +297,8 @@ async fn scan_file_for_deletes(
     let batch_stream = reader.read(task_stream).map_err(to_datafusion_error)?;
 
     // Track row offset and lazily-built physical filter across batches
-    use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     // Determine if we have filters to apply
     let has_filters = !filter_exprs.is_empty();
@@ -357,15 +357,15 @@ async fn scan_file_for_deletes(
                             // Filter failed to build - fail the operation explicitly.
                             // Silent skips are a correctness hazard: users must know if
                             // their DELETE wasn't fully applied.
-                            return Err(datafusion::error::DataFusionError::Execution(
-                                msg.clone(),
-                            ));
+                            return Err(datafusion::error::DataFusionError::Execution(msg.clone()));
                         }
                     };
 
                     if positions.is_empty() {
                         // Return empty batch instead of None to keep stream structure simple
-                        Ok(RecordBatch::new_empty(IcebergDeleteScanExec::make_output_schema()))
+                        Ok(RecordBatch::new_empty(
+                            IcebergDeleteScanExec::make_output_schema(),
+                        ))
                     } else {
                         IcebergDeleteScanExec::make_delete_batch(&file_path, positions)
                     }
@@ -459,11 +459,11 @@ mod tests {
 
     #[test]
     fn test_make_delete_batch() {
-        let batch = IcebergDeleteScanExec::make_delete_batch(
-            "s3://bucket/table/data/file.parquet",
-            vec![0, 1, 5, 10],
-        )
-        .unwrap();
+        let batch =
+            IcebergDeleteScanExec::make_delete_batch("s3://bucket/table/data/file.parquet", vec![
+                0, 1, 5, 10,
+            ])
+            .unwrap();
 
         assert_eq!(batch.num_rows(), 4);
         assert_eq!(batch.num_columns(), 2);
@@ -489,11 +489,8 @@ mod tests {
 
     #[test]
     fn test_make_delete_batch_empty() {
-        let batch = IcebergDeleteScanExec::make_delete_batch(
-            "s3://bucket/file.parquet",
-            vec![],
-        )
-        .unwrap();
+        let batch =
+            IcebergDeleteScanExec::make_delete_batch("s3://bucket/file.parquet", vec![]).unwrap();
 
         assert_eq!(batch.num_rows(), 0);
     }

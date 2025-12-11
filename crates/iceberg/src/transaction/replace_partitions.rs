@@ -294,7 +294,7 @@ impl ReplacePartitionsAction {
             let snapshot = table.metadata().snapshot_by_id(current).ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!("Snapshot {} not found in table metadata", current),
+                    format!("Snapshot {current} not found in table metadata"),
                 )
             })?;
 
@@ -308,8 +308,7 @@ impl ReplacePartitionsAction {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
-                            "validate_from_snapshot {} is not an ancestor of current snapshot {}",
-                            start_snapshot_id, current_id
+                            "validate_from_snapshot {start_snapshot_id} is not an ancestor of current snapshot {current_id}"
                         ),
                     ));
                 }
@@ -335,7 +334,7 @@ impl ReplacePartitionsAction {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Snapshot {} not found", snapshot_id),
+                        format!("Snapshot {snapshot_id} not found"),
                     )
                 })?;
 
@@ -398,7 +397,7 @@ impl ReplacePartitionsAction {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Snapshot {} not found", snapshot_id),
+                        format!("Snapshot {snapshot_id} not found"),
                     )
                 })?;
 
@@ -459,7 +458,7 @@ impl TransactionAction for ReplacePartitionsAction {
         let partition_spec = table.metadata().default_partition_spec();
 
         // Extract partitions to replace from added files
-        let partitions_to_replace = self.extract_partition_values(&partition_spec);
+        let partitions_to_replace = self.extract_partition_values(partition_spec);
 
         if partitions_to_replace.is_empty() {
             return Err(Error::new(
@@ -490,7 +489,7 @@ impl TransactionAction for ReplacePartitionsAction {
                     table,
                     &snapshots_since,
                     &partitions_to_replace,
-                    &partition_spec,
+                    partition_spec,
                 )
                 .await?;
             }
@@ -501,7 +500,7 @@ impl TransactionAction for ReplacePartitionsAction {
                     table,
                     &snapshots_since,
                     &partitions_to_replace,
-                    &partition_spec,
+                    partition_spec,
                 )
                 .await?;
             }
@@ -591,7 +590,10 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
                 }
 
                 // Check if this file's partition matches any partition we're replacing
-                if self.partitions_to_replace.contains(entry.data_file().partition()) {
+                if self
+                    .partitions_to_replace
+                    .contains(entry.data_file().partition())
+                {
                     // Create a delete entry for this file, preserving sequence info
                     let delete_entry = ManifestEntry::builder()
                         .status(ManifestStatus::Deleted)
@@ -1053,9 +1055,10 @@ mod tests {
         // Should fail because validate_from_snapshot was not called
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert!(err
-            .message()
-            .contains("validate_from_snapshot() must be called"));
+        assert!(
+            err.message()
+                .contains("validate_from_snapshot() must be called")
+        );
     }
 
     #[tokio::test]

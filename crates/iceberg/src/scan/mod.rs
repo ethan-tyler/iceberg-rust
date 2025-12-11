@@ -723,7 +723,7 @@ pub mod tests {
             }
         }
 
-        fn next_manifest_file(&self) -> OutputFile {
+        pub fn next_manifest_file(&self) -> OutputFile {
             self.table
                 .file_io()
                 .new_output(format!(

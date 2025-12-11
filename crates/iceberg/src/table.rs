@@ -332,10 +332,7 @@ impl Table {
             Some(value) => value.parse::<T>().map(Some).map_err(|e| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!(
-                        "Failed to parse property '{}' value '{}': {}",
-                        key, value, e
-                    ),
+                    format!("Failed to parse property '{key}' value '{value}': {e}"),
                 )
             }),
             None => Ok(None),

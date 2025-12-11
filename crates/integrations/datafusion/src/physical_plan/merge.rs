@@ -1372,6 +1372,7 @@ fn compute_dpp_filter(
             .iter()
             .filter(|f| f.transform != Transform::Identity)
             .collect();
+        #[cfg(debug_assertions)]
         if !non_identity.is_empty() {
             let transforms: Vec<_> = non_identity
                 .iter()

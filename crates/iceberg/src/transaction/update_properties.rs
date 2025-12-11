@@ -85,8 +85,7 @@ impl UpdatePropertiesAction {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Cannot set reserved property '{}'. Reserved properties are managed by Iceberg internally.",
-                        key
+                        "Cannot set reserved property '{key}'. Reserved properties are managed by Iceberg internally."
                     ),
                 ));
             }
@@ -98,8 +97,7 @@ impl UpdatePropertiesAction {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Cannot remove reserved property '{}'. Reserved properties are managed by Iceberg internally.",
-                        key
+                        "Cannot remove reserved property '{key}'. Reserved properties are managed by Iceberg internally."
                     ),
                 ));
             }

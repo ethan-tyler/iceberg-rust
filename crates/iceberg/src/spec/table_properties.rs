@@ -263,8 +263,7 @@ impl std::str::FromStr for WriteMode {
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Invalid write mode: '{}'. Expected 'copy-on-write', 'cow', 'merge-on-read', or 'mor'",
-                    s
+                    "Invalid write mode: '{s}'. Expected 'copy-on-write', 'cow', 'merge-on-read', or 'mor'"
                 ),
             )),
         }
@@ -312,8 +311,7 @@ impl std::str::FromStr for WriteDistributionMode {
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Invalid write distribution mode: '{}'. Expected 'none', 'hash', or 'range'",
-                    s
+                    "Invalid write distribution mode: '{s}'. Expected 'none', 'hash', or 'range'"
                 ),
             )),
         }

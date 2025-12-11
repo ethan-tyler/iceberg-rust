@@ -221,8 +221,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestContentType,
-        MAIN_BRANCH, Struct,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        ManifestContentType, Struct,
     };
     use crate::transaction::tests::make_v2_minimal_table;
     use crate::transaction::{Transaction, TransactionAction};

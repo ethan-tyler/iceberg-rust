@@ -22,10 +22,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::{col, lit};
-use iceberg::memory::{MemoryCatalog, MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
+use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use iceberg_datafusion::{IcebergCatalogProvider, IcebergTableProvider};
@@ -81,7 +81,11 @@ async fn setup_test_table(
         .unwrap();
 
     let client = Arc::new(iceberg_catalog);
-    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await.unwrap());
+    let catalog = Arc::new(
+        IcebergCatalogProvider::try_new(client.clone())
+            .await
+            .unwrap(),
+    );
 
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
@@ -123,13 +127,10 @@ fn bench_update_selectivity(c: &mut Criterion) {
                 let (client, namespace, ctx) =
                     setup_test_table(&namespace_name, "bench_table", row_count).await;
 
-                let provider = IcebergTableProvider::try_new(
-                    client.clone(),
-                    namespace.clone(),
-                    "bench_table",
-                )
-                .await
-                .unwrap();
+                let provider =
+                    IcebergTableProvider::try_new(client.clone(), namespace.clone(), "bench_table")
+                        .await
+                        .unwrap();
 
                 // UPDATE rows where id < filter_threshold
                 let _count = provider
@@ -165,13 +166,10 @@ fn bench_update_row_count(c: &mut Criterion) {
                 let (client, namespace, ctx) =
                     setup_test_table(&namespace_name, "bench_table", row_count).await;
 
-                let provider = IcebergTableProvider::try_new(
-                    client.clone(),
-                    namespace.clone(),
-                    "bench_table",
-                )
-                .await
-                .unwrap();
+                let provider =
+                    IcebergTableProvider::try_new(client.clone(), namespace.clone(), "bench_table")
+                        .await
+                        .unwrap();
 
                 // Full table UPDATE
                 let _count = provider
@@ -209,13 +207,10 @@ fn bench_delete_operations(c: &mut Criterion) {
                 let (client, namespace, ctx) =
                     setup_test_table(&namespace_name, "bench_table", row_count).await;
 
-                let provider = IcebergTableProvider::try_new(
-                    client.clone(),
-                    namespace.clone(),
-                    "bench_table",
-                )
-                .await
-                .unwrap();
+                let provider =
+                    IcebergTableProvider::try_new(client.clone(), namespace.clone(), "bench_table")
+                        .await
+                        .unwrap();
 
                 // DELETE rows where id < filter_threshold
                 let _count = provider
