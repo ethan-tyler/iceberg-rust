@@ -596,7 +596,7 @@ impl RewriteDataFilesAction {
     /// Set a cancellation token for aborting the operation.
     ///
     /// When the token is cancelled, external executors should stop processing
-    /// new file groups and return early. Use [`is_cancelled()`] to check
+    /// new file groups and return early. Use [`Self::is_cancelled`] to check
     /// the token state during execution.
     ///
     /// **Note:** This is used by external query engines (like DataFusion) that
@@ -940,5 +940,46 @@ mod tests {
 
         // Callback is set
         assert!(action.progress_callback.is_some());
+    }
+
+    #[test]
+    fn test_sort_order_resolution_with_explicit_order() {
+        use crate::spec::{NullOrder, SortDirection, SortField, SortOrder, Transform};
+
+        let sort_field = SortField::builder()
+            .source_id(1)
+            .direction(SortDirection::Ascending)
+            .null_order(NullOrder::First)
+            .transform(Transform::Identity)
+            .build();
+
+        let sort_order = SortOrder::builder()
+            .with_sort_field(sort_field)
+            .build_unbound()
+            .unwrap();
+
+        let action = RewriteDataFilesAction::new().sort_by(sort_order.clone());
+
+        match &action.strategy {
+            RewriteStrategy::Sort {
+                sort_order: Some(order),
+            } => {
+                assert_eq!(order.fields.len(), 1);
+                assert_eq!(order.fields[0].source_id, 1);
+            }
+            _ => panic!("Expected Sort strategy with sort order"),
+        }
+    }
+
+    #[test]
+    fn test_sort_uses_table_default_when_none_provided() {
+        let action = RewriteDataFilesAction::new().sort();
+
+        match &action.strategy {
+            RewriteStrategy::Sort { sort_order: None } => {
+                // Expected: None means use table's default
+            }
+            _ => panic!("Expected Sort strategy with None sort_order"),
+        }
     }
 }
