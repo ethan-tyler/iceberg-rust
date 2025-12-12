@@ -52,7 +52,7 @@ use iceberg::Catalog;
 use iceberg::table::Table;
 use iceberg::transaction::rewrite_data_files::{
     CompactionProgressEvent, ProgressCallback, RewriteDataFilesOptions, RewriteDataFilesPlanner,
-    RewriteDataFilesResult,
+    RewriteDataFilesResult, RewriteStrategy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -65,6 +65,8 @@ use crate::physical_plan::compaction_commit::IcebergCompactionCommitExec;
 pub struct CompactionOptions {
     /// Core rewrite options (file sizes, thresholds).
     pub rewrite_options: Option<RewriteDataFilesOptions>,
+    /// Rewrite strategy (bin-pack or sort).
+    pub strategy: Option<RewriteStrategy>,
     /// Cancellation token for aborting the operation.
     pub cancellation_token: Option<CancellationToken>,
     /// Progress callback for monitoring.
@@ -90,6 +92,13 @@ impl CompactionOptions {
     #[must_use]
     pub fn with_progress_callback(mut self, callback: ProgressCallback) -> Self {
         self.progress_callback = Some(callback);
+        self
+    }
+
+    /// Set rewrite strategy.
+    #[must_use]
+    pub fn with_strategy(mut self, strategy: RewriteStrategy) -> Self {
+        self.strategy = Some(strategy);
         self
     }
 }
@@ -253,5 +262,14 @@ mod tests {
         assert!(options.rewrite_options.is_some());
         assert!(options.cancellation_token.is_some());
         assert!(options.progress_callback.is_some());
+    }
+
+    #[test]
+    fn test_compaction_options_with_strategy() {
+        let options = CompactionOptions::default()
+            .with_strategy(RewriteStrategy::Sort { sort_order: None });
+
+        assert!(options.strategy.is_some());
+        assert!(options.strategy.as_ref().unwrap().is_sort());
     }
 }
