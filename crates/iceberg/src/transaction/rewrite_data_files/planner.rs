@@ -41,7 +41,7 @@ use super::options::RewriteDataFilesOptions;
 use super::partition_filter::PartitionFilterEvaluator;
 
 /// Result of the planning phase.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RewriteDataFilesPlan {
     /// File groups to be rewritten.
     pub file_groups: Vec<FileGroup>,

@@ -18,6 +18,7 @@
 mod catalog;
 pub use catalog::*;
 
+pub mod compaction;
 pub mod delete;
 pub mod merge;
 pub mod update;

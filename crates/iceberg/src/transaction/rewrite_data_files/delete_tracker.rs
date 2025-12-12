@@ -57,7 +57,7 @@ use crate::{Error, ErrorKind, Result};
 /// Tracks which data files each delete file references.
 ///
 /// Used to identify dangling delete files after compaction.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct DeleteTracker {
     /// Position deletes indexed by their referenced data file path.
     /// Only populated when the position delete has `referenced_data_file` set.

@@ -107,6 +107,7 @@ pub struct IcebergCompactionExec {
     progress_callback: Option<ProgressCallback>,
 }
 
+#[allow(dead_code)]
 impl IcebergCompactionExec {
     /// Create a new compaction executor.
     pub fn new(table: Table, plan: RewriteDataFilesPlan) -> DFResult<Self> {
