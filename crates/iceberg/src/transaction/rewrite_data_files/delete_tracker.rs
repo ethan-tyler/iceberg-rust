@@ -82,6 +82,10 @@ pub(crate) struct DeleteTracker {
 }
 
 /// Key for partition-based lookup: (partition_value, partition_spec_id).
+///
+/// Note: This tuple alias predates the `partition_filter::PartitionKey` struct.
+/// The struct uses `(spec_id, partition)` ordering while this uses `(partition, spec_id)`.
+/// Consider unifying to use the struct in a future refactor for consistency.
 type PartitionKey = (Option<Struct>, i32);
 
 /// Reference to a delete file with its path.
@@ -123,16 +127,16 @@ impl DeleteTracker {
         let spec_id = entry.data_file.partition_spec_id;
 
         // Derive is_unpartitioned from the entry's spec_id, failing if unknown
-        let is_unpartitioned = self.spec_unpartitioned.get(&spec_id).copied().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Delete file '{}' references unknown partition spec ID {}. \
-                     This may indicate table metadata corruption.",
-                    path, spec_id
-                ),
-            )
-        })?;
+        let is_unpartitioned = self
+            .spec_unpartitioned
+            .get(&spec_id)
+            .copied()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Delete file '{path}' references unknown partition spec ID {spec_id}. This may indicate table metadata corruption."),
+                )
+            })?;
 
         let partition_key = if is_unpartitioned {
             (None, spec_id)

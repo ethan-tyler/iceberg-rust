@@ -734,9 +734,7 @@ mod tests {
         let partition_match = Struct::from_iter([Some(Literal::int(expected_bucket))]);
         assert!(
             evaluator.matches(&partition_match).unwrap(),
-            "Expected bucket {} to match for user_id={}",
-            expected_bucket,
-            user_id
+            "Expected bucket {expected_bucket} to match for user_id={user_id}",
         );
 
         // Verify all other buckets do NOT match
@@ -745,10 +743,7 @@ mod tests {
                 let partition = Struct::from_iter([Some(Literal::int(bucket))]);
                 assert!(
                     !evaluator.matches(&partition).unwrap(),
-                    "Bucket {} should NOT match for user_id={}, only bucket {} should",
-                    bucket,
-                    user_id,
-                    expected_bucket
+                    "Bucket {bucket} should NOT match for user_id={user_id}, only bucket {expected_bucket} should",
                 );
             }
         }

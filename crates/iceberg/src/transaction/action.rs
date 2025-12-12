@@ -23,7 +23,7 @@ use async_trait::async_trait;
 
 use crate::table::Table;
 use crate::transaction::Transaction;
-use crate::{Result, TableRequirement, TableUpdate};
+use crate::{Catalog, Result, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
 /// A boxed, thread-safe reference to a `TransactionAction`.
 pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;
@@ -100,6 +100,45 @@ impl ActionCommit {
     /// Consumes and returns the list of table requirements.
     pub fn take_requirements(&mut self) -> Vec<TableRequirement> {
         take(&mut self.requirements)
+    }
+
+    /// Commits this action to the catalog.
+    ///
+    /// This is a convenience method for creating a `TableCommit` from this `ActionCommit`
+    /// and submitting it to the catalog. It consumes the updates and requirements from
+    /// this `ActionCommit`.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_ident` - The identifier of the table to update
+    /// * `catalog` - The catalog to commit the changes to
+    ///
+    /// # Returns
+    ///
+    /// The updated table after the commit is applied, or an error if the commit fails.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (action_commit, result) = committer.commit(results).await?;
+    /// let updated_table = action_commit
+    ///     .commit_to_catalog(table.identifier().clone(), catalog.as_ref())
+    ///     .await?;
+    /// ```
+    pub async fn commit_to_catalog(
+        mut self,
+        table_ident: TableIdent,
+        catalog: &dyn Catalog,
+    ) -> Result<Table> {
+        let updates = self.take_updates();
+        let requirements = self.take_requirements();
+
+        let table_commit = TableCommit::builder()
+            .ident(table_ident)
+            .updates(updates)
+            .requirements(requirements)
+            .build();
+        catalog.update_table(table_commit).await
     }
 }
 

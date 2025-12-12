@@ -80,9 +80,10 @@
 //!
 //! # Partition Evolution
 //!
-//! Only files written with the **current default partition spec** are considered
-//! for deletion. Files written with older partition specs (from partition evolution)
-//! are preserved, even if they would logically match the filter.
+//! The overwrite filter is projected against every partition spec referenced by
+//! manifests in the current snapshot. Files written with older partition specs
+//! are still evaluated and deleted when their partitions could match the filter,
+//! preventing stale data after partition evolution.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -330,6 +331,26 @@ impl OverwriteAction {
             .bind(partition_schema, case_sensitive)
     }
 
+    /// Create partition filters for all partition specs in the table.
+    ///
+    /// The row filter is bound once per spec and projected using that spec's
+    /// transforms so that manifests written under older specs can be evaluated
+    /// safely.
+    fn create_partition_filters_for_all_specs(
+        &self,
+        table: &Table,
+        schema: &Arc<Schema>,
+        case_sensitive: bool,
+    ) -> Result<HashMap<i32, BoundPredicate>> {
+        let mut filters = HashMap::new();
+        for spec in table.metadata().partition_specs_iter() {
+            let spec_id = spec.spec_id();
+            let filter = self.create_partition_filter(schema, spec, case_sensitive)?;
+            filters.insert(spec_id, filter);
+        }
+        Ok(filters)
+    }
+
     /// Find all snapshots between start_snapshot_id and current_snapshot_id (exclusive of start).
     fn find_snapshots_since(
         table: &Table,
@@ -384,11 +405,8 @@ impl OverwriteAction {
     async fn validate_no_conflicting_data_in_snapshots(
         table: &Table,
         snapshot_ids: &[i64],
-        partition_filter: &BoundPredicate,
-        partition_spec: &PartitionSpecRef,
+        partition_filters: &HashMap<i32, BoundPredicate>,
     ) -> Result<()> {
-        let evaluator = ExpressionEvaluator::new(partition_filter.clone());
-
         for &snapshot_id in snapshot_ids {
             let snapshot = table
                 .metadata()
@@ -408,9 +426,18 @@ impl OverwriteAction {
                 if manifest_file.content != ManifestContentType::Data {
                     continue;
                 }
-                if manifest_file.partition_spec_id != partition_spec.spec_id() {
-                    continue;
-                }
+
+                let spec_id = manifest_file.partition_spec_id;
+                let partition_filter = partition_filters.get(&spec_id).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Manifest '{}' references partition spec id {} which does not exist in table metadata",
+                            manifest_file.manifest_path, spec_id
+                        ),
+                    )
+                })?;
+                let evaluator = ExpressionEvaluator::new(partition_filter.clone());
 
                 let manifest = manifest_file.load_manifest(table.file_io()).await?;
 
@@ -444,11 +471,8 @@ impl OverwriteAction {
     async fn validate_no_conflicting_deletes_in_snapshots(
         table: &Table,
         snapshot_ids: &[i64],
-        partition_filter: &BoundPredicate,
-        partition_spec: &PartitionSpecRef,
+        partition_filters: &HashMap<i32, BoundPredicate>,
     ) -> Result<()> {
-        let evaluator = ExpressionEvaluator::new(partition_filter.clone());
-
         for &snapshot_id in snapshot_ids {
             let snapshot = table
                 .metadata()
@@ -468,9 +492,18 @@ impl OverwriteAction {
                 if manifest_file.content != ManifestContentType::Deletes {
                     continue;
                 }
-                if manifest_file.partition_spec_id != partition_spec.spec_id() {
-                    continue;
-                }
+
+                let spec_id = manifest_file.partition_spec_id;
+                let partition_filter = partition_filters.get(&spec_id).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Manifest '{}' references partition spec id {} which does not exist in table metadata",
+                            manifest_file.manifest_path, spec_id
+                        ),
+                    )
+                })?;
+                let evaluator = ExpressionEvaluator::new(partition_filter.clone());
 
                 let manifest = manifest_file.load_manifest(table.file_io()).await?;
 
@@ -543,9 +576,21 @@ impl TransactionAction for OverwriteAction {
         let schema = table.metadata().current_schema();
         let partition_spec = table.metadata().default_partition_spec();
 
-        // Create the partition filter from the row filter
-        let partition_filter =
-            self.create_partition_filter(schema, partition_spec, self.case_sensitive)?;
+        // Create partition filters for all specs so we can evaluate manifests written under
+        // older specs as well.
+        let partition_filters =
+            self.create_partition_filters_for_all_specs(table, schema, self.case_sensitive)?;
+
+        let default_spec_id = partition_spec.spec_id();
+        let default_partition_filter =
+            partition_filters.get(&default_spec_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "Default partition spec id {default_spec_id} missing from partition filters"
+                    ),
+                )
+            })?;
 
         // Perform conflict detection if enabled
         if self.validate_no_conflicting_data || self.validate_no_conflicting_deletes {
@@ -566,8 +611,7 @@ impl TransactionAction for OverwriteAction {
                 Self::validate_no_conflicting_data_in_snapshots(
                     table,
                     &snapshots_since,
-                    &partition_filter,
-                    partition_spec,
+                    &partition_filters,
                 )
                 .await?;
             }
@@ -576,8 +620,7 @@ impl TransactionAction for OverwriteAction {
                 Self::validate_no_conflicting_deletes_in_snapshots(
                     table,
                     &snapshots_since,
-                    &partition_filter,
-                    partition_spec,
+                    &partition_filters,
                 )
                 .await?;
             }
@@ -587,7 +630,7 @@ impl TransactionAction for OverwriteAction {
         if self.validate_added_files_match_filter && !self.added_data_files.is_empty() {
             Self::validate_added_files_match_partition_filter(
                 &self.added_data_files,
-                &partition_filter,
+                default_partition_filter,
             )?;
         }
 
@@ -610,10 +653,7 @@ impl TransactionAction for OverwriteAction {
         }
 
         // Create operation with filter-based deletion logic
-        let operation = OverwriteOperation {
-            partition_filter,
-            partition_spec: partition_spec.clone(),
-        };
+        let operation = OverwriteOperation { partition_filters };
 
         snapshot_producer
             .commit(operation, DefaultManifestProcess)
@@ -623,8 +663,7 @@ impl TransactionAction for OverwriteAction {
 
 /// Operation implementation for filter-based overwrite.
 struct OverwriteOperation {
-    partition_filter: BoundPredicate,
-    partition_spec: PartitionSpecRef,
+    partition_filters: HashMap<i32, BoundPredicate>,
 }
 
 impl SnapshotProduceOperation for OverwriteOperation {
@@ -647,7 +686,6 @@ impl SnapshotProduceOperation for OverwriteOperation {
             )
             .await?;
 
-        let evaluator = ExpressionEvaluator::new(self.partition_filter.clone());
         let mut entries_to_delete = Vec::new();
 
         for manifest_file in manifest_list.entries() {
@@ -656,10 +694,17 @@ impl SnapshotProduceOperation for OverwriteOperation {
                 continue;
             }
 
-            // Skip manifests that don't match current partition spec
-            if manifest_file.partition_spec_id != self.partition_spec.spec_id() {
-                continue;
-            }
+            let spec_id = manifest_file.partition_spec_id;
+            let partition_filter = self.partition_filters.get(&spec_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Manifest '{}' references partition spec id {} which does not exist in table metadata",
+                        manifest_file.manifest_path, spec_id
+                    ),
+                )
+            })?;
+            let evaluator = ExpressionEvaluator::new(partition_filter.clone());
 
             let manifest = manifest_file
                 .load_manifest(snapshot_producer.table.file_io())
@@ -704,7 +749,6 @@ impl SnapshotProduceOperation for OverwriteOperation {
             )
             .await?;
 
-        let evaluator = ExpressionEvaluator::new(self.partition_filter.clone());
         let mut result = Vec::new();
 
         for manifest_file in manifest_list.entries() {
@@ -714,25 +758,39 @@ impl SnapshotProduceOperation for OverwriteOperation {
                 continue;
             }
 
-            // Include data manifests with different partition spec
-            if manifest_file.partition_spec_id != self.partition_spec.spec_id() {
+            if manifest_file.content != ManifestContentType::Data {
                 result.push(manifest_file.clone());
                 continue;
             }
 
-            // For data manifests with current partition spec, check if any files
-            // do NOT match the filter (should be kept)
+            let spec_id = manifest_file.partition_spec_id;
+            let partition_filter = self.partition_filters.get(&spec_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Manifest '{}' references partition spec id {} which does not exist in table metadata",
+                        manifest_file.manifest_path, spec_id
+                    ),
+                )
+            })?;
+            let evaluator = ExpressionEvaluator::new(partition_filter.clone());
+
+            // For data manifests, check if any files do NOT match the filter (should be kept)
             let manifest = manifest_file
                 .load_manifest(snapshot_producer.table.file_io())
                 .await?;
 
-            let has_files_to_keep = manifest.entries().iter().any(|entry| {
+            let mut has_files_to_keep = false;
+            for entry in manifest.entries() {
                 if entry.status() == ManifestStatus::Deleted {
-                    return false;
+                    continue;
                 }
                 // Keep files that don't match the filter
-                !evaluator.eval(entry.data_file()).unwrap_or(false)
-            });
+                if !evaluator.eval(entry.data_file())? {
+                    has_files_to_keep = true;
+                    break;
+                }
+            }
 
             if has_files_to_keep {
                 result.push(manifest_file.clone());
@@ -748,7 +806,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::expr::Reference;
-    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, Struct};
+    use crate::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestContentType,
+        ManifestStatus, Struct, Transform, UnboundPartitionSpec,
+    };
     use crate::transaction::tests::make_v2_minimal_table;
     use crate::transaction::{Transaction, TransactionAction};
     use crate::{TableRequirement, TableUpdate};
@@ -1055,5 +1116,110 @@ mod tests {
         // Should succeed - filter projects to AlwaysTrue which matches all partitions
         let result = Arc::new(action).commit(&table).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_deletes_files_written_under_older_specs() {
+        // Start with a table partitioned by x (spec 0)
+        let table = make_v2_minimal_table();
+
+        // Append two files under the original spec: x=100 and x=200
+        let file_x_100 = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/table/data/x=100/file1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::from_iter([Some(Literal::long(100))]))
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        let file_x_200 = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/table/data/x=200/file2.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::from_iter([Some(Literal::long(200))]))
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .add_data_files(vec![file_x_100.clone(), file_x_200.clone()]);
+
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let table =
+            Transaction::update_table_metadata(table, &action_commit.take_updates()).unwrap();
+
+        // Evolve partition spec to partition by y instead (spec 1, set as default)
+        let new_spec = UnboundPartitionSpec::builder()
+            .add_partition_field(2, "y", Transform::Identity)
+            .unwrap()
+            .build();
+
+        let tx = Transaction::new(&table);
+        let evolve = tx.evolve_partition_spec().add_spec(new_spec).set_default();
+        let mut evolve_commit = Arc::new(evolve).commit(&table).await.unwrap();
+        let table =
+            Transaction::update_table_metadata(table, &evolve_commit.take_updates()).unwrap();
+
+        // Append a file under the new spec (y=5)
+        let new_spec_id = table.metadata().default_partition_spec_id();
+        assert_ne!(new_spec_id, 0);
+
+        let file_y_5 = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/table/data/y=5/file3.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::from_iter([Some(Literal::long(5))]))
+            .partition_spec_id(new_spec_id)
+            .build()
+            .unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![file_y_5.clone()]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let table =
+            Transaction::update_table_metadata(table, &action_commit.take_updates()).unwrap();
+
+        // Overwrite where x = 100. This should delete:
+        // - file_x_100 (written under spec 0)
+        // - file_y_5   (written under spec 1, filter projects to AlwaysTrue)
+        // and keep file_x_200.
+        let filter = Reference::new("x").equal_to(Datum::long(100));
+        let tx = Transaction::new(&table);
+        let overwrite = tx.overwrite().overwrite_filter(filter);
+        let mut overwrite_commit = Arc::new(overwrite).commit(&table).await.unwrap();
+        let table =
+            Transaction::update_table_metadata(table, &overwrite_commit.take_updates()).unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), &table.metadata_ref())
+            .await
+            .unwrap();
+
+        let mut deleted_paths = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                if entry.status() == ManifestStatus::Deleted {
+                    deleted_paths.push(entry.data_file().file_path().to_string());
+                }
+            }
+        }
+
+        assert!(deleted_paths.contains(&file_x_100.file_path().to_string()));
+        assert!(deleted_paths.contains(&file_y_5.file_path().to_string()));
+        assert!(!deleted_paths.contains(&file_x_200.file_path().to_string()));
     }
 }

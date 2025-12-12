@@ -318,7 +318,7 @@ impl MergeBuilder {
     /// # Arguments
     ///
     /// * `condition` - Optional additional filter beyond the ON condition.
-    ///                 Use `None` to match all matched rows.
+    ///   Use `None` to match all matched rows.
     ///
     /// # Example
     ///
@@ -343,7 +343,7 @@ impl MergeBuilder {
     /// # Arguments
     ///
     /// * `condition` - Optional filter on source row.
-    ///                 Use `None` to match all unmatched source rows.
+    ///   Use `None` to match all unmatched source rows.
     ///
     /// # Example
     ///
@@ -369,7 +369,7 @@ impl MergeBuilder {
     /// # Arguments
     ///
     /// * `condition` - Optional filter on target row.
-    ///                 Use `None` to match all unmatched target rows.
+    ///   Use `None` to match all unmatched target rows.
     ///
     /// # Example
     ///
@@ -402,46 +402,53 @@ impl MergeBuilder {
         // Helper to find duplicates in a list of column names
         fn find_duplicate(columns: &[(String, Expr)]) -> Option<&str> {
             let mut seen = std::collections::HashSet::new();
-            columns.iter().map(|(col, _)| col).find(|&col| !seen.insert(col.as_str())).map(|v| v as _)
+            columns
+                .iter()
+                .map(|(col, _)| col)
+                .find(|&col| !seen.insert(col.as_str()))
+                .map(|v| v as _)
         }
 
         // Check WHEN MATCHED UPDATE clauses
         for (idx, clause) in when_matched.iter().enumerate() {
             if let MatchedAction::Update(assignments) = &clause.action
-                && let Some(dup) = find_duplicate(assignments) {
-                    return Err(DataFusionError::Plan(format!(
-                        "Duplicate column '{}' in WHEN MATCHED clause #{}. \
+                && let Some(dup) = find_duplicate(assignments)
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "Duplicate column '{}' in WHEN MATCHED clause #{}. \
                          Each column can only be assigned once per clause.",
-                        dup,
-                        idx + 1
-                    )));
-                }
+                    dup,
+                    idx + 1
+                )));
+            }
         }
 
         // Check WHEN NOT MATCHED INSERT clauses
         for (idx, clause) in when_not_matched.iter().enumerate() {
             if let NotMatchedAction::Insert(values) = &clause.action
-                && let Some(dup) = find_duplicate(values) {
-                    return Err(DataFusionError::Plan(format!(
-                        "Duplicate column '{}' in WHEN NOT MATCHED clause #{}. \
+                && let Some(dup) = find_duplicate(values)
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "Duplicate column '{}' in WHEN NOT MATCHED clause #{}. \
                          Each column can only be specified once per INSERT.",
-                        dup,
-                        idx + 1
-                    )));
-                }
+                    dup,
+                    idx + 1
+                )));
+            }
         }
 
         // Check WHEN NOT MATCHED BY SOURCE UPDATE clauses
         for (idx, clause) in when_not_matched_by_source.iter().enumerate() {
             if let NotMatchedBySourceAction::Update(assignments) = &clause.action
-                && let Some(dup) = find_duplicate(assignments) {
-                    return Err(DataFusionError::Plan(format!(
-                        "Duplicate column '{}' in WHEN NOT MATCHED BY SOURCE clause #{}. \
+                && let Some(dup) = find_duplicate(assignments)
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "Duplicate column '{}' in WHEN NOT MATCHED BY SOURCE clause #{}. \
                          Each column can only be assigned once per clause.",
-                        dup,
-                        idx + 1
-                    )));
-                }
+                    dup,
+                    idx + 1
+                )));
+            }
         }
 
         Ok(())
@@ -505,12 +512,13 @@ impl MergeBuilder {
                 MatchedAction::Update(assignments) => {
                     for (column_name, _) in assignments {
                         if let Some(field) = iceberg_schema.field_by_name(column_name)
-                            && partition_source_ids.contains(&field.id) {
-                                return Err(DataFusionError::Plan(format!(
-                                    "Cannot UPDATE partition column '{column_name}' in MERGE. \
+                            && partition_source_ids.contains(&field.id)
+                        {
+                            return Err(DataFusionError::Plan(format!(
+                                "Cannot UPDATE partition column '{column_name}' in MERGE. \
                                      Updating partition columns would require moving rows between partitions."
-                                )));
-                            }
+                            )));
+                        }
                     }
                 }
                 MatchedAction::UpdateAll => {
@@ -536,12 +544,13 @@ impl MergeBuilder {
             if let NotMatchedBySourceAction::Update(assignments) = &clause.action {
                 for (column_name, _) in assignments {
                     if let Some(field) = iceberg_schema.field_by_name(column_name)
-                        && partition_source_ids.contains(&field.id) {
-                            return Err(DataFusionError::Plan(format!(
-                                "Cannot UPDATE partition column '{column_name}' in MERGE. \
+                        && partition_source_ids.contains(&field.id)
+                    {
+                        return Err(DataFusionError::Plan(format!(
+                            "Cannot UPDATE partition column '{column_name}' in MERGE. \
                                  Updating partition columns would require moving rows between partitions."
-                            )));
-                        }
+                        )));
+                    }
                 }
             }
         }

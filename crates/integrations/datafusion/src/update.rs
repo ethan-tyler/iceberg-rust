@@ -203,9 +203,7 @@ impl UpdateBuilder {
         for (column_name, _expr) in &self.assignments {
             // Column must exist
             let field = iceberg_schema.field_by_name(column_name).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "Column '{column_name}' not found in table schema"
-                ))
+                DataFusionError::Plan(format!("Column '{column_name}' not found in table schema"))
             })?;
 
             // Cannot update partition source columns

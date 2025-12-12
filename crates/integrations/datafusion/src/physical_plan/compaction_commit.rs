@@ -23,18 +23,32 @@
 //! 3. Commits via `RewriteDataFilesCommitter`
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::array::{RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::datatypes::{
+    DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use futures::StreamExt;
+use iceberg::Catalog;
+use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
-use iceberg::transaction::rewrite_data_files::RewriteDataFilesPlan;
+use iceberg::transaction::rewrite_data_files::{
+    FileGroupRewriteResult, RewriteDataFilesCommitter, RewriteDataFilesPlan,
+};
+
+use super::compaction::{COMPACTION_DATA_FILES_COL, COMPACTION_GROUP_ID_COL};
+use crate::partition_utils::build_partition_type_map;
+use crate::to_datafusion_error;
 
 /// Schema for compaction commit output (metrics).
 pub fn compaction_commit_output_schema() -> ArrowSchemaRef {
@@ -54,6 +68,8 @@ pub fn compaction_commit_output_schema() -> ArrowSchemaRef {
 pub struct IcebergCompactionCommitExec {
     /// The Iceberg table being compacted.
     table: Table,
+    /// The catalog for committing changes.
+    catalog: Arc<dyn Catalog>,
     /// The compaction plan (for FileGroup metadata).
     plan: RewriteDataFilesPlan,
     /// The input execution plan (IcebergCompactionExec).
@@ -66,9 +82,17 @@ pub struct IcebergCompactionCommitExec {
 
 impl IcebergCompactionCommitExec {
     /// Create a new compaction commit executor.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - The Iceberg table being compacted
+    /// * `catalog` - The catalog for committing changes
+    /// * `plan` - The compaction plan containing file groups to rewrite
+    /// * `input` - The input execution plan (IcebergCompactionExec)
     #[allow(dead_code)]
     pub fn new(
         table: Table,
+        catalog: Arc<dyn Catalog>,
         plan: RewriteDataFilesPlan,
         input: Arc<dyn ExecutionPlan>,
     ) -> DFResult<Self> {
@@ -77,6 +101,7 @@ impl IcebergCompactionCommitExec {
 
         Ok(Self {
             table,
+            catalog,
             plan,
             input,
             output_schema,
@@ -157,6 +182,7 @@ impl ExecutionPlan for IcebergCompactionCommitExec {
 
         Ok(Arc::new(Self {
             table: self.table.clone(),
+            catalog: self.catalog.clone(),
             plan: self.plan.clone(),
             input: children[0].clone(),
             output_schema: self.output_schema.clone(),
@@ -167,25 +193,158 @@ impl ExecutionPlan for IcebergCompactionCommitExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
-                "IcebergCompactionCommitExec only supports partition 0, got {}",
-                partition
+                "IcebergCompactionCommitExec only supports partition 0, got {partition}"
             )));
         }
 
-        // TODO: Implement commit logic
-        // 1. Execute input to get (group_id, data_files_json) batches
-        // 2. Parse JSON back to DataFile entries
-        // 3. Call RewriteDataFilesCommitter::commit()
-        // 4. Return metrics batch
-        Err(DataFusionError::NotImplemented(
-            "IcebergCompactionCommitExec::execute() not yet implemented - \
-             depends on IcebergCompactionExec being fully implemented"
-                .to_string(),
-        ))
+        let table = self.table.clone();
+        let catalog = self.catalog.clone();
+        let plan = self.plan.clone();
+        let output_schema = self.output_schema.clone();
+
+        // Execute input plan
+        let input_stream = self.input.execute(0, context)?;
+
+        // Build partition type map for deserialization
+        let partition_types = build_partition_type_map(&table)?;
+        let schema = table.metadata().current_schema().clone();
+        let group_spec_ids: HashMap<u32, i32> = plan
+            .file_groups
+            .iter()
+            .map(|g| (g.group_id, g.partition_spec_id))
+            .collect();
+
+        // Create single-item stream that processes all input and commits
+        let stream = futures::stream::once(async move {
+            let mut results_by_group: HashMap<u32, Vec<DataFile>> = plan
+                .file_groups
+                .iter()
+                .map(|g| (g.group_id, Vec::new()))
+                .collect();
+
+            let mut batch_stream = input_stream;
+            while let Some(batch_result) = batch_stream.next().await {
+                let batch = batch_result.map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to execute compaction: {e}"))
+                })?;
+
+                // Get group_id and data_files columns
+                let group_id_col = batch
+                    .column_by_name(COMPACTION_GROUP_ID_COL)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("Missing group_id column".to_string())
+                    })?
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("group_id column wrong type".to_string())
+                    })?;
+
+                let data_files_col = batch
+                    .column_by_name(COMPACTION_DATA_FILES_COL)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("Missing data_files column".to_string())
+                    })?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("data_files column wrong type".to_string())
+                    })?;
+
+                // Parse each row
+                for i in 0..batch.num_rows() {
+                    let group_id = group_id_col.value(i);
+                    let data_file_json = data_files_col.value(i);
+
+                    let spec_id = *group_spec_ids.get(&group_id).ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Group {group_id} not found in compaction plan"
+                        ))
+                    })?;
+
+                    let partition_type = partition_types.get(&spec_id).ok_or_else(|| {
+                        DataFusionError::Internal(format!("No partition type for spec {spec_id}"))
+                    })?;
+
+                    // Deserialize the data file
+                    let data_file = deserialize_data_file_from_json(
+                        data_file_json,
+                        spec_id,
+                        partition_type,
+                        &schema,
+                    )
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to deserialize compacted DataFile JSON for group {group_id} (spec {spec_id}) row {i}: {e}"
+                        ))
+                    })?;
+
+                    results_by_group
+                        .get_mut(&group_id)
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(format!(
+                                "Group {group_id} not found in compaction plan"
+                            ))
+                        })?
+                        .push(data_file);
+                }
+            }
+
+            // Convert to FileGroupRewriteResult entries in plan order so that we always include
+            // groups with zero output files (valid if deletes removed all rows).
+            let results: Vec<FileGroupRewriteResult> = plan
+                .file_groups
+                .iter()
+                .map(|g| FileGroupRewriteResult {
+                    group_id: g.group_id,
+                    new_data_files: results_by_group.remove(&g.group_id).unwrap_or_default(),
+                })
+                .collect();
+
+            // Commit the compaction via RewriteDataFilesCommitter.
+            // Note: Concurrency control is handled by TableRequirement::RefSnapshotIdMatch,
+            // which is included in the ActionCommit and enforced atomically by the catalog.
+            let table_ident = table.identifier().clone();
+            let committer = RewriteDataFilesCommitter::new(&table, plan);
+            let (action_commit, result) = committer
+                .commit(results)
+                .await
+                .map_err(to_datafusion_error)?;
+
+            // Apply the commit to the catalog (this is the actual catalog write)
+            action_commit
+                .commit_to_catalog(table_ident, catalog.as_ref())
+                .await
+                .map_err(to_datafusion_error)?;
+
+            // Create output metrics batch
+            let rewritten_files_array =
+                Arc::new(UInt64Array::from(vec![result.rewritten_data_files_count]))
+                    as Arc<dyn datafusion::arrow::array::Array>;
+            let added_files_array = Arc::new(UInt64Array::from(vec![result.added_data_files_count]))
+                as Arc<dyn datafusion::arrow::array::Array>;
+            let rewritten_bytes_array = Arc::new(UInt64Array::from(vec![result.rewritten_bytes]))
+                as Arc<dyn datafusion::arrow::array::Array>;
+            let added_bytes_array = Arc::new(UInt64Array::from(vec![result.added_bytes]))
+                as Arc<dyn datafusion::arrow::array::Array>;
+
+            RecordBatch::try_new(output_schema, vec![
+                rewritten_files_array,
+                added_files_array,
+                rewritten_bytes_array,
+                added_bytes_array,
+            ])
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.output_schema.clone(),
+            stream.boxed(),
+        )))
     }
 }
 

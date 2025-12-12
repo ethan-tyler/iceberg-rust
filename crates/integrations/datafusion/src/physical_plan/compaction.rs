@@ -46,7 +46,9 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::time::Instant;
 
+use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray, UInt32Array};
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -55,14 +57,32 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use futures::{StreamExt, TryStreamExt};
+use iceberg::arrow::ArrowReaderBuilder;
+use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
+use iceberg::spec::{
+    DataContentType, DataFile, DataFileFormat, PartitionKey, PartitionSpec, Struct,
+    TableProperties, serialize_data_file_to_json,
+};
 use iceberg::table::Table;
 use iceberg::transaction::rewrite_data_files::{
-    CompactionProgressEvent, ProgressCallback, RewriteDataFilesPlan,
+    CompactionProgressEvent, FileGroup, ProgressCallback, RewriteDataFilesPlan,
 };
-use iceberg::spec::{DataFile, serialize_data_file_to_json};
-use iceberg::transaction::rewrite_data_files::FileGroup;
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::partition_utils::build_partition_type_map;
+use crate::to_datafusion_error;
 
 /// Column name for serialized data files output.
 pub const COMPACTION_DATA_FILES_COL: &str = "data_files";
@@ -234,24 +254,173 @@ impl ExecutionPlan for IcebergCompactionExec {
     ) -> DFResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
-                "IcebergCompactionExec only supports partition 0, got {}",
-                partition
+                "IcebergCompactionExec only supports partition 0, got {partition}"
             )));
         }
 
-        // TODO: Implement in Task 7
-        // Return NotImplemented to prevent silent "success" with zero output
-        Err(DataFusionError::NotImplemented(
-            "IcebergCompactionExec::execute() not yet implemented - \
-             file group reading and writing requires full implementation"
-                .to_string(),
-        ))
+        let table = self.table.clone();
+        let file_groups = self.plan.file_groups.clone();
+        let output_schema = self.output_schema.clone();
+        let cancellation_token = self.cancellation_token.clone();
+        let progress_callback = self.progress_callback.clone();
+        let total_bytes = self.plan.total_bytes;
+        let total_files = self.plan.total_data_files;
+
+        // Build partition type map for serialization
+        let partition_types = build_partition_type_map(&table)?;
+        let format_version = table.metadata().format_version();
+
+        // Emit Started event
+        if let Some(ref callback) = progress_callback {
+            callback(CompactionProgressEvent::Started {
+                total_groups: file_groups.len() as u32,
+                total_bytes,
+                total_files,
+            });
+        }
+
+        let stream = futures::stream::iter(file_groups.into_iter().enumerate())
+            .then(move |(idx, file_group)| {
+                let table = table.clone();
+                let partition_types = partition_types.clone();
+                let output_schema = output_schema.clone();
+                let cancellation_token = cancellation_token.clone();
+                let progress_callback = progress_callback.clone();
+
+                async move {
+                    let group_id = file_group.group_id;
+                    let spec_id = file_group.partition_spec_id;
+                    let input_files = file_group.data_files.len() as u32;
+                    let input_bytes = file_group.total_bytes;
+
+                    // Check cancellation before processing
+                    if cancellation_token
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    {
+                        if let Some(ref callback) = progress_callback {
+                            callback(CompactionProgressEvent::Cancelled {
+                                groups_completed: idx as u32,
+                            });
+                        }
+                        return Err(DataFusionError::Execution(
+                            "Compaction cancelled".to_string(),
+                        ));
+                    }
+
+                    // Emit GroupStarted
+                    if let Some(ref callback) = progress_callback {
+                        callback(CompactionProgressEvent::GroupStarted {
+                            group_id,
+                            input_files,
+                            input_bytes,
+                        });
+                    }
+
+                    // Process the file group (read + write)
+                    let result = process_file_group(&table, &file_group).await;
+
+                    match result {
+                        Ok(write_result) => {
+                            let output_files = write_result.new_data_files.len() as u32;
+                            let output_bytes = write_result.bytes_written;
+                            let duration_ms = write_result.duration_ms;
+
+                            // Emit GroupCompleted
+                            if let Some(ref callback) = progress_callback {
+                                callback(CompactionProgressEvent::GroupCompleted {
+                                    group_id,
+                                    output_files,
+                                    output_bytes,
+                                    duration_ms,
+                                });
+                            }
+
+                            // Serialize data files to JSON
+                            let partition_type =
+                                partition_types.get(&spec_id).ok_or_else(|| {
+                                    DataFusionError::Internal(format!(
+                                        "No partition type for spec {spec_id}"
+                                    ))
+                                })?;
+
+                            let data_files_json: Vec<String> = write_result
+                                .new_data_files
+                                .into_iter()
+                                .map(|df| {
+                                    serialize_data_file_to_json(df, partition_type, format_version)
+                                        .map_err(|e| {
+                                            DataFusionError::Internal(format!(
+                                                "Failed to serialize DataFile: {e}"
+                                            ))
+                                        })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+
+                            // Create output batch - one row per data file
+                            let group_ids: Vec<u32> = vec![group_id; data_files_json.len()];
+                            let group_id_array = Arc::new(UInt32Array::from(group_ids)) as ArrayRef;
+                            let data_files_array =
+                                Arc::new(StringArray::from(data_files_json)) as ArrayRef;
+
+                            RecordBatch::try_new(output_schema, vec![
+                                group_id_array,
+                                data_files_array,
+                            ])
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                        }
+                        Err(e) => {
+                            // Emit GroupFailed
+                            if let Some(ref callback) = progress_callback {
+                                callback(CompactionProgressEvent::GroupFailed {
+                                    group_id,
+                                    error: e.to_string(),
+                                });
+                            }
+                            Err(e)
+                        }
+                    }
+                }
+            })
+            .boxed();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.output_schema.clone(),
+            stream,
+        )))
     }
 }
 
 // =============================================================================
 // Helper Functions (Tasks 5, 6, 7)
 // =============================================================================
+
+/// Finds a schema compatible with the given partition spec.
+///
+/// For partition evolution support, historical partition specs may reference
+/// fields that no longer exist in the current schema. This function finds a
+/// schema that can compute the partition type for the given spec.
+fn find_compatible_schema(
+    metadata: &iceberg::spec::TableMetadata,
+    partition_spec: &PartitionSpec,
+) -> DFResult<iceberg::spec::SchemaRef> {
+    let current_schema = metadata.current_schema();
+    if partition_spec.partition_type(current_schema).is_ok() {
+        return Ok(current_schema.clone());
+    }
+
+    metadata
+        .schemas_iter()
+        .find(|schema| partition_spec.partition_type(schema).is_ok())
+        .cloned()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "Cannot find compatible schema for partition spec {}: \
+                 no schema contains all referenced source fields",
+                partition_spec.spec_id()
+            ))
+        })
+}
 
 /// Result from processing a single file group.
 #[derive(Debug)]
@@ -269,93 +438,247 @@ pub struct FileGroupWriteResult {
 
 /// Read all data from a file group, applying any position deletes.
 ///
+/// This function creates [`FileScanTask`] entries for each data file in the group
+/// and uses the Iceberg [`ArrowReaderBuilder`] to read them with automatic
+/// delete file application.
+///
 /// # Arguments
 /// * `table` - The Iceberg table
 /// * `file_group` - The file group to read
 ///
 /// # Returns
-/// A stream of RecordBatches containing the merged data from all files
+/// A vector of RecordBatches containing the merged data from all files
 /// in the group with position deletes applied.
-///
-/// # Note
-/// This is a placeholder that needs implementation. The actual implementation
-/// would:
-/// 1. Create FileScanTasks for each data file in the group
-/// 2. Use ArrowReaderBuilder to read with delete application
-/// 3. Return a stream of RecordBatches
-#[allow(dead_code)]
-pub async fn read_file_group(
-    _table: &Table,
-    _file_group: &FileGroup,
-) -> DFResult<SendableRecordBatchStream> {
-    // TODO: Implement file group reading with delete application
-    // This would use iceberg::arrow::ArrowReaderBuilder to read the files
-    // with automatic position delete application
-    Err(DataFusionError::NotImplemented(
-        "read_file_group not yet implemented".to_string(),
-    ))
+pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<Vec<RecordBatch>> {
+    let file_io = table.file_io().clone();
+    let schema = table.metadata().current_schema().clone();
+
+    // Collect all top-level field IDs from the schema (Iceberg scan currently only supports
+    // projecting direct children of the schema struct).
+    let project_field_ids: Vec<i32> = schema.as_struct().fields().iter().map(|f| f.id).collect();
+
+    // Build delete file list once - file groups associate deletes by partition/spec (not per file),
+    // and the Arrow reader will filter position deletes by referenced file path.
+    let delete_files: Vec<FileScanTaskDeleteFile> = file_group
+        .position_delete_files
+        .iter()
+        .chain(file_group.equality_delete_files.iter())
+        .map(|delete_entry| {
+            let delete_file = &delete_entry.data_file;
+            FileScanTaskDeleteFile {
+                file_path: delete_file.file_path().to_string(),
+                file_type: delete_file.content_type(),
+                partition_spec_id: delete_file.partition_spec_id(),
+                equality_ids: if delete_file.content_type() == DataContentType::EqualityDeletes {
+                    delete_file.equality_ids().map(|ids| ids.to_vec())
+                } else {
+                    None
+                },
+            }
+        })
+        .collect();
+
+    let partition_spec = table
+        .metadata()
+        .partition_spec_by_id(file_group.partition_spec_id)
+        .cloned()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "Partition spec {} not found for file group {}",
+                file_group.partition_spec_id, file_group.group_id
+            ))
+        })?;
+
+    // Build FileScanTasks for each data file in the group
+    let mut tasks: Vec<FileScanTask> = Vec::with_capacity(file_group.data_files.len());
+
+    for entry in &file_group.data_files {
+        let data_file = &entry.data_file;
+        let data_file_spec_id = data_file.partition_spec_id();
+        if data_file_spec_id != file_group.partition_spec_id {
+            return Err(DataFusionError::Internal(format!(
+                "File group {} contains data file with partition spec id {}, expected {}",
+                file_group.group_id, data_file_spec_id, file_group.partition_spec_id
+            )));
+        }
+
+        let task = FileScanTask {
+            start: 0,
+            length: data_file.file_size_in_bytes(),
+            record_count: Some(data_file.record_count()),
+            data_file_path: data_file.file_path().to_string(),
+            data_file_format: data_file.file_format(),
+            schema: schema.clone(),
+            project_field_ids: project_field_ids.clone(),
+            predicate: None, // Read all rows
+            deletes: delete_files.clone(),
+            partition: Some(data_file.partition().clone()),
+            partition_spec: Some(partition_spec.clone()),
+            name_mapping: None,
+        };
+
+        tasks.push(task);
+    }
+
+    // If no tasks, return empty
+    if tasks.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Create ArrowReader and read all tasks
+    let reader = ArrowReaderBuilder::new(file_io).build();
+
+    let task_stream: FileScanTaskStream =
+        Box::pin(futures::stream::iter(tasks.into_iter().map(Ok)));
+
+    let batch_stream = reader.read(task_stream).map_err(to_datafusion_error)?;
+
+    // Collect all batches
+    let batches: Vec<RecordBatch> = batch_stream
+        .try_collect()
+        .await
+        .map_err(to_datafusion_error)?;
+
+    Ok(batches)
 }
 
 /// Write RecordBatches to new data files using rolling file writer.
 ///
+/// Uses the Iceberg writer stack: ParquetWriterBuilder → RollingFileWriterBuilder
+/// → DataFileWriterBuilder to write files at the target size.
+///
 /// # Arguments
 /// * `table` - The Iceberg table (for schema, partition spec, etc.)
-/// * `batches` - Stream of RecordBatches to write
-/// * `target_file_size` - Target size for output files
+/// * `batches` - RecordBatches to write
+/// * `partition` - Optional partition struct for the output files
+/// * `spec_id` - The partition spec ID for the output files
 ///
 /// # Returns
 /// Vector of DataFile entries for the newly written files.
-///
-/// # Note
-/// This is a placeholder that needs implementation. The actual implementation
-/// would:
-/// 1. Create a TaskWriter or RollingFileWriter
-/// 2. Write batches, rolling to new files at target size
-/// 3. Close writers and collect DataFile metadata
-#[allow(dead_code)]
 pub async fn write_compacted_files(
-    _table: &Table,
-    _batches: SendableRecordBatchStream,
-    _target_file_size: u64,
+    table: &Table,
+    batches: Vec<RecordBatch>,
+    partition: Option<&Struct>,
+    spec_id: i32,
 ) -> DFResult<Vec<DataFile>> {
-    // TODO: Implement file writing with rolling writer
-    // This would use iceberg::writer::TaskWriter or RollingFileWriter
-    Err(DataFusionError::NotImplemented(
-        "write_compacted_files not yet implemented".to_string(),
-    ))
+    if batches.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let metadata = table.metadata();
+    let file_io = table.file_io().clone();
+    let iceberg_schema = metadata.current_schema().clone();
+
+    // Get target file size from table properties (default from TableProperties)
+    let target_file_size = metadata
+        .properties()
+        .get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
+
+    // Create location generator for file paths
+    let location_generator =
+        DefaultLocationGenerator::new(metadata.clone()).map_err(to_datafusion_error)?;
+
+    // Create file name generator with unique UUID
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("compaction-{}", Uuid::now_v7()),
+        None,
+        DataFileFormat::Parquet,
+    );
+
+    // Build writer stack: Parquet -> Rolling -> DataFile
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone());
+
+    let rolling_writer_builder = RollingFileWriterBuilder::new(
+        parquet_writer_builder,
+        target_file_size,
+        file_io,
+        location_generator,
+        file_name_generator,
+    );
+
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+
+    // Build partition key if partitioned
+    let partition_key = if let Some(partition_struct) = partition {
+        let partition_spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+            DataFusionError::Internal(format!("Partition spec {spec_id} not found"))
+        })?;
+
+        let partition_schema = find_compatible_schema(metadata, partition_spec.as_ref())?;
+
+        Some(PartitionKey::new(
+            partition_spec.as_ref().clone(),
+            partition_schema,
+            partition_struct.clone(),
+        ))
+    } else {
+        None
+    };
+
+    // Create the writer
+    let mut writer = data_file_writer_builder
+        .build(partition_key)
+        .await
+        .map_err(to_datafusion_error)?;
+
+    // Write all batches
+    for batch in batches {
+        writer.write(batch).await.map_err(to_datafusion_error)?;
+    }
+
+    // Close and get data files
+    let data_files = writer.close().await.map_err(to_datafusion_error)?;
+
+    Ok(data_files)
 }
 
 /// Process a single file group: read, merge, and write compacted output.
 ///
+/// This function orchestrates the full compaction flow for a single file group:
+/// 1. Read all data files with delete application
+/// 2. Write merged data to new compacted files
+/// 3. Return metrics about the operation
+///
 /// # Arguments
 /// * `table` - The Iceberg table
 /// * `file_group` - The file group to process
-/// * `group_id` - The index of this group
-/// * `target_file_size` - Target output file size
 ///
 /// # Returns
 /// Result containing new data files and metrics.
-#[allow(dead_code)]
 pub async fn process_file_group(
-    _table: &Table,
-    _file_group: &FileGroup,
-    group_id: u32,
-    _target_file_size: u64,
+    table: &Table,
+    file_group: &FileGroup,
 ) -> DFResult<FileGroupWriteResult> {
-    // TODO: Implement full file group processing
-    // 1. read_file_group()
-    // 2. write_compacted_files()
-    // 3. Return metrics
-    Err(DataFusionError::NotImplemented(format!(
-        "process_file_group not yet implemented for group {}",
-        group_id
-    )))
+    let start_time = Instant::now();
+    let group_id = file_group.group_id;
+    let spec_id = file_group.partition_spec_id;
+
+    // Step 1: Read all data from the file group with delete application
+    let batches = read_file_group(table, file_group).await?;
+
+    // Step 2: Write merged output to new compacted files
+    let partition = file_group.partition.as_ref();
+    let new_data_files = write_compacted_files(table, batches, partition, spec_id).await?;
+
+    // Calculate metrics
+    let bytes_written: u64 = new_data_files.iter().map(|f| f.file_size_in_bytes()).sum();
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+
+    Ok(FileGroupWriteResult {
+        group_id,
+        new_data_files,
+        bytes_written,
+        duration_ms,
+    })
 }
 
 /// Serialize a vector of DataFiles to JSON for output.
 ///
 /// Handles partition evolution by looking up each file's partition spec
-/// rather than assuming all files use the default spec.
+/// and using the correct partition type for that spec ID.
 ///
 /// # Arguments
 /// * `files` - DataFiles to serialize
@@ -364,29 +687,18 @@ pub async fn process_file_group(
 pub fn serialize_data_files(files: Vec<DataFile>, table: &Table) -> DFResult<Vec<String>> {
     let metadata = table.metadata();
     let format_version = metadata.format_version();
+    let partition_types = build_partition_type_map(table)?;
 
     files
         .into_iter()
         .map(|f| {
-            // Look up the partition spec for this specific file
             let spec_id = f.partition_spec_id();
-            let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "Partition spec {} not found for DataFile",
-                    spec_id
-                ))
+            let partition_type = partition_types.get(&spec_id).ok_or_else(|| {
+                DataFusionError::Internal(format!("Partition type not found for spec {spec_id}"))
             })?;
-            let partition_type =
-                spec.partition_type(metadata.current_schema())
-                    .map_err(|e| {
-                        DataFusionError::Internal(format!(
-                            "Failed to get partition type for spec {}: {}",
-                            spec_id, e
-                        ))
-                    })?;
 
-            serialize_data_file_to_json(f, &partition_type, format_version).map_err(|e| {
-                DataFusionError::Internal(format!("Failed to serialize DataFile: {}", e))
+            serialize_data_file_to_json(f, partition_type, format_version).map_err(|e| {
+                DataFusionError::Internal(format!("Failed to serialize DataFile: {e}"))
             })
         })
         .collect()

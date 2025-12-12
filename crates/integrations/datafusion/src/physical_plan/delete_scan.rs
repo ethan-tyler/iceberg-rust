@@ -306,8 +306,8 @@ async fn scan_file_for_deletes(
     // Cache the physical filter expression after building it from the first batch's schema.
     // This handles schema evolution: files written under older schemas have different Arrow schemas.
     // Result<Option<Arc<...>>>: Ok(Some) = filter built, Ok(None) = no filters, Err = filter failed
-    let cached_filter: Arc<OnceLock<Result<Option<Arc<dyn PhysicalExpr>>, String>>> =
-        Arc::new(OnceLock::new());
+    type CachedFilter = Arc<OnceLock<Result<Option<Arc<dyn PhysicalExpr>>, String>>>;
+    let cached_filter: CachedFilter = Arc::new(OnceLock::new());
 
     let stream = batch_stream
         .map(move |batch_result| {

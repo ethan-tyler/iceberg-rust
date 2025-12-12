@@ -80,7 +80,7 @@
 //!
 //! // 3. Commit: atomically replace old files with new files
 //! let committer = RewriteDataFilesCommitter::new(&table, plan);
-//! let (mut action_commit, result) = committer.commit(results).await?;
+//! let (action_commit, result) = committer.commit(results).await?;
 //!
 //! // Apply directly to catalog (consumes the ActionCommit fields)
 //! let table = action_commit

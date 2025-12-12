@@ -284,6 +284,14 @@ impl DataFile {
     pub fn content_size_in_bytes(&self) -> Option<i64> {
         self.content_size_in_bytes
     }
+    /// Get the partition spec ID under which the file was written.
+    ///
+    /// This is used by DML operations to correctly handle partition evolution:
+    /// position delete files must use the same partition spec as the data file
+    /// they reference, not necessarily the table's current default spec.
+    pub fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
 }
 
 /// Convert data files to avro bytes and write to writer.

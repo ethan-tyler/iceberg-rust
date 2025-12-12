@@ -177,10 +177,7 @@ impl PartitionedDeleteCollector {
     /// For partition evolution support, historical partition specs may reference
     /// fields that no longer exist in the current schema. This method finds a
     /// schema that can compute the partition type for the given spec.
-    fn find_compatible_schema(
-        &self,
-        partition_spec: &PartitionSpec,
-    ) -> DFResult<IcebergSchemaRef> {
+    fn find_compatible_schema(&self, partition_spec: &PartitionSpec) -> DFResult<IcebergSchemaRef> {
         for schema in &self.all_schemas {
             if partition_spec.partition_type(schema).is_ok() {
                 return Ok(schema.clone());

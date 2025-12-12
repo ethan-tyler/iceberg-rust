@@ -179,8 +179,10 @@ mod tests {
 
     #[test]
     fn test_cannot_set_reserved_property_format_version() {
-        let action = UpdatePropertiesAction::new()
-            .set(TableProperties::PROPERTY_FORMAT_VERSION.to_string(), "3".to_string());
+        let action = UpdatePropertiesAction::new().set(
+            TableProperties::PROPERTY_FORMAT_VERSION.to_string(),
+            "3".to_string(),
+        );
 
         let result = action.validate_no_reserved_properties();
         assert!(result.is_err());
@@ -191,8 +193,10 @@ mod tests {
 
     #[test]
     fn test_cannot_set_reserved_property_uuid() {
-        let action = UpdatePropertiesAction::new()
-            .set(TableProperties::PROPERTY_UUID.to_string(), "new-uuid".to_string());
+        let action = UpdatePropertiesAction::new().set(
+            TableProperties::PROPERTY_UUID.to_string(),
+            "new-uuid".to_string(),
+        );
 
         let result = action.validate_no_reserved_properties();
         assert!(result.is_err());
@@ -237,7 +241,10 @@ mod tests {
     fn test_mixed_reserved_and_non_reserved_fails() {
         let action = UpdatePropertiesAction::new()
             .set("write.delete.mode".to_string(), "merge-on-read".to_string())
-            .set(TableProperties::PROPERTY_FORMAT_VERSION.to_string(), "3".to_string());
+            .set(
+                TableProperties::PROPERTY_FORMAT_VERSION.to_string(),
+                "3".to_string(),
+            );
 
         let result = action.validate_no_reserved_properties();
         assert!(result.is_err());

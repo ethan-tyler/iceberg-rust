@@ -56,12 +56,18 @@ pub use action::*;
 pub use evolve_partition::EvolvePartitionAction;
 pub use overwrite::OverwriteAction;
 pub use replace_partitions::ReplacePartitionsAction;
+pub use rewrite_data_files::{
+    FileGroup, FileGroupFailure, FileGroupResult, FileGroupRewriteResult, RewriteDataFilesAction,
+    RewriteDataFilesCommitter, RewriteDataFilesOptions, RewriteDataFilesPlan,
+    RewriteDataFilesPlanner, RewriteDataFilesResult, RewriteJobOrder, RewriteStrategy,
+};
 pub use row_delta::RowDeltaAction;
 mod append;
 mod delete;
 mod evolve_partition;
 mod overwrite;
 mod replace_partitions;
+pub mod rewrite_data_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -299,6 +305,55 @@ impl Transaction {
     /// ```
     pub fn evolve_partition_spec(&self) -> EvolvePartitionAction {
         EvolvePartitionAction::new()
+    }
+
+    /// Creates a rewrite data files action for table compaction.
+    ///
+    /// This action consolidates small data files into larger, target-sized files
+    /// using bin-packing. It is the Rust-native implementation of Iceberg's
+    /// `rewrite_data_files` maintenance action.
+    ///
+    /// # Use Cases
+    ///
+    /// - Consolidate small files from streaming ingestion
+    /// - Reduce query planning overhead from high file count
+    /// - Merge position/equality deletes into data files (V2 tables)
+    /// - Optimize storage costs by reducing object store API calls
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    ///
+    /// // Basic compaction with default settings
+    /// let action = tx.rewrite_data_files();
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    ///
+    /// // Compaction with custom settings
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.rewrite_data_files()
+    ///     .target_file_size_bytes(128 * 1024 * 1024)  // 128 MB target
+    ///     .min_input_files(10)                         // Require more files
+    ///     .max_concurrent_file_group_rewrites(4)       // Limit parallelism
+    ///     .remove_dangling_deletes(true);              // Clean up deletes
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    ///
+    /// # Atomicity
+    ///
+    /// The operation is atomic: files are only replaced on successful commit.
+    /// On failure, original files remain unchanged.
+    ///
+    /// # Format Version Support
+    ///
+    /// - **V1 tables**: Simple bin-packing of data files
+    /// - **V2+ tables**: Full compaction with delete file reconciliation
+    pub fn rewrite_data_files(&self) -> RewriteDataFilesAction {
+        RewriteDataFilesAction::new()
     }
 
     /// Commit transaction.

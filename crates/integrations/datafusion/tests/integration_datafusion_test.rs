@@ -4613,8 +4613,10 @@ async fn test_delete_with_partition_evolution() -> Result<()> {
     .unwrap();
 
     // Evolve partition spec: add partitioning by category
-    let table_ident =
-        TableIdent::new(namespace.clone(), "partition_evolution_delete_table".to_string());
+    let table_ident = TableIdent::new(
+        namespace.clone(),
+        "partition_evolution_delete_table".to_string(),
+    );
     let table = client.load_table(&table_ident).await?;
 
     let new_spec = UnboundPartitionSpec::builder()
@@ -4777,8 +4779,10 @@ async fn test_update_with_partition_evolution() -> Result<()> {
     .unwrap();
 
     // Evolve partition spec: add partitioning by category
-    let table_ident =
-        TableIdent::new(namespace.clone(), "partition_evolution_update_table".to_string());
+    let table_ident = TableIdent::new(
+        namespace.clone(),
+        "partition_evolution_update_table".to_string(),
+    );
     let table = client.load_table(&table_ident).await?;
 
     let new_spec = UnboundPartitionSpec::builder()
@@ -4923,8 +4927,10 @@ async fn test_merge_with_partition_evolution() -> Result<()> {
     .unwrap();
 
     // Evolve partition spec: add partitioning by region
-    let table_ident =
-        TableIdent::new(namespace.clone(), "partition_evolution_merge_table".to_string());
+    let table_ident = TableIdent::new(
+        namespace.clone(),
+        "partition_evolution_merge_table".to_string(),
+    );
     let table = client.load_table(&table_ident).await?;
 
     let new_spec = UnboundPartitionSpec::builder()
@@ -4963,10 +4969,11 @@ async fn test_merge_with_partition_evolution() -> Result<()> {
     let region_array = Arc::new(StringArray::from(vec!["US", "EU", "EU"]));
     let value_array = Arc::new(ArrowInt32Array::from(vec![150, 350, 600]));
 
-    let source_batch = RecordBatch::try_new(
-        source_schema.clone(),
-        vec![id_array, region_array, value_array],
-    )
+    let source_batch = RecordBatch::try_new(source_schema.clone(), vec![
+        id_array,
+        region_array,
+        value_array,
+    ])
     .unwrap();
 
     let source_table =
@@ -5086,8 +5093,7 @@ async fn test_delete_file_inherits_source_spec() -> Result<()> {
     .unwrap();
 
     // Evolve partition spec: add partitioning by category (spec_id = 1)
-    let table_ident =
-        TableIdent::new(namespace.clone(), "delete_inherits_spec_table".to_string());
+    let table_ident = TableIdent::new(namespace.clone(), "delete_inherits_spec_table".to_string());
     let table = client.load_table(&table_ident).await?;
 
     let new_spec = UnboundPartitionSpec::builder()
@@ -5334,7 +5340,11 @@ async fn test_update_writes_with_migrate_forward_semantic() -> Result<()> {
         .collect();
 
     // id=1: updated to 999, id=2: unchanged 200
-    assert_eq!(values, vec![999, 200], "UPDATE should change id=1's value to 999");
+    assert_eq!(
+        values,
+        vec![999, 200],
+        "UPDATE should change id=1's value to 999"
+    );
 
     Ok(())
 }
@@ -5400,8 +5410,7 @@ async fn test_delete_with_departition_evolution() -> Result<()> {
 
     // Evolve partition spec: change to unpartitioned (spec_id = 1)
     // This is a "de-partition" evolution
-    let table_ident =
-        TableIdent::new(namespace.clone(), "departition_delete_table".to_string());
+    let table_ident = TableIdent::new(namespace.clone(), "departition_delete_table".to_string());
     let table = client.load_table(&table_ident).await?;
 
     let unpartitioned_spec = UnboundPartitionSpec::builder().build();
@@ -5524,10 +5533,7 @@ async fn test_delete_with_departition_evolution() -> Result<()> {
         .filter(|m| m.content == iceberg::spec::ManifestContentType::Deletes)
         .collect();
 
-    assert!(
-        !delete_manifests.is_empty(),
-        "Should have delete manifests"
-    );
+    assert!(!delete_manifests.is_empty(), "Should have delete manifests");
 
     // Delete manifest should have spec_id = 0 (the original partitioned spec)
     // because the position deletes target files written under spec v0
@@ -5596,8 +5602,7 @@ async fn test_update_with_departition_evolution() -> Result<()> {
     .unwrap();
 
     // Evolve partition spec: change to unpartitioned (spec_id = 1)
-    let table_ident =
-        TableIdent::new(namespace.clone(), "departition_update_table".to_string());
+    let table_ident = TableIdent::new(namespace.clone(), "departition_update_table".to_string());
     let table = client.load_table(&table_ident).await?;
 
     let unpartitioned_spec = UnboundPartitionSpec::builder().build();
@@ -5703,8 +5708,7 @@ async fn test_delete_with_three_partition_specs() -> Result<()> {
     iceberg_catalog.create_table(&namespace, creation).await?;
 
     let client = Arc::new(iceberg_catalog);
-    let table_ident =
-        TableIdent::new(namespace.clone(), "three_specs_delete_table".to_string());
+    let table_ident = TableIdent::new(namespace.clone(), "three_specs_delete_table".to_string());
 
     // === Phase 1: Insert under spec v0 (unpartitioned) ===
     let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);

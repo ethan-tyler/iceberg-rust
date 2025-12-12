@@ -46,10 +46,7 @@ const META_ROOT_PATH: &str = "metadata";
 fn group_files_by_spec(files: Vec<DataFile>) -> BTreeMap<i32, Vec<DataFile>> {
     let mut groups: BTreeMap<i32, Vec<DataFile>> = BTreeMap::new();
     for file in files {
-        groups
-            .entry(file.partition_spec_id)
-            .or_default()
-            .push(file);
+        groups.entry(file.partition_spec_id).or_default().push(file);
     }
     groups
 }
@@ -241,7 +238,7 @@ impl<'a> SnapshotProducer<'a> {
                 })?;
             // Validate partition value against the file's actual partition type
             let partition_type = self
-                .find_compatible_partition_type(&partition_spec)
+                .find_compatible_partition_type(partition_spec)
                 .map_err(|e| {
                     Error::new(
                         ErrorKind::DataInvalid,
@@ -594,7 +591,7 @@ impl<'a> SnapshotProducer<'a> {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Data file references unknown partition spec: {}", spec_id),
+                        format!("Data file references unknown partition spec: {spec_id}"),
                     )
                 })?;
 
@@ -618,7 +615,7 @@ impl<'a> SnapshotProducer<'a> {
             });
 
             let mut writer =
-                self.new_manifest_writer_for_spec(&partition_spec, ManifestContentType::Data)?;
+                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
             for entry in manifest_entries {
                 writer.add_entry(entry)?;
             }
@@ -657,7 +654,7 @@ impl<'a> SnapshotProducer<'a> {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Delete file references unknown partition spec: {}", spec_id),
+                        format!("Delete file references unknown partition spec: {spec_id}"),
                     )
                 })?;
 
@@ -673,7 +670,7 @@ impl<'a> SnapshotProducer<'a> {
             });
 
             let mut writer =
-                self.new_manifest_writer_for_spec(&partition_spec, ManifestContentType::Deletes)?;
+                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Deletes)?;
             for entry in manifest_entries {
                 writer.add_entry(entry)?;
             }
@@ -713,15 +710,12 @@ impl<'a> SnapshotProducer<'a> {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!(
-                            "Deleted entry references unknown partition spec: {}",
-                            spec_id
-                        ),
+                        format!("Deleted entry references unknown partition spec: {spec_id}"),
                     )
                 })?;
 
             let mut writer =
-                self.new_manifest_writer_for_spec(&partition_spec, ManifestContentType::Data)?;
+                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
             for entry in entries {
                 // Use add_delete_entry to properly set status=Deleted
                 // (add_entry would override status to Added)
@@ -763,15 +757,12 @@ impl<'a> SnapshotProducer<'a> {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!(
-                            "Existing entry references unknown partition spec: {}",
-                            spec_id
-                        ),
+                        format!("Existing entry references unknown partition spec: {spec_id}"),
                     )
                 })?;
 
             let mut writer =
-                self.new_manifest_writer_for_spec(&partition_spec, ManifestContentType::Data)?;
+                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
             for entry in entries {
                 writer.add_existing_entry(entry)?;
             }
@@ -891,7 +882,11 @@ impl<'a> SnapshotProducer<'a> {
                     )
                 })?;
             let compatible_schema = self.find_compatible_schema(partition_spec)?;
-            summary_collector.add_file(data_file, compatible_schema.clone(), partition_spec.clone());
+            summary_collector.add_file(
+                data_file,
+                compatible_schema.clone(),
+                partition_spec.clone(),
+            );
         }
 
         // Add delete files to summary collector, using each file's actual partition spec
@@ -909,7 +904,11 @@ impl<'a> SnapshotProducer<'a> {
                     )
                 })?;
             let compatible_schema = self.find_compatible_schema(partition_spec)?;
-            summary_collector.add_file(delete_file, compatible_schema.clone(), partition_spec.clone());
+            summary_collector.add_file(
+                delete_file,
+                compatible_schema.clone(),
+                partition_spec.clone(),
+            );
         }
 
         let previous_snapshot = table_metadata

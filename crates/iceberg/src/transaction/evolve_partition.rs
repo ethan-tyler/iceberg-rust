@@ -222,8 +222,7 @@ mod tests {
                 assert!(
                     err.to_string()
                         .contains("Cannot set default partition spec without adding a spec"),
-                    "Expected error about missing spec, got: {}",
-                    err
+                    "Expected error about missing spec, got: {err}",
                 );
             }
         }

@@ -564,7 +564,10 @@ mod tests {
 
     #[test]
     fn test_write_distribution_mode_default() {
-        assert_eq!(WriteDistributionMode::default(), WriteDistributionMode::None);
+        assert_eq!(
+            WriteDistributionMode::default(),
+            WriteDistributionMode::None
+        );
     }
 
     #[test]

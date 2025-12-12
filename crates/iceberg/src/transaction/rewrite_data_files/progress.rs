@@ -17,8 +17,8 @@
 
 //! Progress reporting for compaction operations.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Events emitted during compaction for progress tracking.
 #[derive(Debug, Clone)]

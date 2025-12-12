@@ -21,9 +21,8 @@
 //! be compacted together into new, target-sized files. The bin-packing algorithm
 //! groups files to maximize efficiency while respecting size constraints.
 
-use crate::spec::{ManifestEntryRef, Struct};
-
 use super::options::RewriteJobOrder;
+use crate::spec::{ManifestEntryRef, Struct};
 
 /// A group of files to be compacted together.
 ///
@@ -185,10 +184,7 @@ pub fn bin_pack_files(
     }
 
     // Step 1: Sort by file size descending (First-Fit Decreasing)
-    entries.sort_by(|a, b| {
-        b.file_size_in_bytes()
-            .cmp(&a.file_size_in_bytes())
-    });
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.file_size_in_bytes()));
 
     // Step 2: Bin-pack using First-Fit
     let mut groups: Vec<FileGroup> = Vec::new();
@@ -319,7 +315,7 @@ mod tests {
 
         // Max size 100KB, current 60KB, should have room for 40KB
         assert!(group.has_capacity_for(40_000, 100_000));
-        assert!(group.has_capacity_for(40_001, 100_000) == false);
+        assert!(!group.has_capacity_for(40_001, 100_000));
         assert!(group.has_capacity_for(30_000, 100_000));
     }
 
@@ -504,11 +500,7 @@ mod tests {
         let per_file_size = total_bytes / file_count as u64;
 
         for i in 0..file_count {
-            group.add_data_file(test_entry(
-                &format!("file{i}.parquet"),
-                per_file_size,
-                100,
-            ));
+            group.add_data_file(test_entry(&format!("file{i}.parquet"), per_file_size, 100));
         }
         group
     }

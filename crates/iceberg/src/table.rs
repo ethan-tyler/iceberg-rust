@@ -325,9 +325,7 @@ impl Table {
     /// let enabled: Option<bool> = table.property_as("write.metadata.delete-after-commit.enabled")?;
     /// ```
     pub fn property_as<T: std::str::FromStr>(&self, key: &str) -> Result<Option<T>>
-    where
-        T::Err: std::fmt::Display,
-    {
+    where T::Err: std::fmt::Display {
         match self.property(key) {
             Some(value) => value.parse::<T>().map(Some).map_err(|e| {
                 Error::new(
@@ -357,9 +355,7 @@ impl Table {
     /// let file_size: i64 = table.property_as_or("write.target-file-size-bytes", 536870912)?;
     /// ```
     pub fn property_as_or<T: std::str::FromStr>(&self, key: &str, default: T) -> Result<T>
-    where
-        T::Err: std::fmt::Display,
-    {
+    where T::Err: std::fmt::Display {
         self.property_as(key).map(|opt| opt.unwrap_or(default))
     }
 
@@ -791,9 +787,7 @@ mod tests {
         let builder = table.update_properties();
 
         // Set some properties
-        let builder = builder
-            .set("key1", "value1")
-            .set("key2", "value2");
+        let builder = builder.set("key1", "value1").set("key2", "value2");
 
         // Verify the builder has the updates tracked
         assert_eq!(builder.updates.len(), 2);
@@ -808,9 +802,7 @@ mod tests {
         let builder = table.update_properties();
 
         // Remove some properties
-        let builder = builder
-            .remove("key1")
-            .remove("key2");
+        let builder = builder.remove("key1").remove("key2");
 
         // Verify the builder has the removals tracked
         assert_eq!(builder.removals.len(), 2);
@@ -825,9 +817,7 @@ mod tests {
         let builder = table.update_properties();
 
         // Set a property then remove it
-        let builder = builder
-            .set("key1", "value1")
-            .remove("key1");
+        let builder = builder.set("key1", "value1").remove("key1");
 
         // Should be in removals, not updates
         assert!(builder.updates.is_empty());
@@ -841,9 +831,7 @@ mod tests {
         let builder = table.update_properties();
 
         // Remove a property then set it
-        let builder = builder
-            .remove("key1")
-            .set("key1", "value1");
+        let builder = builder.remove("key1").set("key1", "value1");
 
         // Should be in updates, not removals
         assert!(builder.removals.is_empty());
@@ -882,9 +870,7 @@ mod tests {
         let key: &str = "key";
         let value: String = "value".to_string();
 
-        let builder = table.update_properties()
-            .set(key, &value)
-            .remove("other");
+        let builder = table.update_properties().set(key, &value).remove("other");
 
         assert_eq!(builder.updates.len(), 1);
         assert_eq!(builder.removals.len(), 1);

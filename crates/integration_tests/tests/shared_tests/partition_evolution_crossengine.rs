@@ -274,17 +274,15 @@ async fn test_crossengine_merge_with_partition_evolution() {
         Field::new("amount", DataType::Int32, false),
     ]));
 
-    let source_batch = RecordBatch::try_new(
-        source_schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 3, 6])),          // ids to update/insert
-            Arc::new(StringArray::from(vec!["US", "EU", "EU"])), // regions
-            Arc::new(Int32Array::from(vec![150, 350, 600])),    // new amounts
-        ],
-    )
+    let source_batch = RecordBatch::try_new(source_schema.clone(), vec![
+        Arc::new(Int32Array::from(vec![1, 3, 6])), // ids to update/insert
+        Arc::new(StringArray::from(vec!["US", "EU", "EU"])), // regions
+        Arc::new(Int32Array::from(vec![150, 350, 600])), // new amounts
+    ])
     .unwrap();
 
-    let source_table = Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
+    let source_table =
+        Arc::new(MemTable::try_new(source_schema, vec![vec![source_batch]]).unwrap());
     ctx.register_table("merge_source", source_table).unwrap();
     let source_df = ctx.table("merge_source").await.unwrap();
 

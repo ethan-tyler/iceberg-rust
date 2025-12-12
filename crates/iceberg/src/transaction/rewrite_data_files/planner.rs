@@ -1315,8 +1315,10 @@ mod tests {
 
     #[test]
     fn test_is_candidate_with_delete_threshold() {
-        let mut options = RewriteDataFilesOptions::default();
-        options.delete_file_threshold = Some(3);
+        let options = RewriteDataFilesOptions {
+            delete_file_threshold: Some(3),
+            ..Default::default()
+        };
 
         // File is the right size (not a size-based candidate)
         // Default min = 384MB, max = 921.6MB, so 400MB is within range

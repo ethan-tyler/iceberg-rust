@@ -217,19 +217,18 @@ impl RewriteDataFilesOptions {
     ///
     /// Reads the following table properties:
     /// - `write.target-file-size-bytes`: Target output file size
-    pub fn from_table_properties(
-        properties: &std::collections::HashMap<String, String>,
-    ) -> Self {
+    pub fn from_table_properties(properties: &std::collections::HashMap<String, String>) -> Self {
         let mut options = Self::default();
 
         // Read target file size from table property
-        if let Some(size_str) = properties.get("write.target-file-size-bytes") {
-            if let Ok(size) = size_str.parse::<u64>() {
-                options.target_file_size_bytes = size;
-                // Recompute derived defaults
-                options.min_file_size_bytes = (size as f64 * 0.75) as u64;
-                options.max_file_size_bytes = (size as f64 * 1.80) as u64;
-            }
+        if let Some(size) = properties
+            .get("write.target-file-size-bytes")
+            .and_then(|size_str| size_str.parse::<u64>().ok())
+        {
+            options.target_file_size_bytes = size;
+            // Recompute derived defaults
+            options.min_file_size_bytes = (size as f64 * 0.75) as u64;
+            options.max_file_size_bytes = (size as f64 * 1.80) as u64;
         }
 
         options
@@ -312,14 +311,8 @@ mod tests {
         let options = RewriteDataFilesOptions::from_table_properties(&properties);
 
         assert_eq!(options.target_file_size_bytes, 268435456);
-        assert_eq!(
-            options.min_file_size_bytes,
-            (268435456.0 * 0.75) as u64
-        );
-        assert_eq!(
-            options.max_file_size_bytes,
-            (268435456.0 * 1.80) as u64
-        );
+        assert_eq!(options.min_file_size_bytes, (268435456.0 * 0.75) as u64);
+        assert_eq!(options.max_file_size_bytes, (268435456.0 * 1.80) as u64);
     }
 
     #[test]

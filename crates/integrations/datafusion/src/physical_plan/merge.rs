@@ -412,8 +412,8 @@ struct MergeWriters {
 
 /// Data file writer that supports both partitioned and unpartitioned tables.
 enum MergeDataWriter {
-    Unpartitioned(DataFileWriterType),
-    Partitioned(FanoutWriter<DataFileWriterBuilderType>),
+    Unpartitioned(Box<DataFileWriterType>),
+    Partitioned(Box<FanoutWriter<DataFileWriterBuilderType>>),
 }
 
 /// Position delete writer - always uses FanoutWriter for partition evolution support.
@@ -523,14 +523,14 @@ impl MergeWriters {
         // Data writer: based on default spec (new data goes to default partition layout)
         // Delete writer: always FanoutWriter (must handle files from any historical spec)
         let data_writer = if is_partitioned {
-            MergeDataWriter::Partitioned(FanoutWriter::new(data_file_builder))
+            MergeDataWriter::Partitioned(Box::new(FanoutWriter::new(data_file_builder)))
         } else {
-            MergeDataWriter::Unpartitioned(
+            MergeDataWriter::Unpartitioned(Box::new(
                 data_file_builder
                     .build(None)
                     .await
                     .map_err(to_datafusion_error)?,
-            )
+            ))
         };
         // Delete writer always uses FanoutWriter to handle partition evolution:
         // historical files may have different partition specs than the current default
@@ -574,7 +574,11 @@ impl MergeWriters {
 
     /// Writes a position delete batch.
     /// Always uses FanoutWriter to handle partition evolution (historical files may have different specs).
-    async fn write_deletes(&mut self, batch: RecordBatch, partition_key: PartitionKey) -> DFResult<()> {
+    async fn write_deletes(
+        &mut self,
+        batch: RecordBatch,
+        partition_key: PartitionKey,
+    ) -> DFResult<()> {
         self.delete_writer
             .write(partition_key, batch)
             .await
@@ -626,9 +630,8 @@ impl MergeWriters {
                 // File not in map - only valid if default spec is unpartitioned
                 if self.partition_splitter.is_some() {
                     return Err(DataFusionError::Internal(format!(
-                        "No partition info found for file '{}'. This may indicate a consistency issue \
-                         between the scan and write phases.",
-                        file_path
+                        "No partition info found for file '{file_path}'. This may indicate a consistency issue \
+                         between the scan and write phases."
                     )));
                 }
                 // Default spec is unpartitioned, so empty partition is correct
@@ -652,7 +655,11 @@ impl MergeWriters {
             }
         };
 
-        let delete_files = self.delete_writer.close().await.map_err(to_datafusion_error)?;
+        let delete_files = self
+            .delete_writer
+            .close()
+            .await
+            .map_err(to_datafusion_error)?;
 
         Ok((data_files, delete_files))
     }
@@ -1086,12 +1093,7 @@ async fn execute_merge(
     // Build prefixed key column names for all join keys
     let prefixed_join_keys: Vec<(String, String)> = join_keys
         .iter()
-        .map(|(t, s)| {
-            (
-                format!("{TARGET_PREFIX}{t}"),
-                format!("{SOURCE_PREFIX}{s}"),
-            )
-        })
+        .map(|(t, s)| (format!("{TARGET_PREFIX}{t}"), format!("{SOURCE_PREFIX}{s}")))
         .collect();
 
     // Metadata column names after prefix
@@ -1156,17 +1158,14 @@ async fn execute_merge(
     let data_files_json: Vec<String> = data_files
         .into_iter()
         .map(|df| {
-            let file_json =
-                serialize_data_file_to_json(df, default_partition_type, format_version)
-                    .map_err(to_datafusion_error)?;
+            let file_json = serialize_data_file_to_json(df, default_partition_type, format_version)
+                .map_err(to_datafusion_error)?;
             serde_json::to_string(&SerializedFileWithSpec {
                 spec_id: current_spec_id,
                 file_json,
             })
             .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to serialize data file metadata: {e}"
-                ))
+                DataFusionError::Execution(format!("Failed to serialize data file metadata: {e}"))
             })
         })
         .collect::<DFResult<Vec<_>>>()?;
@@ -1187,9 +1186,7 @@ async fn execute_merge(
             let file_json = serialize_data_file_to_json(df, partition_type, format_version)
                 .map_err(to_datafusion_error)?;
             serde_json::to_string(&SerializedFileWithSpec { spec_id, file_json }).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to serialize delete file metadata: {e}"
-                ))
+                DataFusionError::Execution(format!("Failed to serialize delete file metadata: {e}"))
             })
         })
         .collect::<DFResult<Vec<_>>>()?;
@@ -1411,79 +1408,82 @@ fn extract_distinct_values(
                 continue;
             }
 
-            let datum =
-                match &data_type {
-                    DataType::Int32 => {
-                        let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                            DataFusionError::Internal("Expected Int32Array".into())
+            let datum = match &data_type {
+                DataType::Int32 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| DataFusionError::Internal("Expected Int32Array".into()))?;
+                    let val = arr.value(row_idx);
+                    let key = val.to_string();
+                    if seen_strings.insert(key) {
+                        Some(iceberg::spec::Datum::int(val))
+                    } else {
+                        None
+                    }
+                }
+                DataType::Int64 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| DataFusionError::Internal("Expected Int64Array".into()))?;
+                    let val = arr.value(row_idx);
+                    let key = val.to_string();
+                    if seen_strings.insert(key) {
+                        Some(iceberg::spec::Datum::long(val))
+                    } else {
+                        None
+                    }
+                }
+                DataType::Utf8 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
+                    let val = arr.value(row_idx);
+                    if seen_strings.insert(val.to_string()) {
+                        Some(iceberg::spec::Datum::string(val))
+                    } else {
+                        None
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal("Expected LargeStringArray".into())
                         })?;
-                        let val = arr.value(row_idx);
-                        let key = val.to_string();
-                        if seen_strings.insert(key) {
-                            Some(iceberg::spec::Datum::int(val))
-                        } else {
-                            None
-                        }
+                    let val = arr.value(row_idx);
+                    if seen_strings.insert(val.to_string()) {
+                        Some(iceberg::spec::Datum::string(val))
+                    } else {
+                        None
                     }
-                    DataType::Int64 => {
-                        let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                            DataFusionError::Internal("Expected Int64Array".into())
-                        })?;
-                        let val = arr.value(row_idx);
-                        let key = val.to_string();
-                        if seen_strings.insert(key) {
-                            Some(iceberg::spec::Datum::long(val))
-                        } else {
-                            None
-                        }
+                }
+                DataType::Date32 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<Date32Array>()
+                        .ok_or_else(|| DataFusionError::Internal("Expected Date32Array".into()))?;
+                    let val = arr.value(row_idx);
+                    let key = val.to_string();
+                    if seen_strings.insert(key) {
+                        Some(iceberg::spec::Datum::date(val))
+                    } else {
+                        None
                     }
-                    DataType::Utf8 => {
-                        let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                            DataFusionError::Internal("Expected StringArray".into())
-                        })?;
-                        let val = arr.value(row_idx);
-                        if seen_strings.insert(val.to_string()) {
-                            Some(iceberg::spec::Datum::string(val))
-                        } else {
-                            None
-                        }
-                    }
-                    DataType::LargeUtf8 => {
-                        let arr =
-                            col.as_any()
-                                .downcast_ref::<LargeStringArray>()
-                                .ok_or_else(|| {
-                                    DataFusionError::Internal("Expected LargeStringArray".into())
-                                })?;
-                        let val = arr.value(row_idx);
-                        if seen_strings.insert(val.to_string()) {
-                            Some(iceberg::spec::Datum::string(val))
-                        } else {
-                            None
-                        }
-                    }
-                    DataType::Date32 => {
-                        let arr = col.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
-                            DataFusionError::Internal("Expected Date32Array".into())
-                        })?;
-                        let val = arr.value(row_idx);
-                        let key = val.to_string();
-                        if seen_strings.insert(key) {
-                            Some(iceberg::spec::Datum::date(val))
-                        } else {
-                            None
-                        }
-                    }
-                    other => {
-                        // For unsupported types, skip DPP rather than fail
-                        #[cfg(debug_assertions)]
-                        eprintln!(
-                            "MERGE DPP: Skipping - unsupported data type {other:?} for column '{column_name}' \
+                }
+                other => {
+                    // For unsupported types, skip DPP rather than fail
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "MERGE DPP: Skipping - unsupported data type {other:?} for column '{column_name}' \
                          (supported: Int32, Int64, Utf8, LargeUtf8, Date32)"
-                        );
-                        return Ok(vec![]);
-                    }
-                };
+                    );
+                    return Ok(vec![]);
+                }
+            };
 
             if let Some(d) = datum {
                 values.push(d);
@@ -1775,8 +1775,8 @@ async fn write_position_deletes_partitioned(
     // Always group deletes by (spec_id, partition data) to handle partition evolution.
     // Even for "unpartitioned" tables, we use FanoutWriter and PartitionKey routing
     // to support tables that evolved from partitioned to unpartitioned.
-    let mut partition_groups: HashMap<(i32, String), (Vec<String>, Vec<i64>, PartitionKey)> =
-        HashMap::new();
+    type PartitionGroups = HashMap<(i32, String), (Vec<String>, Vec<i64>, PartitionKey)>;
+    let mut partition_groups: PartitionGroups = HashMap::new();
 
     for &idx in indices {
         let file_path = file_path_col.value(idx).to_string();
@@ -2649,12 +2649,7 @@ fn classify_and_count_actions(
     // Build prefixed key column names
     let prefixed_keys: Vec<(String, String)> = join_keys
         .iter()
-        .map(|(t, s)| {
-            (
-                format!("{TARGET_PREFIX}{t}"),
-                format!("{SOURCE_PREFIX}{s}"),
-            )
-        })
+        .map(|(t, s)| (format!("{TARGET_PREFIX}{t}"), format!("{SOURCE_PREFIX}{s}")))
         .collect();
 
     for batch in joined_batches {

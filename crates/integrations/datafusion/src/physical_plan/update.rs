@@ -38,8 +38,7 @@ use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use datafusion::common::DFSchema;
-use datafusion::common::DataFusionError;
+use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::planner::create_physical_expr;
@@ -68,8 +67,8 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::partitioning::PartitioningWriter;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -93,11 +92,8 @@ type DataFileWriterType = iceberg::writer::base_writer::data_file_writer::DataFi
     DefaultFileNameGenerator,
 >;
 
-type DataFileWriterBuilderType = DataFileWriterBuilder<
-    ParquetWriterBuilder,
-    DefaultLocationGenerator,
-    DefaultFileNameGenerator,
->;
+type DataFileWriterBuilderType =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
 type PositionDeleteWriterBuilderType = PositionDeleteFileWriterBuilder<
     ParquetWriterBuilder,
@@ -107,14 +103,17 @@ type PositionDeleteWriterBuilderType = PositionDeleteFileWriterBuilder<
 
 /// Data file writer that supports both partitioned and unpartitioned tables.
 enum UpdateDataWriter {
-    Unpartitioned(DataFileWriterType),
-    Partitioned(FanoutWriter<DataFileWriterBuilderType>),
+    Unpartitioned(Box<DataFileWriterType>),
+    Partitioned(Box<FanoutWriter<DataFileWriterBuilderType>>),
 }
 
 /// Position delete writer - always uses FanoutWriter for partition evolution support.
 /// Historical files may have different partition specs than the current default,
 /// so we always route deletes by their actual partition info.
 type UpdateDeleteWriter = FanoutWriter<PositionDeleteWriterBuilderType>;
+
+type PhysicalAssignments = HashMap<String, Arc<dyn PhysicalExpr>>;
+type PhysicalExpressions = (Option<Arc<dyn PhysicalExpr>>, PhysicalAssignments);
 
 /// Column name for serialized delete files in output
 pub const UPDATE_DELETE_FILES_COL: &str = "delete_files";
@@ -401,7 +400,8 @@ async fn execute_update(
         None,
         DataFileFormat::Parquet,
     );
-    let parquet_writer = ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone());
+    let parquet_writer =
+        ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone());
     let data_rolling_writer = RollingFileWriterBuilder::new(
         parquet_writer.clone(),
         target_file_size,
@@ -471,14 +471,14 @@ async fn execute_update(
     // Data writer: based on default spec (new data goes to default partition layout)
     // Delete writer: always FanoutWriter (must handle files from any historical spec)
     let mut data_writer = if is_partitioned {
-        UpdateDataWriter::Partitioned(FanoutWriter::new(data_file_builder))
+        UpdateDataWriter::Partitioned(Box::new(FanoutWriter::new(data_file_builder)))
     } else {
-        UpdateDataWriter::Unpartitioned(
+        UpdateDataWriter::Unpartitioned(Box::new(
             data_file_builder
                 .build(None)
                 .await
                 .map_err(to_datafusion_error)?,
-        )
+        ))
     };
     // Delete writer always uses FanoutWriter to handle partition evolution:
     // historical files may have different partition specs than the current default
@@ -515,9 +515,8 @@ async fn execute_update(
                 // File not in map - only valid if default spec is unpartitioned
                 if is_partitioned {
                     return Err(DataFusionError::Internal(format!(
-                        "No partition info found for file '{}'. This may indicate a consistency issue \
-                         between the scan and write phases.",
-                        file_path
+                        "No partition info found for file '{file_path}'. This may indicate a consistency issue \
+                         between the scan and write phases."
                     )));
                 }
                 // Default spec is unpartitioned, so empty partition is correct
@@ -589,8 +588,7 @@ async fn execute_update(
                 // Write position deletes for original rows (with partition awareness)
                 let delete_batch =
                     make_position_delete_batch(&file_path, &positions, delete_schema.clone())?;
-                write_delete_batch(&mut delete_writer, delete_batch, &file_partition_key)
-                    .await?;
+                write_delete_batch(&mut delete_writer, delete_batch, &file_partition_key).await?;
 
                 total_count += positions.len() as u64;
             }
@@ -633,8 +631,7 @@ async fn execute_update(
                 // Write position deletes for original rows (with partition awareness)
                 let delete_batch =
                     make_position_delete_batch(&file_path, &positions, delete_schema.clone())?;
-                write_delete_batch(&mut delete_writer, delete_batch, &file_partition_key)
-                    .await?;
+                write_delete_batch(&mut delete_writer, delete_batch, &file_partition_key).await?;
 
                 total_count += positions.len() as u64;
             }
@@ -658,17 +655,14 @@ async fn execute_update(
     let data_files_json: Vec<String> = data_files
         .into_iter()
         .map(|df| {
-            let file_json =
-                serialize_data_file_to_json(df, default_partition_type, format_version)
-                    .map_err(to_datafusion_error)?;
+            let file_json = serialize_data_file_to_json(df, default_partition_type, format_version)
+                .map_err(to_datafusion_error)?;
             serde_json::to_string(&SerializedFileWithSpec {
                 spec_id: default_spec_id,
                 file_json,
             })
             .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to serialize data file metadata: {e}"
-                ))
+                DataFusionError::Execution(format!("Failed to serialize data file metadata: {e}"))
             })
         })
         .collect::<DFResult<Vec<_>>>()?;
@@ -689,9 +683,7 @@ async fn execute_update(
             let file_json = serialize_data_file_to_json(df, partition_type, format_version)
                 .map_err(to_datafusion_error)?;
             serde_json::to_string(&SerializedFileWithSpec { spec_id, file_json }).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to serialize delete file metadata: {e}"
-                ))
+                DataFusionError::Execution(format!("Failed to serialize delete file metadata: {e}"))
             })
         })
         .collect::<DFResult<Vec<_>>>()?;
@@ -704,10 +696,7 @@ fn build_physical_expressions(
     filter_exprs: &[Expr],
     assignments: &[(String, Expr)],
     batch_schema: ArrowSchemaRef,
-) -> DFResult<(
-    Option<Arc<dyn PhysicalExpr>>,
-    HashMap<String, Arc<dyn PhysicalExpr>>,
-)> {
+) -> DFResult<PhysicalExpressions> {
     let df_schema = DFSchema::try_from(batch_schema.as_ref().clone())?;
     let ctx = SessionContext::new();
     let execution_props = ctx.state().execution_props().clone();
@@ -861,7 +850,9 @@ async fn write_data_batch(
             })?;
             let partitioned_batches = splitter.split(&batch).map_err(to_datafusion_error)?;
             for (partition_key, batch) in partitioned_batches {
-                w.write(partition_key, batch).await.map_err(to_datafusion_error)?;
+                w.write(partition_key, batch)
+                    .await
+                    .map_err(to_datafusion_error)?;
             }
         }
     }
@@ -885,12 +876,8 @@ async fn write_delete_batch(
 /// Closes the data writer and returns all data files written.
 async fn close_data_writer(writer: UpdateDataWriter) -> DFResult<Vec<DataFile>> {
     match writer {
-        UpdateDataWriter::Unpartitioned(mut w) => {
-            w.close().await.map_err(to_datafusion_error)
-        }
-        UpdateDataWriter::Partitioned(w) => {
-            w.close().await.map_err(to_datafusion_error)
-        }
+        UpdateDataWriter::Unpartitioned(mut w) => w.close().await.map_err(to_datafusion_error),
+        UpdateDataWriter::Partitioned(w) => w.close().await.map_err(to_datafusion_error),
     }
 }
 

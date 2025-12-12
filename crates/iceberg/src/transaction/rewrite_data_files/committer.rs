@@ -24,17 +24,16 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use crate::error::{Error, ErrorKind, Result};
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
-use crate::table::Table;
-use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
-};
-use crate::transaction::ActionCommit;
-
 use super::file_group::FileGroup;
 use super::planner::RewriteDataFilesPlan;
 use super::result::RewriteDataFilesResult;
+use crate::error::{Error, ErrorKind, Result};
+use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::table::Table;
+use crate::transaction::ActionCommit;
+use crate::transaction::snapshot::{
+    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+};
 
 /// Result of rewriting a single file group.
 #[derive(Debug, Clone)]
@@ -183,7 +182,8 @@ impl<'a> RewriteDataFilesCommitter<'a> {
         self.validate_batch_results(&results, batch_group_ids)?;
 
         // Collect files to delete and add for this batch only
-        let (files_to_delete, files_to_add) = self.collect_batch_file_changes(&results, batch_group_ids)?;
+        let (files_to_delete, files_to_add) =
+            self.collect_batch_file_changes(&results, batch_group_ids)?;
 
         // If nothing changed, return empty commit
         if files_to_delete.is_empty() && files_to_add.is_empty() {
@@ -196,14 +196,8 @@ impl<'a> RewriteDataFilesCommitter<'a> {
         // Build statistics for result
         let rewritten_data_files_count = files_to_delete.len() as u64;
         let added_data_files_count = files_to_add.len() as u64;
-        let rewritten_bytes: u64 = files_to_delete
-            .iter()
-            .map(|e| e.file_size_in_bytes())
-            .sum();
-        let added_bytes: u64 = files_to_add
-            .iter()
-            .map(|f| f.file_size_in_bytes)
-            .sum();
+        let rewritten_bytes: u64 = files_to_delete.iter().map(|e| e.file_size_in_bytes()).sum();
+        let added_bytes: u64 = files_to_add.iter().map(|f| f.file_size_in_bytes).sum();
 
         // Find dangling delete files for this batch
         let dangling_deletes = self.find_dangling_deletes(&files_to_delete);
@@ -258,8 +252,10 @@ impl<'a> RewriteDataFilesCommitter<'a> {
         results: &[FileGroupRewriteResult],
         batch_group_ids: &[u32],
     ) -> Result<()> {
-        let expected_ids: std::collections::HashSet<u32> = batch_group_ids.iter().copied().collect();
-        let result_ids: std::collections::HashSet<u32> = results.iter().map(|r| r.group_id).collect();
+        let expected_ids: std::collections::HashSet<u32> =
+            batch_group_ids.iter().copied().collect();
+        let result_ids: std::collections::HashSet<u32> =
+            results.iter().map(|r| r.group_id).collect();
 
         // Check for missing groups
         let missing: Vec<u32> = expected_ids.difference(&result_ids).copied().collect();
@@ -350,14 +346,8 @@ impl<'a> RewriteDataFilesCommitter<'a> {
         // Build statistics for result
         let rewritten_data_files_count = files_to_delete.len() as u64;
         let added_data_files_count = files_to_add.len() as u64;
-        let rewritten_bytes: u64 = files_to_delete
-            .iter()
-            .map(|e| e.file_size_in_bytes())
-            .sum();
-        let added_bytes: u64 = files_to_add
-            .iter()
-            .map(|f| f.file_size_in_bytes)
-            .sum();
+        let rewritten_bytes: u64 = files_to_delete.iter().map(|e| e.file_size_in_bytes()).sum();
+        let added_bytes: u64 = files_to_add.iter().map(|f| f.file_size_in_bytes).sum();
 
         // Find dangling delete files (if delete tracker is available)
         let dangling_deletes = self.find_dangling_deletes(&files_to_delete);
@@ -436,7 +426,8 @@ impl<'a> RewriteDataFilesCommitter<'a> {
         let remaining_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Find position deletes whose referenced files are all being rewritten
-        let dangling_refs = tracker.find_dangling_position_deletes(&rewritten_files, &remaining_files);
+        let dangling_refs =
+            tracker.find_dangling_position_deletes(&rewritten_files, &remaining_files);
 
         // Convert ManifestEntryRef to ManifestEntry
         dangling_refs
@@ -459,20 +450,14 @@ impl<'a> RewriteDataFilesCommitter<'a> {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Duplicate rewrite results for groups: {:?}. \
-                     Each group must have exactly one result.",
-                    duplicates
+                    "Duplicate rewrite results for groups: {duplicates:?}. Each group must have exactly one result."
                 ),
             ));
         }
 
         // Build a set of expected group IDs
-        let expected_ids: std::collections::HashSet<u32> = self
-            .plan
-            .file_groups
-            .iter()
-            .map(|g| g.group_id)
-            .collect();
+        let expected_ids: std::collections::HashSet<u32> =
+            self.plan.file_groups.iter().map(|g| g.group_id).collect();
 
         // Check for missing groups
         let missing: Vec<u32> = expected_ids.difference(&seen_ids).copied().collect();
@@ -480,9 +465,7 @@ impl<'a> RewriteDataFilesCommitter<'a> {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Missing rewrite results for groups: {:?}. \
-                     All planned groups must have results.",
-                    missing
+                    "Missing rewrite results for groups: {missing:?}. All planned groups must have results."
                 ),
             ));
         }
@@ -493,9 +476,7 @@ impl<'a> RewriteDataFilesCommitter<'a> {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Unexpected rewrite results for groups: {:?}. \
-                     These groups were not in the plan.",
-                    unexpected
+                    "Unexpected rewrite results for groups: {unexpected:?}. These groups were not in the plan."
                 ),
             ));
         }
@@ -566,7 +547,7 @@ impl<'a> RewriteDataFilesCommitter<'a> {
             // Find a compatible schema for this partition spec
             // (may be historical for evolved tables)
             let partition_type = self
-                .find_compatible_partition_type(&partition_spec)
+                .find_compatible_partition_type(partition_spec)
                 .map_err(|e| {
                     Error::new(
                         ErrorKind::DataInvalid,
@@ -777,9 +758,9 @@ pub async fn execute_file_group_rewrite(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
+    use super::*;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry, ManifestStatus,
         Struct,
@@ -834,12 +815,13 @@ mod tests {
 
     #[test]
     fn test_validate_results_missing_groups() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         // Create a test table
         let file = File::open(format!(
@@ -889,12 +871,13 @@ mod tests {
 
     #[test]
     fn test_validate_results_unexpected_groups() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         // Create a test table
         let file = File::open(format!(
@@ -947,12 +930,13 @@ mod tests {
 
     #[test]
     fn test_collect_file_changes() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         // Create a test table
         let file = File::open(format!(
@@ -997,12 +981,16 @@ mod tests {
 
         // Should have 2 files to delete
         assert_eq!(files_to_delete.len(), 2);
-        assert!(files_to_delete
-            .iter()
-            .any(|e| e.file_path() == "old/file1.parquet"));
-        assert!(files_to_delete
-            .iter()
-            .any(|e| e.file_path() == "old/file2.parquet"));
+        assert!(
+            files_to_delete
+                .iter()
+                .any(|e| e.file_path() == "old/file1.parquet")
+        );
+        assert!(
+            files_to_delete
+                .iter()
+                .any(|e| e.file_path() == "old/file2.parquet")
+        );
 
         // Should have 1 file to add
         assert_eq!(files_to_add.len(), 1);
@@ -1022,12 +1010,13 @@ mod tests {
 
     #[test]
     fn test_validate_new_data_files_rejects_delete_content() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         // Create a test table
         let file = File::open(format!(
@@ -1077,12 +1066,13 @@ mod tests {
 
     #[test]
     fn test_validate_new_data_files_accepts_valid_file() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         // Create a test table
         let file = File::open(format!(
@@ -1121,12 +1111,13 @@ mod tests {
 
     #[test]
     fn test_validate_results_rejects_duplicate_groups() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         // Create a test table
         let file = File::open(format!(
@@ -1183,12 +1174,13 @@ mod tests {
 
     #[test]
     fn test_plan_batches_empty() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
@@ -1222,12 +1214,13 @@ mod tests {
 
     #[test]
     fn test_plan_batches_single_batch() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
@@ -1275,12 +1268,13 @@ mod tests {
 
     #[test]
     fn test_plan_batches_multiple_batches() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
@@ -1328,12 +1322,13 @@ mod tests {
 
     #[test]
     fn test_validate_batch_results_missing_group() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
@@ -1381,12 +1376,13 @@ mod tests {
 
     #[test]
     fn test_validate_batch_results_unexpected_group() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
@@ -1438,12 +1434,13 @@ mod tests {
 
     #[test]
     fn test_collect_batch_file_changes() {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
         use crate::io::FileIOBuilder;
         use crate::spec::TableMetadata;
         use crate::table::Table;
-        use crate::TableIdent;
-        use std::fs::File;
-        use std::io::BufReader;
 
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
@@ -1484,8 +1481,9 @@ mod tests {
             new_data_files: vec![test_data_file("new/compacted0.parquet", 30_000, 300)],
         }];
 
-        let (files_to_delete, files_to_add) =
-            committer.collect_batch_file_changes(&results, &[0]).unwrap();
+        let (files_to_delete, files_to_add) = committer
+            .collect_batch_file_changes(&results, &[0])
+            .unwrap();
 
         // Only files from group 0
         assert_eq!(files_to_delete.len(), 1);

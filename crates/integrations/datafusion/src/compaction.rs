@@ -20,21 +20,15 @@
 //! This module provides a user-friendly API for compacting Iceberg tables
 //! by rewriting small files into larger, target-sized files.
 //!
-//! # Status
-//!
-//! **Note:** The actual execution is not yet implemented. The underlying
-//! `IcebergCompactionExec` and `IcebergCompactionCommitExec` return
-//! `NotImplemented` errors. This API provides the structure and will
-//! work once file group reading/writing is implemented.
-//!
-//! # Example (once implemented)
+//! # Example
 //!
 //! ```rust,ignore
+//! use std::sync::Arc;
 //! use iceberg_datafusion::compaction::{compact_table, CompactionOptions};
 //! use tokio_util::sync::CancellationToken;
 //!
 //! // Basic compaction
-//! let result = compact_table(&table, None).await?;
+//! let result = compact_table(&table, catalog.clone(), None).await?;
 //!
 //! // With progress and cancellation
 //! let token = CancellationToken::new();
@@ -44,7 +38,7 @@
 //!         println!("{:?}", event);
 //!     }));
 //!
-//! let result = compact_table(&table, Some(options)).await?;
+//! let result = compact_table(&table, catalog.clone(), Some(options)).await?;
 //! ```
 
 use std::sync::Arc;
@@ -54,6 +48,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
+use iceberg::Catalog;
 use iceberg::table::Table;
 use iceberg::transaction::rewrite_data_files::{
     CompactionProgressEvent, ProgressCallback, RewriteDataFilesOptions, RewriteDataFilesPlanner,
@@ -105,11 +100,12 @@ impl CompactionOptions {
 /// 1. Plans which files should be compacted
 /// 2. Reads and merges the data (applying deletes)
 /// 3. Writes new compacted files
-/// 4. Commits the changes atomically
+/// 4. Commits the changes atomically to the catalog
 ///
 /// # Arguments
 ///
 /// * `table` - The Iceberg table to compact
+/// * `catalog` - The catalog for committing changes
 /// * `options` - Optional compaction configuration
 ///
 /// # Returns
@@ -123,6 +119,12 @@ impl CompactionOptions {
 /// - Execution fails (e.g., I/O errors)
 /// - Commit fails (e.g., concurrent modification)
 /// - Operation is cancelled
+///
+/// # Orphan Files
+///
+/// If the rewrite writes new data files successfully but the final catalog commit fails
+/// (for example, due to concurrent modification), those newly written files may become
+/// orphaned and require cleanup (e.g., via `remove_orphan_files`).
 ///
 /// # Cancellation
 ///
@@ -138,13 +140,9 @@ impl CompactionOptions {
 /// - `GroupCompleted` - When each file group finishes
 /// - `Completed` - When all groups are done
 /// - `Cancelled` - If operation is cancelled
-///
-/// # Status
-///
-/// **Note:** This function currently returns `NotImplemented` because
-/// the underlying file group reading/writing is not yet implemented.
 pub async fn compact_table(
     table: &Table,
+    catalog: Arc<dyn Catalog>,
     options: Option<CompactionOptions>,
 ) -> Result<RewriteDataFilesResult, DataFusionError> {
     let options = options.unwrap_or_default();
@@ -183,6 +181,7 @@ pub async fn compact_table(
     let compaction_exec = Arc::new(compaction_exec);
     let commit_exec = Arc::new(IcebergCompactionCommitExec::new(
         table.clone(),
+        catalog,
         plan,
         compaction_exec,
     )?);
