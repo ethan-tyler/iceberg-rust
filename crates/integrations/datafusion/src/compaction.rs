@@ -160,6 +160,9 @@ pub async fn compact_table(
         RewriteDataFilesOptions::from_table_properties(table.metadata().properties())
     });
 
+    // Get strategy (default to BinPack)
+    let strategy = options.strategy.unwrap_or(RewriteStrategy::BinPack);
+
     // Step 1: Plan compaction
     let planner = RewriteDataFilesPlanner::new(table, &rewrite_options);
     let plan = planner.plan().await.map_err(to_datafusion_error)?;
@@ -176,8 +179,9 @@ pub async fn compact_table(
         return Ok(RewriteDataFilesResult::empty());
     }
 
-    // Step 2: Create execution plan with progress and cancellation
-    let mut compaction_exec = IcebergCompactionExec::new(table.clone(), plan.clone())?;
+    // Step 2: Create execution plan with strategy, progress and cancellation
+    let mut compaction_exec =
+        IcebergCompactionExec::new_with_strategy(table.clone(), plan.clone(), strategy)?;
 
     if let Some(token) = options.cancellation_token {
         compaction_exec = compaction_exec.with_cancellation_token(token);
