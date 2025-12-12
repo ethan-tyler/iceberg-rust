@@ -751,13 +751,11 @@ impl RewriteDataFilesAction {
             ));
         }
 
-        // Validate strategy (placeholders for future phases)
+        // Validate strategy
         match &self.strategy {
             RewriteStrategy::Sort { .. } => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "Sort strategy not yet implemented (Phase 2.2)",
-                ));
+                // Sort strategy is now supported (Phase 2.2)
+                // Sort order resolution happens at execution time in DataFusion
             }
             RewriteStrategy::ZOrder { .. } => {
                 return Err(Error::new(
