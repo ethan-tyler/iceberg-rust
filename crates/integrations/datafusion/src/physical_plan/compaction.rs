@@ -21,6 +21,17 @@
 //! by reading data files, applying position/equality deletes, and writing compacted
 //! Parquet files.
 //!
+//! ## Strategies
+//!
+//! Two compaction strategies are supported:
+//!
+//! - **BinPack** (default): Combines files by size without changing data order.
+//!   This is the fastest strategy as it avoids sorting overhead.
+//!
+//! - **Sort**: Sorts data during compaction using a specified sort order.
+//!   Produces files with non-overlapping key ranges, enabling efficient
+//!   row group skipping in query engines.
+//!
 //! ## Architecture
 //!
 //! ```text
@@ -32,15 +43,42 @@
 //!     │   1. Check cancellation token
 //!     │   2. Emit progress event (GroupStarted)
 //!     │   3. Read data files with delete application
-//!     │   4. Write merged output (TaskWriter)
-//!     │   5. Emit progress event (GroupCompleted)
-//!     │   6. Yield DataFile JSON
+//!     │   4. Sort data (if Sort strategy)
+//!     │   5. Write merged output (TaskWriter)
+//!     │   6. Emit progress event (GroupCompleted)
+//!     │   7. Yield DataFile JSON
 //!     ▼
 //! IcebergCompactionCommitExec
 //!     │ Collects all DataFile JSON
 //!     │ Calls RewriteDataFilesCommitter::commit()
 //!     ▼
 //! Updated Table Snapshot
+//! ```
+//!
+//! ## Example: Sorted Compaction
+//!
+//! ```rust,ignore
+//! use iceberg_datafusion::compaction::{compact_table, CompactionOptions};
+//! use iceberg::transaction::rewrite_data_files::RewriteStrategy;
+//! use iceberg::spec::{SortOrder, SortField, SortDirection, NullOrder, Transform};
+//!
+//! // Create sort order
+//! let sort_order = SortOrder::builder()
+//!     .with_sort_field(
+//!         SortField::builder()
+//!             .source_id(1)  // timestamp column ID
+//!             .direction(SortDirection::Ascending)
+//!             .null_order(NullOrder::First)
+//!             .transform(Transform::Identity)
+//!             .build()
+//!     )
+//!     .build_unbound()
+//!     .unwrap();
+//!
+//! let options = CompactionOptions::default()
+//!     .with_strategy(RewriteStrategy::Sort { sort_order: Some(sort_order) });
+//!
+//! let result = compact_table(&table, catalog.clone(), Some(options)).await?;
 //! ```
 
 use std::any::Any;
