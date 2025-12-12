@@ -658,46 +658,6 @@ pub async fn write_compacted_files(
     Ok(data_files)
 }
 
-/// Process a single file group: read, merge, and write compacted output.
-///
-/// This function orchestrates the full compaction flow for a single file group:
-/// 1. Read all data files with delete application
-/// 2. Write merged data to new compacted files
-/// 3. Return metrics about the operation
-///
-/// # Arguments
-/// * `table` - The Iceberg table
-/// * `file_group` - The file group to process
-///
-/// # Returns
-/// Result containing new data files and metrics.
-pub async fn process_file_group(
-    table: &Table,
-    file_group: &FileGroup,
-) -> DFResult<FileGroupWriteResult> {
-    let start_time = Instant::now();
-    let group_id = file_group.group_id;
-    let spec_id = file_group.partition_spec_id;
-
-    // Step 1: Read all data from the file group with delete application
-    let batches = read_file_group(table, file_group).await?;
-
-    // Step 2: Write merged output to new compacted files
-    let partition = file_group.partition.as_ref();
-    let new_data_files = write_compacted_files(table, batches, partition, spec_id).await?;
-
-    // Calculate metrics
-    let bytes_written: u64 = new_data_files.iter().map(|f| f.file_size_in_bytes()).sum();
-    let duration_ms = start_time.elapsed().as_millis() as u64;
-
-    Ok(FileGroupWriteResult {
-        group_id,
-        new_data_files,
-        bytes_written,
-        duration_ms,
-    })
-}
-
 /// Build column ID to name mapping from Iceberg schema.
 fn build_column_id_map(schema: &iceberg::spec::Schema) -> HashMap<i32, String> {
     let mut map = HashMap::new();
@@ -1109,5 +1069,65 @@ mod tests {
         assert_eq!(id_col.value(2), 1);
         assert_eq!(cat_col.value(3), "b");
         assert_eq!(id_col.value(3), 2);
+    }
+
+    #[tokio::test]
+    async fn test_sort_batches_empty_input() {
+        use iceberg::spec::{NullOrder, SortField};
+
+        let sort_order = SortOrder::builder()
+            .with_sort_field(
+                SortField::builder()
+                    .source_id(1)
+                    .direction(SortDirection::Ascending)
+                    .null_order(NullOrder::First)
+                    .transform(Transform::Identity)
+                    .build(),
+            )
+            .build_unbound()
+            .unwrap();
+
+        let column_id_to_name = HashMap::new();
+
+        let sorted = sort_batches(vec![], &sort_order, &column_id_to_name)
+            .await
+            .unwrap();
+        assert!(sorted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sort_batches_unsorted_order_passthrough() {
+        use datafusion::arrow::array::Int64Array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![3, 1, 2]))],
+        )
+        .unwrap();
+
+        // Unsorted order (empty fields) should pass through unchanged
+        let sort_order = SortOrder::unsorted_order();
+        let column_id_to_name = HashMap::new();
+
+        let sorted = sort_batches(vec![batch.clone()], &sort_order, &column_id_to_name)
+            .await
+            .unwrap();
+
+        // Should be unchanged
+        assert_eq!(sorted.len(), 1);
+        let id_col = sorted[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 3);
+        assert_eq!(id_col.value(1), 1);
+        assert_eq!(id_col.value(2), 2);
     }
 }
