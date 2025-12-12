@@ -132,7 +132,7 @@ spark.sql("INSERT INTO rest.default.test_promote_partition_column VALUES (25, 22
 
 #  Create a table with various types
 spark.sql("""
-CREATE OR REPLACE TABLE rest.default.types_test USING ICEBERG AS 
+CREATE OR REPLACE TABLE rest.default.types_test USING ICEBERG AS
 SELECT
     CAST(s % 2 = 1 AS BOOLEAN) AS cboolean,
     CAST(s % 256 - 128 AS TINYINT) AS ctinyint,
@@ -150,4 +150,116 @@ SELECT
 FROM (
     SELECT EXPLODE(SEQUENCE(0, 1000)) AS s
 );
+""")
+
+# =============================================================================
+# Partition Evolution Cross-Engine Tests
+# =============================================================================
+# These tables are created with partition evolution to test iceberg-rust's
+# ability to perform DML operations (DELETE, UPDATE, MERGE) on tables with
+# multiple partition specs. See docs/partition-evolution/DESIGN.md
+
+# Table for testing DELETE on evolved partitions
+# Spec v0: unpartitioned, Spec v1: partitioned by category
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_partition_evolution_delete (
+    id     integer,
+    category string,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.delete.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+# Insert data under spec v0 (unpartitioned)
+spark.sql("""
+INSERT INTO rest.default.test_partition_evolution_delete
+VALUES
+    (1, 'electronics', 100),
+    (2, 'electronics', 200),
+    (3, 'books', 300);
+""")
+
+# Evolve to partition by category
+spark.sql("ALTER TABLE rest.default.test_partition_evolution_delete ADD PARTITION FIELD category")
+
+# Insert data under spec v1 (partitioned by category)
+spark.sql("""
+INSERT INTO rest.default.test_partition_evolution_delete
+VALUES
+    (4, 'books', 400),
+    (5, 'electronics', 500);
+""")
+
+# Table for testing UPDATE on evolved partitions
+# Spec v0: unpartitioned, Spec v1: partitioned by region
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_partition_evolution_update (
+    id     integer,
+    region string,
+    status string
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.update.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+# Insert data under spec v0 (unpartitioned)
+spark.sql("""
+INSERT INTO rest.default.test_partition_evolution_update
+VALUES
+    (1, 'US', 'pending'),
+    (2, 'US', 'pending'),
+    (3, 'EU', 'pending');
+""")
+
+# Evolve to partition by region
+spark.sql("ALTER TABLE rest.default.test_partition_evolution_update ADD PARTITION FIELD region")
+
+# Insert data under spec v1 (partitioned by region)
+spark.sql("""
+INSERT INTO rest.default.test_partition_evolution_update
+VALUES
+    (4, 'EU', 'pending'),
+    (5, 'APAC', 'pending');
+""")
+
+# Table for testing MERGE on evolved partitions
+# Spec v0: unpartitioned, Spec v1: partitioned by region
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_partition_evolution_merge (
+    id     integer,
+    region string,
+    amount integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.merge.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+# Insert data under spec v0 (unpartitioned)
+spark.sql("""
+INSERT INTO rest.default.test_partition_evolution_merge
+VALUES
+    (1, 'US', 100),
+    (2, 'US', 200),
+    (3, 'EU', 300);
+""")
+
+# Evolve to partition by region
+spark.sql("ALTER TABLE rest.default.test_partition_evolution_merge ADD PARTITION FIELD region")
+
+# Insert data under spec v1 (partitioned by region)
+spark.sql("""
+INSERT INTO rest.default.test_partition_evolution_merge
+VALUES
+    (4, 'EU', 400),
+    (5, 'APAC', 500);
 """)

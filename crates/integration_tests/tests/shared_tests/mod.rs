@@ -28,6 +28,7 @@ mod append_partition_data_file_test;
 mod conflict_commit_test;
 mod datafusion;
 mod delete_files_test;
+mod partition_evolution_crossengine;
 mod read_evolved_schema;
 mod read_positional_deletes;
 mod scan_all_type;
