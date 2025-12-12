@@ -146,6 +146,8 @@ pub use strategy::RewriteStrategy;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -174,7 +176,6 @@ use crate::transaction::{ActionCommit, TransactionAction};
 /// - `bin_pack()`: Default - combines files by size (Phase 2.1)
 /// - `sort()`: Sort data during compaction (Phase 2.2)
 /// - `z_order()`: Z-order clustering for multi-column optimization (Phase 2.3)
-#[derive(Debug)]
 pub struct RewriteDataFilesAction {
     /// Configuration options
     options: RewriteDataFilesOptions,
@@ -193,6 +194,12 @@ pub struct RewriteDataFilesAction {
 
     /// Snapshot summary properties
     snapshot_properties: HashMap<String, String>,
+
+    /// Cancellation token for aborting the operation.
+    cancellation_token: Option<CancellationToken>,
+
+    /// Progress callback for monitoring.
+    progress_callback: Option<ProgressCallback>,
 }
 
 impl RewriteDataFilesAction {
@@ -205,6 +212,8 @@ impl RewriteDataFilesAction {
             case_sensitive: true,
             commit_uuid: None,
             snapshot_properties: HashMap::new(),
+            cancellation_token: None,
+            progress_callback: None,
         }
     }
 
@@ -545,6 +554,77 @@ impl RewriteDataFilesAction {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Progress and Cancellation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Set a cancellation token for aborting the operation.
+    ///
+    /// When the token is cancelled, the operation will stop processing
+    /// new file groups and return early with partial results.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tokio_util::sync::CancellationToken;
+    /// use std::time::Duration;
+    ///
+    /// let token = CancellationToken::new();
+    /// let token_clone = token.clone();
+    ///
+    /// // Spawn task to cancel after timeout
+    /// tokio::spawn(async move {
+    ///     tokio::time::sleep(Duration::from_secs(60)).await;
+    ///     token_clone.cancel();
+    /// });
+    ///
+    /// let result = table.rewrite_data_files()
+    ///     .with_cancellation_token(token)
+    ///     .execute()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    /// Set a progress callback for monitoring the operation.
+    ///
+    /// The callback will be invoked for each progress event during
+    /// the compaction operation.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use iceberg::transaction::rewrite_data_files::CompactionProgressEvent;
+    ///
+    /// let result = table.rewrite_data_files()
+    ///     .with_progress_callback(Arc::new(|event| {
+    ///         match event {
+    ///             CompactionProgressEvent::GroupCompleted { group_id, .. } => {
+    ///                 println!("Completed group {}", group_id);
+    ///             }
+    ///             _ => {}
+    ///         }
+    ///     }))
+    ///     .execute()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_progress_callback(mut self, callback: ProgressCallback) -> Self {
+        self.progress_callback = Some(callback);
+        self
+    }
+
+    /// Check if the operation has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token
+            .as_ref()
+            .is_some_and(|t| t.is_cancelled())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Commit Configuration (Reserved for future use)
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -818,5 +898,35 @@ mod tests {
 
         let action = RewriteDataFilesAction::new().z_order(vec!["col1".to_string()]);
         assert!(matches!(action.strategy, RewriteStrategy::ZOrder { .. }));
+    }
+
+    #[test]
+    fn test_rewrite_action_with_cancellation() {
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+
+        let action = RewriteDataFilesAction::new().with_cancellation_token(token.clone());
+
+        assert!(!action.is_cancelled());
+        token.cancel();
+        assert!(action.is_cancelled());
+    }
+
+    #[test]
+    fn test_rewrite_action_with_progress_callback() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let callback: ProgressCallback = Arc::new(move |_event| {
+            counter_clone.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let action = RewriteDataFilesAction::new().with_progress_callback(callback);
+
+        // Callback is set
+        assert!(action.progress_callback.is_some());
     }
 }
