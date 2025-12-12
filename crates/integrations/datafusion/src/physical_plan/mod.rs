@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod commit;
+pub(crate) mod compaction;
 pub(crate) mod delete_commit;
 pub(crate) mod delete_scan;
 pub(crate) mod delete_write;
