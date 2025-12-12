@@ -28,17 +28,20 @@
 
 use std::collections::HashMap;
 
+use super::FilterStats;
+use super::delete_tracker::DeleteTracker;
+use super::file_group::{FileGroup, bin_pack_files, order_groups};
+use super::options::RewriteDataFilesOptions;
+use super::partition_filter::{MultiSpecPartitionFilter, PartitionFilterEvaluator, PartitionKey};
 use crate::error::{Error, ErrorKind, Result};
 use crate::expr::Predicate;
 use crate::spec::{
-    DataContentType, FormatVersion, ManifestContentType, ManifestEntryRef, ManifestStatus, Struct,
+    DataContentType, FormatVersion, ManifestContentType, ManifestEntryRef, ManifestStatus,
+    PartitionSpecRef, Struct,
 };
 use crate::table::Table;
 
-use super::delete_tracker::DeleteTracker;
-use super::file_group::{bin_pack_files, order_groups, FileGroup};
-use super::options::RewriteDataFilesOptions;
-use super::partition_filter::PartitionFilterEvaluator;
+type PartitionEntryGroups = HashMap<(Option<Struct>, i32), Vec<ManifestEntryRef>>;
 
 /// Result of the planning phase.
 #[derive(Debug, Clone)]
@@ -64,6 +67,22 @@ pub struct RewriteDataFilesPlan {
     /// Used by the committer to identify delete files that can be removed
     /// after compaction.
     pub(super) delete_tracker: Option<DeleteTracker>,
+}
+
+/// Result of planning with filter diagnostics.
+///
+/// Returned by [`RewriteDataFilesPlanner::plan_with_stats`] to provide both
+/// the plan and diagnostics about partition filter evaluation.
+#[derive(Debug, Clone)]
+pub struct RewriteDataFilesPlanningResult {
+    /// The compaction plan.
+    pub plan: RewriteDataFilesPlan,
+
+    /// Partition filter diagnostics.
+    ///
+    /// Contains counters for fail-open behavior during filtering.
+    /// Check `fail_open_partitions > 0` to detect degraded filtering.
+    pub filter_stats: FilterStats,
 }
 
 /// Planner for the rewrite data files operation.
@@ -95,12 +114,20 @@ impl<'a> RewriteDataFilesPlanner<'a> {
     /// The predicate is projected to partition values using inclusive projection,
     /// meaning it will include any partition that *might* contain matching data.
     ///
-    /// # Partition Evolution
+    /// # Partition Evolution (Multi-Spec Evaluation)
     ///
     /// When a table has multiple partition specs (due to partition evolution),
-    /// files with partition specs that don't match the table's current default spec
-    /// are included conservatively (not filtered out). This ensures correctness
-    /// at the cost of potentially compacting more files than strictly necessary.
+    /// each file is evaluated against its own partition spec. The predicate is
+    /// projected separately to each spec, enabling correct filtering across
+    /// evolved tables.
+    ///
+    /// **Fail-open semantics:** If the predicate cannot be projected to a spec
+    /// (incompatible transforms or missing fields), or if evaluation errors
+    /// occur, files in those partitions are included rather than excluded.
+    /// This ensures correctness at the cost of potentially compacting more
+    /// files than strictly necessary.
+    ///
+    /// Use [`plan_with_stats`] to get diagnostics about fail-open behavior.
     #[must_use]
     pub fn with_partition_filter(mut self, filter: &'a Predicate) -> Self {
         self.partition_filter = Some(filter);
@@ -117,35 +144,32 @@ impl<'a> RewriteDataFilesPlanner<'a> {
         self
     }
 
-    /// Execute the planning phase.
+    /// Execute the planning phase with filter diagnostics.
     ///
     /// This method:
     /// 1. Validates the table has a current snapshot
     /// 2. Loads all data file entries from manifests
-    /// 3. Filters by partition predicate (if provided)
+    /// 3. Filters by partition predicate (if provided) using multi-spec evaluation
     /// 4. Selects candidates based on size thresholds
-    /// 5. Groups files by partition
-    /// 6. Applies bin-packing within partitions
-    /// 7. Filters groups below minimum thresholds
-    /// 8. Orders groups according to configuration
-    /// 9. Loads delete files for V2 tables
+    /// 5. Counts fail_open_files among candidates
+    /// 6. Groups files by partition
+    /// 7. Applies bin-packing within partitions
+    /// 8. Filters groups below minimum thresholds
+    /// 9. Orders groups according to configuration
+    /// 10. Loads delete files for V2 tables
     ///
     /// # Returns
     ///
-    /// A `RewriteDataFilesPlan` containing file groups to process,
-    /// or an error if planning fails.
-    pub async fn plan(&self) -> Result<RewriteDataFilesPlan> {
+    /// A `RewriteDataFilesPlanningResult` containing file groups to process
+    /// and filter diagnostics, or an error if planning fails.
+    pub async fn plan_with_stats(&self) -> Result<RewriteDataFilesPlanningResult> {
         // Step 1: Validate snapshot exists
-        let snapshot = self
-            .table
-            .metadata()
-            .current_snapshot()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Cannot rewrite data files: table has no current snapshot",
-                )
-            })?;
+        let snapshot = self.table.metadata().current_snapshot().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot rewrite data files: table has no current snapshot",
+            )
+        })?;
 
         let starting_sequence_number = snapshot.sequence_number();
 
@@ -153,25 +177,33 @@ impl<'a> RewriteDataFilesPlanner<'a> {
         let all_entries = self.load_data_files().await?;
 
         if all_entries.is_empty() {
-            return Ok(RewriteDataFilesPlan {
-                file_groups: vec![],
-                starting_sequence_number,
-                total_data_files: 0,
-                total_bytes: 0,
-                delete_tracker: None,
+            return Ok(RewriteDataFilesPlanningResult {
+                plan: RewriteDataFilesPlan {
+                    file_groups: vec![],
+                    starting_sequence_number,
+                    total_data_files: 0,
+                    total_bytes: 0,
+                    delete_tracker: None,
+                },
+                filter_stats: FilterStats::default(),
             });
         }
 
         // Step 3: Filter by partition predicate (if provided)
-        let filtered_entries = self.filter_by_partition(all_entries)?;
+        // Use internal method to get both filtered entries and the filter for stats
+        let (filtered_entries, partition_filter) =
+            self.filter_by_partition_internal(all_entries)?;
 
         if filtered_entries.is_empty() {
-            return Ok(RewriteDataFilesPlan {
-                file_groups: vec![],
-                starting_sequence_number,
-                total_data_files: 0,
-                total_bytes: 0,
-                delete_tracker: None,
+            return Ok(RewriteDataFilesPlanningResult {
+                plan: RewriteDataFilesPlan {
+                    file_groups: vec![],
+                    starting_sequence_number,
+                    total_data_files: 0,
+                    total_bytes: 0,
+                    delete_tracker: None,
+                },
+                filter_stats: partition_filter.map(|f| f.stats()).unwrap_or_default(),
             });
         }
 
@@ -182,13 +214,37 @@ impl<'a> RewriteDataFilesPlanner<'a> {
         // Step 5: Select candidates based on size thresholds and delete count
         let candidates = self.select_candidates(filtered_entries, delete_index.as_ref())?;
 
+        // Step 5b: Count fail_open_files among candidates
+        // Build spec_map for PartitionKey construction
+        if let Some(ref filter) = partition_filter {
+            let spec_map: HashMap<i32, PartitionSpecRef> = self
+                .table
+                .metadata()
+                .partition_specs_iter()
+                .map(|spec| (spec.spec_id(), spec.clone()))
+                .collect();
+
+            for candidate in &candidates {
+                let spec_id = candidate.data_file.partition_spec_id;
+                if let Some(spec) = spec_map.get(&spec_id) {
+                    let key = PartitionKey::from_manifest_entry(candidate, spec);
+                    if filter.is_fail_open(&key) {
+                        filter.increment_fail_open_files();
+                    }
+                }
+            }
+        }
+
         if candidates.is_empty() {
-            return Ok(RewriteDataFilesPlan {
-                file_groups: vec![],
-                starting_sequence_number,
-                total_data_files: 0,
-                total_bytes: 0,
-                delete_tracker: None,
+            return Ok(RewriteDataFilesPlanningResult {
+                plan: RewriteDataFilesPlan {
+                    file_groups: vec![],
+                    starting_sequence_number,
+                    total_data_files: 0,
+                    total_bytes: 0,
+                    delete_tracker: None,
+                },
+                filter_stats: partition_filter.map(|f| f.stats()).unwrap_or_default(),
             });
         }
 
@@ -202,12 +258,15 @@ impl<'a> RewriteDataFilesPlanner<'a> {
         file_groups = self.filter_valid_groups(file_groups);
 
         if file_groups.is_empty() {
-            return Ok(RewriteDataFilesPlan {
-                file_groups: vec![],
-                starting_sequence_number,
-                total_data_files: 0,
-                total_bytes: 0,
-                delete_tracker: None,
+            return Ok(RewriteDataFilesPlanningResult {
+                plan: RewriteDataFilesPlan {
+                    file_groups: vec![],
+                    starting_sequence_number,
+                    total_data_files: 0,
+                    total_bytes: 0,
+                    delete_tracker: None,
+                },
+                filter_stats: partition_filter.map(|f| f.stats()).unwrap_or_default(),
             });
         }
 
@@ -233,13 +292,30 @@ impl<'a> RewriteDataFilesPlanner<'a> {
         let total_data_files: u64 = file_groups.iter().map(|g| g.file_count() as u64).sum();
         let total_bytes: u64 = file_groups.iter().map(|g| g.total_bytes).sum();
 
-        Ok(RewriteDataFilesPlan {
-            file_groups,
-            starting_sequence_number,
-            total_data_files,
-            total_bytes,
-            delete_tracker,
+        Ok(RewriteDataFilesPlanningResult {
+            plan: RewriteDataFilesPlan {
+                file_groups,
+                starting_sequence_number,
+                total_data_files,
+                total_bytes,
+                delete_tracker,
+            },
+            filter_stats: partition_filter.map(|f| f.stats()).unwrap_or_default(),
         })
+    }
+
+    /// Execute the planning phase.
+    ///
+    /// This is a convenience method that delegates to [`plan_with_stats`] and
+    /// discards the filter diagnostics. Use `plan_with_stats` when you need
+    /// visibility into partition filter evaluation behavior.
+    ///
+    /// # Returns
+    ///
+    /// A `RewriteDataFilesPlan` containing file groups to process,
+    /// or an error if planning fails.
+    pub async fn plan(&self) -> Result<RewriteDataFilesPlan> {
+        self.plan_with_stats().await.map(|result| result.plan)
     }
 
     /// Build a delete tracker from the delete files loaded into file groups.
@@ -277,9 +353,11 @@ impl<'a> RewriteDataFilesPlanner<'a> {
 
     /// Load all data file entries from the current snapshot's manifests.
     async fn load_data_files(&self) -> Result<Vec<ManifestEntryRef>> {
-        let snapshot = self.table.metadata().current_snapshot().ok_or_else(|| {
-            Error::new(ErrorKind::DataInvalid, "No current snapshot")
-        })?;
+        let snapshot = self
+            .table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "No current snapshot"))?;
 
         let manifest_list = snapshot
             .load_manifest_list(self.table.file_io(), self.table.metadata())
@@ -314,31 +392,39 @@ impl<'a> RewriteDataFilesPlanner<'a> {
         Ok(entries)
     }
 
-    /// Filter entries by partition predicate.
+    /// Filter entries by partition predicate using multi-spec evaluation.
     ///
-    /// Creates a `PartitionFilterEvaluator` from the partition filter predicate
-    /// and uses it to filter entries. Entries with partition specs that don't
-    /// match the evaluator's spec are included conservatively (partition evolution safety).
-    fn filter_by_partition(
+    /// Creates a `MultiSpecPartitionFilter` from the partition filter predicate
+    /// and uses it to filter entries. Each entry is evaluated against its own
+    /// partition spec. Fail-open semantics apply for unevaluable specs.
+    ///
+    /// Returns the filtered entries and optionally the filter (for stats collection).
+    fn filter_by_partition_internal(
         &self,
         entries: Vec<ManifestEntryRef>,
-    ) -> Result<Vec<ManifestEntryRef>> {
+    ) -> Result<(Vec<ManifestEntryRef>, Option<MultiSpecPartitionFilter>)> {
         match &self.partition_filter {
             Some(predicate) => {
-                // Create evaluator for the partition filter
-                let schema = self.table.metadata().current_schema();
-                let partition_spec = self.table.metadata().default_partition_spec();
+                // Build spec_id -> PartitionSpec map
+                let spec_map: HashMap<i32, PartitionSpecRef> = self
+                    .table
+                    .metadata()
+                    .partition_specs_iter()
+                    .map(|spec| (spec.spec_id(), spec.clone()))
+                    .collect();
 
-                let evaluator = PartitionFilterEvaluator::try_new(
+                // Create multi-spec filter
+                let filter = MultiSpecPartitionFilter::try_new(
                     predicate,
-                    schema,
-                    partition_spec,
+                    self.table.metadata(),
                     self.case_sensitive,
                 )?;
 
-                filter_entries_by_partition(entries, Some(&evaluator))
+                let filtered = filter_entries_with_multi_spec(entries, Some(&filter), &spec_map)?;
+
+                Ok((filtered, Some(filter)))
             }
-            None => Ok(entries), // No filter, return all entries
+            None => Ok((entries, None)), // No filter, return all entries
         }
     }
 
@@ -379,9 +465,11 @@ impl<'a> RewriteDataFilesPlanner<'a> {
             return Ok(None);
         }
 
-        let snapshot = self.table.metadata().current_snapshot().ok_or_else(|| {
-            Error::new(ErrorKind::DataInvalid, "No current snapshot")
-        })?;
+        let snapshot = self
+            .table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "No current snapshot"))?;
 
         let manifest_list = snapshot
             .load_manifest_list(self.table.file_io(), self.table.metadata())
@@ -426,11 +514,8 @@ impl<'a> RewriteDataFilesPlanner<'a> {
     /// # Errors
     ///
     /// Returns an error if any entry references an unknown partition spec ID.
-    fn group_by_partition(
-        &self,
-        entries: Vec<ManifestEntryRef>,
-    ) -> Result<HashMap<(Option<Struct>, i32), Vec<ManifestEntryRef>>> {
-        let mut groups: HashMap<(Option<Struct>, i32), Vec<ManifestEntryRef>> = HashMap::new();
+    fn group_by_partition(&self, entries: Vec<ManifestEntryRef>) -> Result<PartitionEntryGroups> {
+        let mut groups: PartitionEntryGroups = HashMap::new();
 
         // Build mapping of spec_id -> is_unpartitioned for all partition specs
         let spec_unpartitioned: HashMap<i32, bool> = self
@@ -444,17 +529,16 @@ impl<'a> RewriteDataFilesPlanner<'a> {
             let spec_id = entry.data_file.partition_spec_id;
 
             // Derive is_unpartitioned from the entry's spec_id, failing if unknown
-            let is_unpartitioned =
-                spec_unpartitioned.get(&spec_id).copied().ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Data file '{}' references unknown partition spec ID {}. \
+            let is_unpartitioned = spec_unpartitioned.get(&spec_id).copied().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Data file '{}' references unknown partition spec ID {spec_id}. \
                              This may indicate table metadata corruption.",
-                            entry.data_file.file_path, spec_id
-                        ),
-                    )
-                })?;
+                        entry.data_file.file_path
+                    ),
+                )
+            })?;
 
             let partition = if is_unpartitioned {
                 None
@@ -462,10 +546,7 @@ impl<'a> RewriteDataFilesPlanner<'a> {
                 Some(entry.data_file.partition().clone())
             };
 
-            groups
-                .entry((partition, spec_id))
-                .or_default()
-                .push(entry);
+            groups.entry((partition, spec_id)).or_default().push(entry);
         }
 
         Ok(groups)
@@ -490,7 +571,7 @@ impl<'a> RewriteDataFilesPlanner<'a> {
                 // Use partition's Debug representation for stable lexicographic ordering
                 let partition_repr = partition
                     .as_ref()
-                    .map(|p| format!("{:?}", p))
+                    .map(|p| format!("{p:?}"))
                     .unwrap_or_default();
 
                 ((spec_id, partition_repr), partition, entries)
@@ -555,16 +636,23 @@ impl<'a> RewriteDataFilesPlanner<'a> {
                 .push(idx);
         }
 
-        let is_unpartitioned = self
+        // Build mapping of spec_id -> is_unpartitioned for all partition specs.
+        // This must be derived from each entry's own spec_id to correctly handle
+        // partition evolution where a table may contain both partitioned and
+        // unpartitioned specs.
+        let spec_unpartitioned: HashMap<i32, bool> = self
             .table
             .metadata()
-            .default_partition_spec()
-            .is_unpartitioned();
+            .partition_specs_iter()
+            .map(|spec| (spec.spec_id(), spec.is_unpartitioned()))
+            .collect();
 
         // Load delete manifests
-        let snapshot = self.table.metadata().current_snapshot().ok_or_else(|| {
-            Error::new(ErrorKind::DataInvalid, "No current snapshot")
-        })?;
+        let snapshot = self
+            .table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "No current snapshot"))?;
 
         let manifest_list = snapshot
             .load_manifest_list(self.table.file_io(), self.table.metadata())
@@ -589,7 +677,19 @@ impl<'a> RewriteDataFilesPlanner<'a> {
                 let content_type = entry.data_file.content_type();
 
                 // Find group indices with matching partition AND spec_id
-                // For unpartitioned tables, delete files apply to all groups with matching spec_id
+                // For unpartitioned specs, delete files apply to all groups with matching spec_id.
+                let is_unpartitioned =
+                    spec_unpartitioned.get(&spec_id).copied().ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Delete file '{}' references unknown partition spec ID {}. \
+                             This may indicate table metadata corruption.",
+                                entry.data_file.file_path, spec_id
+                            ),
+                        )
+                    })?;
+
                 let lookup_key = if is_unpartitioned {
                     (None, spec_id)
                 } else {
@@ -679,16 +779,20 @@ impl DeleteIndex {
         let spec_id = entry.data_file.partition_spec_id;
 
         // Derive is_unpartitioned from the entry's spec_id, failing if unknown
-        let is_unpartitioned = self.spec_unpartitioned.get(&spec_id).copied().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Delete file '{}' references unknown partition spec ID {}. \
+        let is_unpartitioned = self
+            .spec_unpartitioned
+            .get(&spec_id)
+            .copied()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Delete file '{}' references unknown partition spec ID {}. \
                      This may indicate table metadata corruption.",
-                    entry.data_file.file_path, spec_id
-                ),
-            )
-        })?;
+                        entry.data_file.file_path, spec_id
+                    ),
+                )
+            })?;
 
         let partition = if is_unpartitioned {
             None
@@ -745,16 +849,16 @@ impl DeleteIndex {
         let spec_id = entry.data_file.partition_spec_id;
 
         // Derive is_unpartitioned from the entry's spec_id, failing if unknown
-        let is_unpartitioned = self.spec_unpartitioned.get(&spec_id).copied().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Data file '{}' references unknown partition spec ID {}. \
-                     This may indicate table metadata corruption.",
-                    file_path, spec_id
-                ),
-            )
-        })?;
+        let is_unpartitioned = self
+                .spec_unpartitioned
+                .get(&spec_id)
+                .copied()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Data file '{file_path}' references unknown partition spec ID {spec_id}. This may indicate table metadata corruption."),
+                    )
+                })?;
 
         let partition = if is_unpartitioned {
             None
@@ -770,13 +874,18 @@ impl DeleteIndex {
         }
 
         // Position deletes for this partition (not referencing specific files)
-        if let Some(deletes) = self.position_deletes_by_partition.get(&(partition.clone(), spec_id))
+        if let Some(deletes) = self
+            .position_deletes_by_partition
+            .get(&(partition.clone(), spec_id))
         {
             count += deletes.len();
         }
 
         // Equality deletes for this partition
-        if let Some(deletes) = self.equality_deletes_by_partition.get(&(partition, spec_id)) {
+        if let Some(deletes) = self
+            .equality_deletes_by_partition
+            .get(&(partition, spec_id))
+        {
             count += deletes.len();
         }
 
@@ -811,16 +920,68 @@ fn is_candidate_with_deletes(
     }
 
     // Delete-based: too many associated deletes
-    if let Some(threshold) = options.delete_file_threshold {
-        if delete_count >= threshold as usize {
-            return true;
-        }
+    if options
+        .delete_file_threshold
+        .is_some_and(|threshold| delete_count >= threshold as usize)
+    {
+        return true;
     }
 
     false
 }
 
-/// Filter entries by partition predicate.
+/// Filter entries using a multi-spec partition filter.
+///
+/// This helper evaluates each entry against the filter using its correct
+/// partition spec. Fail-open semantics apply when evaluation isn't possible.
+///
+/// # Arguments
+///
+/// * `entries` - Manifest entries to filter
+/// * `filter` - Multi-spec filter (if None, all entries pass through)
+/// * `spec_map` - Mapping of spec_id to PartitionSpec for building PartitionKey
+///
+/// # Errors
+///
+/// Returns an error if any entry references an unknown partition spec ID.
+fn filter_entries_with_multi_spec(
+    entries: Vec<ManifestEntryRef>,
+    filter: Option<&MultiSpecPartitionFilter>,
+    spec_map: &HashMap<i32, PartitionSpecRef>,
+) -> Result<Vec<ManifestEntryRef>> {
+    let filter = match filter {
+        None => return Ok(entries),
+        Some(f) => f,
+    };
+
+    let mut filtered = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let spec_id = entry.data_file.partition_spec_id;
+
+        // Lookup the spec for this entry
+        let spec = spec_map.get(&spec_id).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Data file '{}' references unknown partition spec ID {}. \
+                     This may indicate table metadata corruption.",
+                    entry.data_file.file_path, spec_id
+                ),
+            )
+        })?;
+
+        let key = PartitionKey::from_manifest_entry(&entry, spec);
+
+        if filter.matches(&key)? {
+            filtered.push(entry);
+        }
+    }
+
+    Ok(filtered)
+}
+
+/// Filter entries by partition predicate (legacy single-spec version).
 ///
 /// This is a helper function used by the planner to filter entries
 /// before grouping. If no evaluator is provided, all entries pass through.
@@ -828,6 +989,7 @@ fn is_candidate_with_deletes(
 /// **Partition Evolution Safety:** When an entry's partition_spec_id doesn't match
 /// the evaluator's spec_id, the entry is included by default (conservative behavior).
 /// This ensures we don't incorrectly exclude entries from tables with evolved partitions.
+#[allow(dead_code)] // Kept for backward compatibility, superseded by filter_entries_with_multi_spec
 fn filter_entries_by_partition(
     entries: Vec<ManifestEntryRef>,
     evaluator: Option<&PartitionFilterEvaluator>,
@@ -1076,7 +1238,10 @@ mod tests {
         // Should exclude:
         // - file2 (matches spec but doesn't match filter)
         assert_eq!(filtered.len(), 2);
-        let paths: Vec<&str> = filtered.iter().map(|e| e.data_file.file_path.as_str()).collect();
+        let paths: Vec<&str> = filtered
+            .iter()
+            .map(|e| e.data_file.file_path.as_str())
+            .collect();
         assert!(paths.contains(&"file1.parquet"));
         assert!(paths.contains(&"file3.parquet"));
         assert!(!paths.contains(&"file2.parquet"));

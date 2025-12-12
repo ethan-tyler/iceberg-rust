@@ -82,13 +82,10 @@
 //! let committer = RewriteDataFilesCommitter::new(&table, plan);
 //! let (mut action_commit, result) = committer.commit(results).await?;
 //!
-//! // Apply directly to catalog (take_* methods consume the ActionCommit fields)
-//! let table_commit = TableCommit::builder()
-//!     .ident(table.identifier().clone())
-//!     .updates(action_commit.take_updates())
-//!     .requirements(action_commit.take_requirements())
-//!     .build();
-//! let table = catalog.update_table(table_commit).await?;
+//! // Apply directly to catalog (consumes the ActionCommit fields)
+//! let table = action_commit
+//!     .commit_to_catalog(table.identifier().clone(), catalog.as_ref())
+//!     .await?;
 //!
 //! println!("Compacted {} files into {} files, saved {} bytes",
 //!     result.rewritten_data_files_count,
@@ -138,17 +135,56 @@ mod strategy;
 pub use committer::{FileGroupRewriteResult, RewriteDataFilesCommitter};
 pub use file_group::FileGroup;
 pub use options::{RewriteDataFilesOptions, RewriteJobOrder};
-pub use planner::{RewriteDataFilesPlanner, RewriteDataFilesPlan};
+pub use planner::{RewriteDataFilesPlan, RewriteDataFilesPlanner, RewriteDataFilesPlanningResult};
 pub use progress::{CompactionProgressEvent, CompactionProgressTracker, ProgressCallback};
 pub use result::{FileGroupFailure, FileGroupResult, RewriteDataFilesResult};
 pub use strategy::RewriteStrategy;
 
+/// Diagnostics from partition filter evaluation during planning.
+///
+/// These counters help users understand when partition filtering degraded
+/// to fail-open behavior, which may result in compacting more files than
+/// strictly necessary.
+///
+/// # Fail-Open Semantics
+///
+/// When a partition filter cannot be evaluated for a file (due to partition
+/// evolution or evaluation errors), the file is included rather than excluded.
+/// This is the safe default for compaction - worst case is extra work, not
+/// missing intended files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilterStats {
+    /// Number of partition specs where filter projection failed.
+    ///
+    /// This happens when the filter references fields or transforms
+    /// incompatible with a particular partition spec. Files in these
+    /// specs are included via fail-open.
+    pub unevaluable_specs: u32,
+
+    /// Number of unique partition keys where evaluation returned an error.
+    ///
+    /// Incremented once per unique (spec_id, partition_value) combination
+    /// that errors during `matches()` evaluation.
+    pub eval_errors: u32,
+
+    /// Number of unique partition keys included via fail-open.
+    ///
+    /// This is the total count of distinct partition keys that were
+    /// included because evaluation was not possible or errored.
+    pub fail_open_partitions: u32,
+
+    /// Number of candidate files in fail-open partitions.
+    ///
+    /// Only counts files that passed candidate selection (size/delete
+    /// thresholds) and belong to a fail-open partition key.
+    pub fail_open_files: u64,
+}
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
-
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{Error, ErrorKind, Result};
@@ -673,13 +709,11 @@ impl RewriteDataFilesAction {
             ));
         }
 
-        if let Some(max_concurrent) = self.options.max_concurrent_file_group_rewrites {
-            if max_concurrent == 0 {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "max-concurrent-file-group-rewrites must be > 0",
-                ));
-            }
+        if self.options.max_concurrent_file_group_rewrites == Some(0) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "max-concurrent-file-group-rewrites must be > 0",
+            ));
         }
 
         if self.options.partial_progress_enabled && self.options.partial_progress_max_commits == 0 {
