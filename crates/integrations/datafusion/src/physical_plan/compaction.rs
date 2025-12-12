@@ -68,7 +68,7 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::transaction::rewrite_data_files::{
-    CompactionProgressEvent, FileGroup, ProgressCallback, RewriteDataFilesPlan,
+    CompactionProgressEvent, FileGroup, ProgressCallback, RewriteDataFilesPlan, RewriteStrategy,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -117,6 +117,8 @@ pub struct IcebergCompactionExec {
     table: Table,
     /// The compaction plan with file groups.
     plan: RewriteDataFilesPlan,
+    /// The rewrite strategy (bin-pack or sort).
+    strategy: RewriteStrategy,
     /// Output schema.
     output_schema: ArrowSchemaRef,
     /// Plan properties.
@@ -129,14 +131,24 @@ pub struct IcebergCompactionExec {
 
 #[allow(dead_code)]
 impl IcebergCompactionExec {
-    /// Create a new compaction executor.
+    /// Create a new compaction executor with default bin-pack strategy.
     pub fn new(table: Table, plan: RewriteDataFilesPlan) -> DFResult<Self> {
+        Self::new_with_strategy(table, plan, RewriteStrategy::BinPack)
+    }
+
+    /// Create a new compaction executor with specified strategy.
+    pub fn new_with_strategy(
+        table: Table,
+        plan: RewriteDataFilesPlan,
+        strategy: RewriteStrategy,
+    ) -> DFResult<Self> {
         let output_schema = compaction_output_schema();
         let plan_properties = Self::compute_properties(output_schema.clone());
 
         Ok(Self {
             table,
             plan,
+            strategy,
             output_schema,
             plan_properties,
             cancellation_token: None,
@@ -178,6 +190,11 @@ impl IcebergCompactionExec {
     /// Get the table being compacted.
     pub fn table(&self) -> &Table {
         &self.table
+    }
+
+    /// Get the rewrite strategy.
+    pub fn strategy(&self) -> &RewriteStrategy {
+        &self.strategy
     }
 
     /// Compute plan properties.
@@ -724,5 +741,15 @@ mod tests {
         assert!(!token.is_cancelled());
         token.cancel();
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_compaction_exec_accepts_strategy() {
+        // Validate RewriteStrategy variants can be used
+        let strategy = RewriteStrategy::Sort { sort_order: None };
+        assert!(strategy.is_sort());
+
+        let strategy = RewriteStrategy::BinPack;
+        assert!(strategy.is_bin_pack());
     }
 }
