@@ -285,6 +285,7 @@ impl ExecutionPlan for IcebergCompactionExec {
         let progress_callback = self.progress_callback.clone();
         let total_bytes = self.plan.total_bytes;
         let total_files = self.plan.total_data_files;
+        let strategy = self.strategy.clone();
 
         // Build partition type map for serialization
         let partition_types = build_partition_type_map(&table)?;
@@ -306,6 +307,7 @@ impl ExecutionPlan for IcebergCompactionExec {
                 let output_schema = output_schema.clone();
                 let cancellation_token = cancellation_token.clone();
                 let progress_callback = progress_callback.clone();
+                let strategy = strategy.clone();
 
                 async move {
                     let group_id = file_group.group_id;
@@ -337,8 +339,9 @@ impl ExecutionPlan for IcebergCompactionExec {
                         });
                     }
 
-                    // Process the file group (read + write)
-                    let result = process_file_group(&table, &file_group).await;
+                    // Process the file group (read + optional sort + write)
+                    let result =
+                        process_file_group_with_strategy(&table, &file_group, &strategy).await;
 
                     match result {
                         Ok(write_result) => {
