@@ -943,4 +943,74 @@ mod tests {
         assert_eq!(id_col.value(2), 1);
         assert!(id_col.is_null(3));
     }
+
+    #[tokio::test]
+    async fn test_sort_batches_multi_column() {
+        use datafusion::arrow::array::Int64Array;
+        use iceberg::spec::{NullOrder, SortField};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("category", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["b", "a", "b", "a"])),
+                Arc::new(Int64Array::from(vec![2, 1, 1, 2])),
+            ],
+        )
+        .unwrap();
+
+        // ORDER BY category ASC, id ASC
+        let sort_order = SortOrder::builder()
+            .with_sort_field(
+                SortField::builder()
+                    .source_id(1) // category
+                    .direction(SortDirection::Ascending)
+                    .null_order(NullOrder::First)
+                    .transform(Transform::Identity)
+                    .build(),
+            )
+            .with_sort_field(
+                SortField::builder()
+                    .source_id(2) // id
+                    .direction(SortDirection::Ascending)
+                    .null_order(NullOrder::First)
+                    .transform(Transform::Identity)
+                    .build(),
+            )
+            .build_unbound()
+            .unwrap();
+
+        let mut column_id_to_name = HashMap::new();
+        column_id_to_name.insert(1_i32, "category".to_string());
+        column_id_to_name.insert(2_i32, "id".to_string());
+
+        let sorted = sort_batches(vec![batch], &sort_order, &column_id_to_name)
+            .await
+            .unwrap();
+
+        let cat_col = sorted[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let id_col = sorted[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // Expected: (a,1), (a,2), (b,1), (b,2)
+        assert_eq!(cat_col.value(0), "a");
+        assert_eq!(id_col.value(0), 1);
+        assert_eq!(cat_col.value(1), "a");
+        assert_eq!(id_col.value(1), 2);
+        assert_eq!(cat_col.value(2), "b");
+        assert_eq!(id_col.value(2), 1);
+        assert_eq!(cat_col.value(3), "b");
+        assert_eq!(id_col.value(3), 2);
+    }
 }
