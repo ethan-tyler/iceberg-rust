@@ -887,4 +887,60 @@ mod tests {
         assert_eq!(id_col.value(1), 2);
         assert_eq!(id_col.value(2), 3);
     }
+
+    #[tokio::test]
+    async fn test_sort_batches_descending_nulls_last() {
+        use datafusion::arrow::array::{Array, Int64Array};
+        use iceberg::spec::{NullOrder, SortField};
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            true,
+        )]));
+
+        // Include a null value
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                Some(2),
+            ]))],
+        )
+        .unwrap();
+
+        // ORDER BY id DESC NULLS LAST
+        let sort_order = SortOrder::builder()
+            .with_sort_field(
+                SortField::builder()
+                    .source_id(1)
+                    .direction(SortDirection::Descending)
+                    .null_order(NullOrder::Last)
+                    .transform(Transform::Identity)
+                    .build(),
+            )
+            .build_unbound()
+            .unwrap();
+
+        let mut column_id_to_name = HashMap::new();
+        column_id_to_name.insert(1_i32, "id".to_string());
+
+        let sorted = sort_batches(vec![batch], &sort_order, &column_id_to_name)
+            .await
+            .unwrap();
+
+        let id_col = sorted[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // DESC order: 3, 2, 1, NULL (nulls last)
+        assert_eq!(id_col.value(0), 3);
+        assert_eq!(id_col.value(1), 2);
+        assert_eq!(id_col.value(2), 1);
+        assert!(id_col.is_null(3));
+    }
 }
