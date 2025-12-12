@@ -61,6 +61,8 @@ use iceberg::table::Table;
 use iceberg::transaction::rewrite_data_files::{
     CompactionProgressEvent, ProgressCallback, RewriteDataFilesPlan,
 };
+use iceberg::spec::{DataFile, serialize_data_file_to_json};
+use iceberg::transaction::rewrite_data_files::FileGroup;
 use tokio_util::sync::CancellationToken;
 
 /// Column name for serialized data files output.
@@ -242,6 +244,131 @@ impl ExecutionPlan for IcebergCompactionExec {
         let empty_stream = futures::stream::empty();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, empty_stream)))
     }
+}
+
+// =============================================================================
+// Helper Functions (Tasks 5, 6, 7)
+// =============================================================================
+
+/// Result from processing a single file group.
+#[derive(Debug)]
+pub struct FileGroupWriteResult {
+    /// The group ID that was processed.
+    pub group_id: u32,
+    /// The new data files written.
+    pub new_data_files: Vec<DataFile>,
+    /// Total bytes written.
+    pub bytes_written: u64,
+    /// Processing duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Read all data from a file group, applying any position deletes.
+///
+/// # Arguments
+/// * `table` - The Iceberg table
+/// * `file_group` - The file group to read
+///
+/// # Returns
+/// A stream of RecordBatches containing the merged data from all files
+/// in the group with position deletes applied.
+///
+/// # Note
+/// This is a placeholder that needs implementation. The actual implementation
+/// would:
+/// 1. Create FileScanTasks for each data file in the group
+/// 2. Use ArrowReaderBuilder to read with delete application
+/// 3. Return a stream of RecordBatches
+#[allow(dead_code)]
+pub async fn read_file_group(
+    _table: &Table,
+    _file_group: &FileGroup,
+) -> DFResult<SendableRecordBatchStream> {
+    // TODO: Implement file group reading with delete application
+    // This would use iceberg::arrow::ArrowReaderBuilder to read the files
+    // with automatic position delete application
+    Err(DataFusionError::NotImplemented(
+        "read_file_group not yet implemented".to_string(),
+    ))
+}
+
+/// Write RecordBatches to new data files using rolling file writer.
+///
+/// # Arguments
+/// * `table` - The Iceberg table (for schema, partition spec, etc.)
+/// * `batches` - Stream of RecordBatches to write
+/// * `target_file_size` - Target size for output files
+///
+/// # Returns
+/// Vector of DataFile entries for the newly written files.
+///
+/// # Note
+/// This is a placeholder that needs implementation. The actual implementation
+/// would:
+/// 1. Create a TaskWriter or RollingFileWriter
+/// 2. Write batches, rolling to new files at target size
+/// 3. Close writers and collect DataFile metadata
+#[allow(dead_code)]
+pub async fn write_compacted_files(
+    _table: &Table,
+    _batches: SendableRecordBatchStream,
+    _target_file_size: u64,
+) -> DFResult<Vec<DataFile>> {
+    // TODO: Implement file writing with rolling writer
+    // This would use iceberg::writer::TaskWriter or RollingFileWriter
+    Err(DataFusionError::NotImplemented(
+        "write_compacted_files not yet implemented".to_string(),
+    ))
+}
+
+/// Process a single file group: read, merge, and write compacted output.
+///
+/// # Arguments
+/// * `table` - The Iceberg table
+/// * `file_group` - The file group to process
+/// * `group_id` - The index of this group
+/// * `target_file_size` - Target output file size
+///
+/// # Returns
+/// Result containing new data files and metrics.
+#[allow(dead_code)]
+pub async fn process_file_group(
+    _table: &Table,
+    _file_group: &FileGroup,
+    group_id: u32,
+    _target_file_size: u64,
+) -> DFResult<FileGroupWriteResult> {
+    // TODO: Implement full file group processing
+    // 1. read_file_group()
+    // 2. write_compacted_files()
+    // 3. Return metrics
+    Err(DataFusionError::NotImplemented(format!(
+        "process_file_group not yet implemented for group {}",
+        group_id
+    )))
+}
+
+/// Serialize a vector of DataFiles to JSON for output.
+///
+/// # Arguments
+/// * `files` - DataFiles to serialize
+/// * `table` - The table (for partition type and format version)
+pub fn serialize_data_files(files: Vec<DataFile>, table: &Table) -> DFResult<Vec<String>> {
+    let metadata = table.metadata();
+    let default_spec = metadata.default_partition_spec();
+    let partition_type = default_spec.partition_type(metadata.current_schema()).map_err(|e| {
+        DataFusionError::Internal(format!("Failed to get partition type: {}", e))
+    })?;
+    let format_version = metadata.format_version();
+
+    files
+        .into_iter()
+        .map(|f| {
+            serialize_data_file_to_json(f, &partition_type, format_version).map_err(|e| {
+                DataFusionError::Internal(format!("Failed to serialize DataFile: {}", e))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
