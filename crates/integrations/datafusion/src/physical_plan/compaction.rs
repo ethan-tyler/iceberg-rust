@@ -695,6 +695,100 @@ pub async fn process_file_group(
     })
 }
 
+/// Build column ID to name mapping from Iceberg schema.
+fn build_column_id_map(schema: &iceberg::spec::Schema) -> HashMap<i32, String> {
+    let mut map = HashMap::new();
+    for field in schema.as_struct().fields() {
+        map.insert(field.id, field.name.clone());
+    }
+    map
+}
+
+/// Resolve sort order for sorted compaction.
+///
+/// If an explicit sort order is provided, uses that.
+/// Otherwise, uses the table's default sort order.
+/// Returns None if strategy is not Sort.
+fn resolve_sort_order(
+    table: &Table,
+    strategy: &RewriteStrategy,
+) -> DFResult<Option<SortOrder>> {
+    match strategy {
+        RewriteStrategy::Sort {
+            sort_order: Some(order),
+        } => Ok(Some(order.clone())),
+        RewriteStrategy::Sort { sort_order: None } => {
+            let default_order = table.metadata().default_sort_order();
+            if default_order.is_unsorted() {
+                Err(DataFusionError::Plan(
+                    "Sort strategy requires a sort order, but table has no default sort order. \
+                     Use sort_by() to specify an explicit sort order."
+                        .to_string(),
+                ))
+            } else {
+                Ok(Some(default_order.as_ref().clone()))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Process a single file group with optional sorting.
+///
+/// This is the main entry point for file group processing that supports
+/// both bin-pack (no sort) and sorted compaction strategies.
+///
+/// # Arguments
+/// * `table` - The Iceberg table
+/// * `file_group` - The file group to process
+/// * `strategy` - The rewrite strategy (determines if sorting is applied)
+///
+/// # Returns
+/// Result containing new data files and metrics.
+pub async fn process_file_group_with_strategy(
+    table: &Table,
+    file_group: &FileGroup,
+    strategy: &RewriteStrategy,
+) -> DFResult<FileGroupWriteResult> {
+    let start_time = Instant::now();
+    let group_id = file_group.group_id;
+    let spec_id = file_group.partition_spec_id;
+
+    // Step 1: Read all data from the file group with delete application
+    let batches = read_file_group(table, file_group).await?;
+
+    // Step 2: Apply sorting if using sort strategy
+    let sorted_batches = match strategy {
+        RewriteStrategy::Sort { .. } => {
+            let sort_order = resolve_sort_order(table, strategy)?
+                .expect("Sort strategy should have sort order");
+            let column_id_map = build_column_id_map(table.metadata().current_schema());
+            sort_batches(batches, &sort_order, &column_id_map).await?
+        }
+        RewriteStrategy::BinPack => batches,
+        RewriteStrategy::ZOrder { .. } => {
+            return Err(DataFusionError::NotImplemented(
+                "Z-order compaction not yet implemented".to_string(),
+            ));
+        }
+    };
+
+    // Step 3: Write output to new compacted files
+    let partition = file_group.partition.as_ref();
+    let new_data_files = write_compacted_files(table, sorted_batches, partition, spec_id).await?;
+
+    // Calculate metrics
+    let bytes_written: u64 = new_data_files.iter().map(|f| f.file_size_in_bytes()).sum();
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+
+    Ok(FileGroupWriteResult {
+        group_id,
+        new_data_files,
+        bytes_written,
+        duration_ms,
+    })
+}
+
 /// Sort record batches according to an Iceberg sort order.
 ///
 /// Uses DataFusion's in-memory sorting which handles:
