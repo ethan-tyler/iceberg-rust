@@ -44,6 +44,7 @@
 //! ```
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::Instant;
@@ -55,16 +56,18 @@ use datafusion::arrow::datatypes::{
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::col;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::prelude::SessionContext;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, PartitionKey, PartitionSpec, Struct,
-    TableProperties, serialize_data_file_to_json,
+    DataContentType, DataFile, DataFileFormat, PartitionKey, PartitionSpec, SortDirection,
+    SortOrder, Struct, TableProperties, Transform, serialize_data_file_to_json,
 };
 use iceberg::table::Table;
 use iceberg::transaction::rewrite_data_files::{
@@ -692,6 +695,81 @@ pub async fn process_file_group(
     })
 }
 
+/// Sort record batches according to an Iceberg sort order.
+///
+/// Uses DataFusion's in-memory sorting which handles:
+/// - Multi-column sorting
+/// - Ascending/descending order
+/// - Nulls first/last semantics
+///
+/// # Arguments
+/// * `batches` - Input record batches to sort
+/// * `sort_order` - Iceberg sort order specification
+/// * `column_id_to_name` - Mapping from Iceberg column IDs to Arrow column names
+///
+/// # Returns
+/// Sorted record batches
+pub async fn sort_batches(
+    batches: Vec<RecordBatch>,
+    sort_order: &SortOrder,
+    column_id_to_name: &HashMap<i32, String>,
+) -> DFResult<Vec<RecordBatch>> {
+    if batches.is_empty() || sort_order.is_unsorted() {
+        return Ok(batches);
+    }
+
+    // Get the schema from the first batch
+    let schema = batches[0].schema();
+
+    // Create a DataFusion context and register the data
+    let ctx = SessionContext::new();
+    let table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![batches])?;
+    ctx.register_table("data", Arc::new(table))?;
+
+    // Build sort expressions from Iceberg sort order
+    let mut sort_exprs = Vec::with_capacity(sort_order.fields.len());
+
+    for sort_field in &sort_order.fields {
+        let column_name = column_id_to_name
+            .get(&sort_field.source_id)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Sort field references unknown column id: {}",
+                    sort_field.source_id
+                ))
+            })?;
+
+        // Build the base expression based on transform
+        let expr = match sort_field.transform {
+            Transform::Identity => col(column_name),
+            Transform::Bucket(_) | Transform::Truncate(_) => {
+                // For bucket and truncate, we sort on the original value
+                // The transform creates the bucket but we cluster by natural order
+                col(column_name)
+            }
+            _ => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Sort transform {:?} not supported for sorted compaction",
+                    sort_field.transform
+                )));
+            }
+        };
+
+        // Apply sort direction and null order
+        let ascending = matches!(sort_field.direction, SortDirection::Ascending);
+        let nulls_first = matches!(sort_field.null_order, iceberg::spec::NullOrder::First);
+
+        sort_exprs.push(expr.sort(ascending, nulls_first));
+    }
+
+    // Execute the sort
+    let df = ctx.table("data").await?;
+    let sorted_df = df.sort(sort_exprs)?;
+    let sorted_batches = sorted_df.collect().await?;
+
+    Ok(sorted_batches)
+}
+
 /// Serialize a vector of DataFiles to JSON for output.
 ///
 /// Handles partition evolution by looking up each file's partition spec
@@ -751,5 +829,62 @@ mod tests {
 
         let strategy = RewriteStrategy::BinPack;
         assert!(strategy.is_bin_pack());
+    }
+
+    #[tokio::test]
+    async fn test_sort_batches_identity_transform() {
+        use datafusion::arrow::array::Int64Array;
+        use iceberg::spec::{NullOrder, SortField};
+
+        // Create test data with unsorted values
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3, 1, 2])),
+                Arc::new(StringArray::from(vec!["c", "a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        // Create sort order: ORDER BY id ASC
+        let sort_order = SortOrder::builder()
+            .with_sort_field(
+                SortField::builder()
+                    .source_id(1) // id column
+                    .direction(SortDirection::Ascending)
+                    .null_order(NullOrder::First)
+                    .transform(Transform::Identity)
+                    .build(),
+            )
+            .build_unbound()
+            .unwrap();
+
+        // Create column ID to name mapping
+        let mut column_id_to_name = HashMap::new();
+        column_id_to_name.insert(1_i32, "id".to_string());
+        column_id_to_name.insert(2_i32, "name".to_string());
+
+        // Sort the batches
+        let sorted = sort_batches(vec![batch], &sort_order, &column_id_to_name)
+            .await
+            .unwrap();
+
+        assert_eq!(sorted.len(), 1);
+        let sorted_batch = &sorted[0];
+
+        // Verify sorted order
+        let id_col = sorted_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 1);
+        assert_eq!(id_col.value(1), 2);
+        assert_eq!(id_col.value(2), 3);
     }
 }
