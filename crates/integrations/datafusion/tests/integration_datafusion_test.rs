@@ -4562,11 +4562,9 @@ async fn test_insert_overwrite_partitioned() -> Result<()> {
 /// 5. Deleting rows spanning both partition specs
 /// 6. Verifying correct rows are deleted
 ///
-/// NOTE: Currently ignored because full partition evolution support for DML operations
-/// is not yet implemented. The SerializedFileWithSpec fix handles serialization between
-/// executors, but the underlying partition data handling needs additional work.
+/// This test validates the partition evolution support implemented in the transaction layer
+/// (per-spec manifest writing) and DataFusion layer (per-file spec_id serialization).
 #[tokio::test]
-#[ignore = "Partition evolution for DML operations not yet fully supported"]
 async fn test_delete_with_partition_evolution() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_delete_partition_evolution".to_string());
@@ -4728,11 +4726,9 @@ async fn test_delete_with_partition_evolution() -> Result<()> {
 /// Test UPDATE on a table with evolved partition spec.
 /// Verifies that UPDATE properly handles tables with multiple partition specs.
 ///
-/// NOTE: Currently ignored because full partition evolution support for DML operations
-/// is not yet implemented. The SerializedFileWithSpec fix handles serialization between
-/// executors, but the underlying partition data handling needs additional work.
+/// This test validates the partition evolution support implemented in the transaction layer
+/// (per-spec manifest writing) and DataFusion layer (per-file spec_id serialization).
 #[tokio::test]
-#[ignore = "Partition evolution for DML operations not yet fully supported"]
 async fn test_update_with_partition_evolution() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_update_partition_evolution".to_string());
@@ -4869,11 +4865,9 @@ async fn test_update_with_partition_evolution() -> Result<()> {
 /// Test MERGE on a table with evolved partition spec.
 /// Verifies that MERGE properly handles tables with multiple partition specs.
 ///
-/// NOTE: Currently ignored because full partition evolution support for DML operations
-/// is not yet implemented. The SerializedFileWithSpec fix handles serialization between
-/// executors, but the underlying partition data handling needs additional work.
+/// This test validates the partition evolution support implemented in the transaction layer
+/// (per-spec manifest writing) and DataFusion layer (per-file spec_id serialization).
 #[tokio::test]
-#[ignore = "Partition evolution for DML operations not yet fully supported"]
 async fn test_merge_with_partition_evolution() -> Result<()> {
     use datafusion::arrow::array::{Int32Array as ArrowInt32Array, RecordBatch};
     use datafusion::arrow::datatypes::{
@@ -4990,13 +4984,15 @@ async fn test_merge_with_partition_evolution() -> Result<()> {
     .await?;
 
     // Execute MERGE across partition specs using programmatic API
+    // Note: After evolving to partition by region, we can't use update_all() because
+    // that would try to update the partition column. Use explicit column update instead.
     let stats = provider
         .merge(source_df)
         .await
         .unwrap()
         .on(df_col("target.id").eq(df_col("source.id")))
         .when_matched(None)
-        .update_all()
+        .update(vec![("value", df_col("source_value"))])
         .when_not_matched(None)
         .insert_all()
         .execute(&ctx.state())
@@ -5032,6 +5028,834 @@ async fn test_merge_with_partition_evolution() -> Result<()> {
     // id=1: updated to 150, id=2: unchanged 200, id=3: updated to 350,
     // id=4: unchanged 400, id=5: unchanged 500, id=6: inserted 600
     assert_eq!(values, vec![150, 200, 350, 400, 500, 600]);
+
+    Ok(())
+}
+
+/// Test that position delete files inherit the partition spec of their source data file.
+///
+/// This validates the "Migrate Forward" semantic: when deleting rows from a data file
+/// that was written under an old partition spec, the position delete file must use
+/// that same partition spec, NOT the table's current default spec.
+#[tokio::test]
+async fn test_delete_file_inherits_source_spec() -> Result<()> {
+    use iceberg::spec::ManifestContentType;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_inherits_spec".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    // Initial partition spec: unpartitioned (spec_id = 0)
+    let partition_spec_v0 = UnboundPartitionSpec::builder().with_spec_id(0).build();
+
+    let creation = TableCreation::builder()
+        .name("delete_inherits_spec_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec_v0)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data under partition spec v0 (unpartitioned)
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_inherits_spec.delete_inherits_spec_table VALUES \
+         (1, 'electronics'), \
+         (2, 'books')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Evolve partition spec: add partitioning by category (spec_id = 1)
+    let table_ident =
+        TableIdent::new(namespace.clone(), "delete_inherits_spec_table".to_string());
+    let table = client.load_table(&table_ident).await?;
+
+    let new_spec = UnboundPartitionSpec::builder()
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let tx = Transaction::new(&table);
+    let action = tx.evolve_partition_spec().add_spec(new_spec).set_default();
+    let tx = action.apply(tx)?;
+    let _table = tx.commit(client.as_ref()).await?;
+
+    // Verify default spec is now 1
+    let table = client.load_table(&table_ident).await?;
+    assert_eq!(
+        table.metadata().default_partition_spec_id(),
+        1,
+        "Default spec should now be 1"
+    );
+
+    // Refresh catalog
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "delete_inherits_spec_table",
+    )
+    .await?;
+
+    // Delete a row from spec v0 data file (id = 1)
+    // The position delete file should have spec_id = 0, not 1
+    let _deleted_count = provider
+        .delete(&ctx.state(), Some(col("id").eq(lit(1))))
+        .await
+        .expect("DELETE should succeed");
+
+    // Load table and inspect manifests
+    let table = client.load_table(&table_ident).await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+
+    // Find delete manifests and verify their spec_id
+    let delete_manifests: Vec<_> = manifest_list
+        .entries()
+        .iter()
+        .filter(|m| m.content == ManifestContentType::Deletes)
+        .collect();
+
+    assert!(
+        !delete_manifests.is_empty(),
+        "Should have at least one delete manifest"
+    );
+
+    // All delete manifests should have partition_spec_id = 0 (inherited from source data file)
+    for manifest in &delete_manifests {
+        assert_eq!(
+            manifest.partition_spec_id, 0,
+            "Delete manifest should inherit spec_id 0 from source data file, not default spec 1"
+        );
+    }
+
+    Ok(())
+}
+
+/// Test that new data files from UPDATE use the table's current default spec,
+/// while position delete files inherit the source file's spec.
+///
+/// This validates the full "Migrate Forward" semantic for UPDATE operations:
+/// - Position deletes: use the spec of the data file being deleted
+/// - New data files: use the table's current default spec
+#[tokio::test]
+async fn test_update_writes_with_migrate_forward_semantic() -> Result<()> {
+    use iceberg::spec::ManifestContentType;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_migrate_forward".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    // Initial partition spec: unpartitioned (spec_id = 0)
+    let partition_spec_v0 = UnboundPartitionSpec::builder().with_spec_id(0).build();
+
+    let creation = TableCreation::builder()
+        .name("update_migrate_forward_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec_v0)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data under partition spec v0 (unpartitioned)
+    ctx.sql(
+        "INSERT INTO catalog.test_update_migrate_forward.update_migrate_forward_table VALUES \
+         (1, 'electronics', 100), \
+         (2, 'books', 200)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Evolve partition spec: add partitioning by category (spec_id = 1)
+    let table_ident = TableIdent::new(
+        namespace.clone(),
+        "update_migrate_forward_table".to_string(),
+    );
+    let table = client.load_table(&table_ident).await?;
+
+    let new_spec = UnboundPartitionSpec::builder()
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let tx = Transaction::new(&table);
+    let action = tx.evolve_partition_spec().add_spec(new_spec).set_default();
+    let tx = action.apply(tx)?;
+    let _table = tx.commit(client.as_ref()).await?;
+
+    // Verify default spec is now 1
+    let table = client.load_table(&table_ident).await?;
+    assert_eq!(
+        table.metadata().default_partition_spec_id(),
+        1,
+        "Default spec should now be 1"
+    );
+
+    // Refresh catalog
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Create provider for programmatic update
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "update_migrate_forward_table",
+    )
+    .await?;
+
+    // Update a row from spec v0 data file
+    // This should:
+    // - Create a position delete file with spec_id = 0 (inherited)
+    // - Create a new data file with spec_id = 1 (current default)
+    let _update_result = provider
+        .update()
+        .await
+        .unwrap()
+        .set("value", lit(999))
+        .filter(col("id").eq(lit(1)))
+        .execute(&ctx.state())
+        .await
+        .expect("UPDATE should succeed");
+
+    // Load table and inspect manifests from the UPDATE snapshot
+    let table = client.load_table(&table_ident).await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+
+    // Separate data and delete manifests from THIS snapshot
+    let mut data_manifests = vec![];
+    let mut delete_manifests = vec![];
+
+    for manifest in manifest_list.entries() {
+        // Only look at manifests added by the UPDATE operation (snapshot_id matches)
+        if manifest.added_snapshot_id == snapshot.snapshot_id() {
+            match manifest.content {
+                ManifestContentType::Data => data_manifests.push(manifest),
+                ManifestContentType::Deletes => delete_manifests.push(manifest),
+            }
+        }
+    }
+
+    // Verify delete manifests have spec_id = 0 (inherited from source)
+    assert!(
+        !delete_manifests.is_empty(),
+        "UPDATE should create delete manifests"
+    );
+    for manifest in &delete_manifests {
+        assert_eq!(
+            manifest.partition_spec_id, 0,
+            "Delete manifest should have spec_id 0 (inherited from source data file)"
+        );
+    }
+
+    // Verify new data manifests have spec_id = 1 (current default)
+    assert!(
+        !data_manifests.is_empty(),
+        "UPDATE should create new data manifests"
+    );
+    for manifest in &data_manifests {
+        assert_eq!(
+            manifest.partition_spec_id, 1,
+            "New data manifest should have spec_id 1 (current default spec)"
+        );
+    }
+
+    // Verify the data is correct
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    let df = ctx
+        .sql("SELECT id, value FROM catalog.test_update_migrate_forward.update_migrate_forward_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let values: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .collect();
+
+    // id=1: updated to 999, id=2: unchanged 200
+    assert_eq!(values, vec![999, 200], "UPDATE should change id=1's value to 999");
+
+    Ok(())
+}
+
+/// Test DELETE on a table that evolved from partitioned to unpartitioned (de-partition).
+///
+/// This tests the specific code path where `default_spec.is_unpartitioned()` is true
+/// but historical data files still have partition values. The delete writer must
+/// preserve the original partition spec (v0) for position delete files targeting
+/// those historical files.
+///
+/// Evolution: partitioned by category (v0) → unpartitioned (v1)
+#[tokio::test]
+async fn test_delete_with_departition_evolution() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_departition".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    // Initial partition spec: partitioned by category (spec_id = 0)
+    let partition_spec_v0 = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("departition_delete_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec_v0)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data under partition spec v0 (partitioned by category)
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_departition.departition_delete_table VALUES \
+         (1, 'electronics', 100), \
+         (2, 'electronics', 200), \
+         (3, 'books', 300)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Evolve partition spec: change to unpartitioned (spec_id = 1)
+    // This is a "de-partition" evolution
+    let table_ident =
+        TableIdent::new(namespace.clone(), "departition_delete_table".to_string());
+    let table = client.load_table(&table_ident).await?;
+
+    let unpartitioned_spec = UnboundPartitionSpec::builder().build();
+
+    let tx = Transaction::new(&table);
+    let action = tx
+        .evolve_partition_spec()
+        .add_spec(unpartitioned_spec)
+        .set_default();
+    let tx = action.apply(tx)?;
+    let _table = tx.commit(client.as_ref()).await?;
+
+    // Refresh catalog to see the evolved spec
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data under partition spec v1 (unpartitioned)
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_departition.departition_delete_table VALUES \
+         (4, 'toys', 400), \
+         (5, 'books', 500)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Verify we have 5 rows total
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_delete_departition.departition_delete_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 5, "Should have 5 rows before delete");
+
+    // Create provider for programmatic delete
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "departition_delete_table",
+    )
+    .await?;
+
+    // Delete rows from the PARTITIONED spec (v0) - specifically target electronics category
+    // This exercises the path where default spec is unpartitioned but we're deleting
+    // from files that have partition values
+    let deleted_count = provider
+        .delete(&ctx.state(), Some(col("category").eq(lit("electronics"))))
+        .await
+        .expect("DELETE on de-partitioned table should succeed");
+
+    assert_eq!(
+        deleted_count, 2,
+        "Should delete 2 rows (id 1, 2 where category='electronics')"
+    );
+
+    // Re-register with fresh catalog to see changes
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Verify total row count decreased
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_delete_departition.departition_delete_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 3, "Should have 3 rows after delete");
+
+    // Verify correct rows remain
+    let df = ctx
+        .sql("SELECT id, category FROM catalog.test_delete_departition.departition_delete_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .collect();
+
+    assert_eq!(
+        ids,
+        vec![3, 4, 5],
+        "Only rows with id 3, 4, 5 (non-electronics) should remain"
+    );
+
+    // Verify manifest structure: delete manifest should have spec_id = 0
+    // (inheriting from the partitioned data files being deleted)
+    let table = client.load_table(&table_ident).await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+
+    let delete_manifests: Vec<_> = manifest_list
+        .entries()
+        .iter()
+        .filter(|m| m.content == iceberg::spec::ManifestContentType::Deletes)
+        .collect();
+
+    assert!(
+        !delete_manifests.is_empty(),
+        "Should have delete manifests"
+    );
+
+    // Delete manifest should have spec_id = 0 (the original partitioned spec)
+    // because the position deletes target files written under spec v0
+    for manifest in &delete_manifests {
+        assert_eq!(
+            manifest.partition_spec_id, 0,
+            "Delete manifest should have spec_id 0 (original partitioned spec)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Test UPDATE on a table that evolved from partitioned to unpartitioned (de-partition).
+///
+/// Similar to test_delete_with_departition_evolution but for UPDATE operations.
+/// Verifies that the delete portion of UPDATE preserves the original partition spec.
+#[tokio::test]
+async fn test_update_with_departition_evolution() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_departition".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    // Initial partition spec: partitioned by category (spec_id = 0)
+    let partition_spec_v0 = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("departition_update_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec_v0)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data under partition spec v0 (partitioned by category)
+    ctx.sql(
+        "INSERT INTO catalog.test_update_departition.departition_update_table VALUES \
+         (1, 'electronics', 100), \
+         (2, 'books', 200)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Evolve partition spec: change to unpartitioned (spec_id = 1)
+    let table_ident =
+        TableIdent::new(namespace.clone(), "departition_update_table".to_string());
+    let table = client.load_table(&table_ident).await?;
+
+    let unpartitioned_spec = UnboundPartitionSpec::builder().build();
+
+    let tx = Transaction::new(&table);
+    let action = tx
+        .evolve_partition_spec()
+        .add_spec(unpartitioned_spec)
+        .set_default();
+    let tx = action.apply(tx)?;
+    let _table = tx.commit(client.as_ref()).await?;
+
+    // Refresh catalog
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Update a row from the PARTITIONED spec (v0) using SQL
+    let result = ctx
+        .sql("UPDATE catalog.test_update_departition.departition_update_table SET value = 999 WHERE id = 1")
+        .await
+        .expect("UPDATE on de-partitioned table should succeed")
+        .collect()
+        .await
+        .unwrap();
+
+    let updated_count: u64 = result
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .sum();
+    assert_eq!(updated_count, 1, "Should update 1 row");
+
+    // Re-register with fresh catalog
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Verify the update
+    let df = ctx
+        .sql("SELECT id, value FROM catalog.test_update_departition.departition_update_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let values: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .collect();
+
+    assert_eq!(values, vec![999, 200], "id=1 should be updated to 999");
+
+    Ok(())
+}
+
+/// Test DML operations spanning 3+ partition specs.
+///
+/// This tests the grouping and serialization logic across multiple spec_ids,
+/// ensuring manifests are correctly written for each spec.
+///
+/// Evolution: unpartitioned (v0) → partitioned by category (v1) → partitioned by year (v2)
+#[tokio::test]
+async fn test_delete_with_three_partition_specs() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_three_specs".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create schema
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "year", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(4, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    // Initial partition spec: unpartitioned (spec_id = 0)
+    let partition_spec_v0 = UnboundPartitionSpec::builder().with_spec_id(0).build();
+
+    let creation = TableCreation::builder()
+        .name("three_specs_delete_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec_v0)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let table_ident =
+        TableIdent::new(namespace.clone(), "three_specs_delete_table".to_string());
+
+    // === Phase 1: Insert under spec v0 (unpartitioned) ===
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_three_specs.three_specs_delete_table VALUES \
+         (1, 'electronics', 2023, 100), \
+         (2, 'books', 2023, 200)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // === Phase 2: Evolve to spec v1 (partitioned by category) and insert ===
+    let table = client.load_table(&table_ident).await?;
+    let spec_v1 = UnboundPartitionSpec::builder()
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let tx = Transaction::new(&table);
+    let action = tx.evolve_partition_spec().add_spec(spec_v1).set_default();
+    let tx = action.apply(tx)?;
+    let _table = tx.commit(client.as_ref()).await?;
+
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_three_specs.three_specs_delete_table VALUES \
+         (3, 'electronics', 2024, 300), \
+         (4, 'toys', 2024, 400)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // === Phase 3: Evolve to spec v2 (partitioned by year) and insert ===
+    let table = client.load_table(&table_ident).await?;
+    let spec_v2 = UnboundPartitionSpec::builder()
+        .add_partition_field(3, "year", Transform::Identity)?
+        .build();
+
+    let tx = Transaction::new(&table);
+    let action = tx.evolve_partition_spec().add_spec(spec_v2).set_default();
+    let tx = action.apply(tx)?;
+    let _table = tx.commit(client.as_ref()).await?;
+
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_three_specs.three_specs_delete_table VALUES \
+         (5, 'books', 2025, 500), \
+         (6, 'electronics', 2025, 600)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Verify we have 6 rows total across 3 specs
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_delete_three_specs.three_specs_delete_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 6, "Should have 6 rows before delete");
+
+    // === Delete spanning all 3 specs ===
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "three_specs_delete_table",
+    )
+    .await?;
+
+    // Delete all electronics - this spans spec v0, v1, and v2
+    let deleted_count = provider
+        .delete(&ctx.state(), Some(col("category").eq(lit("electronics"))))
+        .await
+        .expect("DELETE across 3 partition specs should succeed");
+
+    assert_eq!(
+        deleted_count, 3,
+        "Should delete 3 rows (id 1, 3, 6 where category='electronics')"
+    );
+
+    // Verify final state
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    let df = ctx
+        .sql("SELECT id FROM catalog.test_delete_three_specs.three_specs_delete_table ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .collect();
+
+    assert_eq!(ids, vec![2, 4, 5], "Only rows 2, 4, 5 should remain");
+
+    // Verify manifest structure has multiple spec_ids
+    let table = client.load_table(&table_ident).await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+
+    let delete_manifests: Vec<_> = manifest_list
+        .entries()
+        .iter()
+        .filter(|m| m.content == iceberg::spec::ManifestContentType::Deletes)
+        .collect();
+
+    // Should have delete manifests for multiple specs
+    let spec_ids: std::collections::HashSet<i32> = delete_manifests
+        .iter()
+        .map(|m| m.partition_spec_id)
+        .collect();
+
+    assert!(
+        spec_ids.len() >= 2,
+        "Delete manifests should span multiple partition specs, got spec_ids: {:?}",
+        spec_ids
+    );
 
     Ok(())
 }

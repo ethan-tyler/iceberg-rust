@@ -42,7 +42,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::spec::{
-    DataFileFormat, SchemaRef as IcebergSchemaRef, Struct, TableProperties,
+    DataFileFormat, PartitionSpec, SchemaRef as IcebergSchemaRef, Struct, TableProperties,
     serialize_data_file_to_json,
 };
 use iceberg::table::Table;
@@ -61,7 +61,6 @@ use uuid::Uuid;
 use super::delete_scan::{DELETE_FILE_PATH_COL, DELETE_POS_COL};
 use crate::partition_utils::{
     FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
-    reject_partition_evolution,
 };
 use crate::to_datafusion_error;
 
@@ -144,8 +143,8 @@ struct PartitionedDeleteCollector {
     writer_builder: DeleteWriterBuilder,
     /// Delete config for creating writers
     delete_config: PositionDeleteWriterConfig,
-    /// Table schema for building partition keys
-    table_schema: IcebergSchemaRef,
+    /// All schemas from table metadata (for partition evolution compatibility)
+    all_schemas: Vec<IcebergSchemaRef>,
     /// Whether the table is unpartitioned
     is_unpartitioned: bool,
     /// The default partition spec ID (used for unpartitioned tables)
@@ -158,7 +157,7 @@ impl PartitionedDeleteCollector {
         file_partitions: HashMap<String, FilePartitionInfo>,
         writer_builder: DeleteWriterBuilder,
         delete_config: PositionDeleteWriterConfig,
-        table_schema: IcebergSchemaRef,
+        all_schemas: Vec<IcebergSchemaRef>,
         is_unpartitioned: bool,
         default_spec_id: i32,
     ) -> Self {
@@ -167,30 +166,57 @@ impl PartitionedDeleteCollector {
             file_partitions,
             writer_builder,
             delete_config,
-            table_schema,
+            all_schemas,
             is_unpartitioned,
             default_spec_id,
         }
     }
 
+    /// Finds a schema compatible with the given partition spec.
+    ///
+    /// For partition evolution support, historical partition specs may reference
+    /// fields that no longer exist in the current schema. This method finds a
+    /// schema that can compute the partition type for the given spec.
+    fn find_compatible_schema(
+        &self,
+        partition_spec: &PartitionSpec,
+    ) -> DFResult<IcebergSchemaRef> {
+        for schema in &self.all_schemas {
+            if partition_spec.partition_type(schema).is_ok() {
+                return Ok(schema.clone());
+            }
+        }
+        Err(DataFusionError::Internal(format!(
+            "Cannot find compatible schema for partition spec {}: \
+             no schema contains all referenced source fields",
+            partition_spec.spec_id()
+        )))
+    }
+
     /// Gets the partition key for a given file path.
     ///
-    /// For unpartitioned tables, returns the unpartitioned key with the actual default spec ID.
-    /// For partitioned tables, looks up the partition from the file mapping.
+    /// First checks the file partition map for the file's actual partition info (which handles
+    /// partition evolution correctly - files retain their original spec). If not found and the
+    /// default spec is unpartitioned, returns an unpartitioned key. This supports:
+    /// - Normal unpartitioned tables
+    /// - Tables evolved from partitioned → unpartitioned (historical files have partition info)
+    /// - Tables evolved from unpartitioned → partitioned (new files not in map yet)
     fn get_partition_key(&self, file_path: &str) -> DFResult<PartitionGroupKey> {
+        // First, check if the file has partition info in the map (handles partition evolution)
+        if let Some(info) = self.file_partitions.get(file_path) {
+            return Ok(PartitionGroupKey::new(info.spec_id, info.partition.clone()));
+        }
+
+        // File not in map - use default spec behavior
         if self.is_unpartitioned {
             return Ok(PartitionGroupKey::unpartitioned(self.default_spec_id));
         }
 
-        self.file_partitions
-            .get(file_path)
-            .map(|info| PartitionGroupKey::new(info.spec_id, info.partition.clone()))
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "No partition info found for file '{file_path}'. This may indicate a consistency issue \
-                     between the scan and write phases."
-                ))
-            })
+        // Default spec is partitioned but file not in map - this is unexpected
+        Err(DataFusionError::Internal(format!(
+            "No partition info found for file '{file_path}'. This may indicate a consistency issue \
+             between the scan and write phases."
+        )))
     }
 
     /// Gets or creates a writer for the given partition key.
@@ -201,11 +227,15 @@ impl PartitionedDeleteCollector {
         use iceberg::spec::PartitionKey;
 
         if !self.writers.contains_key(key) {
-            // Build partition key for the writer
-            let partition_key = if self.is_unpartitioned {
+            // Build partition key for the writer.
+            // Check actual partition data, NOT the is_unpartitioned flag, because:
+            // - Tables may have evolved from partitioned to unpartitioned (de-partition)
+            // - Historical files still need their partition info preserved
+            let partition_key = if key.partition.fields().is_empty() {
+                // Truly unpartitioned file (no partition values)
                 None
             } else {
-                // Look up the partition spec from any file with this partition
+                // File has partition data - look up the partition spec
                 let file_info = self
                     .file_partitions
                     .values()
@@ -216,9 +246,14 @@ impl PartitionedDeleteCollector {
                         ))
                     })?;
 
+                // Find a schema compatible with this partition spec (for partition evolution
+                // where historical specs may reference fields not in the current schema)
+                let compatible_schema =
+                    self.find_compatible_schema(file_info.partition_spec.as_ref())?;
+
                 Some(PartitionKey::new(
                     file_info.partition_spec.as_ref().clone(),
-                    self.table_schema.clone(),
+                    compatible_schema,
                     key.partition.clone(),
                 ))
             };
@@ -457,9 +492,6 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        // Guard: Reject tables with partition evolution before expensive operations
-        reject_partition_evolution(&self.table, "DELETE")?;
-
         let table = self.table.clone();
         let partition_types = build_partition_type_map(&table)?;
         let format_version = table.metadata().format_version();
@@ -479,12 +511,11 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             let is_unpartitioned = default_partition_spec.is_unpartitioned();
             let default_spec_id = default_partition_spec.spec_id();
 
-            // Build file-to-partition mapping for partitioned tables
-            let file_partitions = if is_unpartitioned {
-                HashMap::new()
-            } else {
-                build_file_partition_map(&table).await?
-            };
+            // Always build file-to-partition mapping, even for "unpartitioned" default tables.
+            // This is required for partition evolution support: a table may have evolved from
+            // partitioned to unpartitioned, but still have historical partitioned files that
+            // need position deletes written with their original partition spec.
+            let file_partitions = build_file_partition_map(&table).await?;
 
             // Set up position delete writer config
             let delete_config = PositionDeleteWriterConfig::new();
@@ -549,12 +580,14 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                 PositionDeleteFileWriterBuilder::new(rolling_writer_builder, delete_config.clone());
 
             // Create partitioned delete collector
-            let table_schema = table.metadata().current_schema().clone();
+            // Collect all schemas for partition evolution support (historical partition specs
+            // may reference fields not in the current schema)
+            let all_schemas: Vec<_> = table.metadata().schemas_iter().cloned().collect();
             let mut collector = PartitionedDeleteCollector::new(
                 file_partitions,
                 delete_writer_builder,
                 delete_config,
-                table_schema,
+                all_schemas,
                 is_unpartitioned,
                 default_spec_id,
             );

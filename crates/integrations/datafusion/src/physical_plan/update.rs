@@ -55,7 +55,8 @@ use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
-    DataFile, DataFileFormat, PartitionKey, TableProperties, serialize_data_file_to_json,
+    DataFile, DataFileFormat, PartitionKey, PartitionSpec, Struct, TableProperties,
+    serialize_data_file_to_json,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -76,12 +77,14 @@ use uuid::Uuid;
 use super::expr_to_predicate::convert_filters_to_predicate;
 use crate::partition_utils::{
     SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
-    reject_partition_evolution,
 };
 use crate::to_datafusion_error;
 
 /// Column name for serialized data files in output
 pub const UPDATE_DATA_FILES_COL: &str = "data_files";
+
+// Type aliases
+type IcebergSchemaRef = Arc<iceberg::spec::Schema>;
 
 // Type aliases for the writers
 type DataFileWriterType = iceberg::writer::base_writer::data_file_writer::DataFileWriter<
@@ -91,12 +94,6 @@ type DataFileWriterType = iceberg::writer::base_writer::data_file_writer::DataFi
 >;
 
 type DataFileWriterBuilderType = DataFileWriterBuilder<
-    ParquetWriterBuilder,
-    DefaultLocationGenerator,
-    DefaultFileNameGenerator,
->;
-
-type PositionDeleteWriterType = iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<
     ParquetWriterBuilder,
     DefaultLocationGenerator,
     DefaultFileNameGenerator,
@@ -114,16 +111,36 @@ enum UpdateDataWriter {
     Partitioned(FanoutWriter<DataFileWriterBuilderType>),
 }
 
-/// Position delete writer that supports both partitioned and unpartitioned tables.
-enum UpdateDeleteWriter {
-    Unpartitioned(PositionDeleteWriterType),
-    Partitioned(FanoutWriter<PositionDeleteWriterBuilderType>),
-}
+/// Position delete writer - always uses FanoutWriter for partition evolution support.
+/// Historical files may have different partition specs than the current default,
+/// so we always route deletes by their actual partition info.
+type UpdateDeleteWriter = FanoutWriter<PositionDeleteWriterBuilderType>;
 
 /// Column name for serialized delete files in output
 pub const UPDATE_DELETE_FILES_COL: &str = "delete_files";
 /// Column name for update count in output
 pub const UPDATE_COUNT_COL: &str = "count";
+
+/// Finds a schema compatible with the given partition spec.
+///
+/// For partition evolution support, historical partition specs may reference
+/// fields that no longer exist in the current schema. This function finds a
+/// schema that can compute the partition type for the given spec.
+fn find_compatible_schema(
+    all_schemas: &[IcebergSchemaRef],
+    partition_spec: &PartitionSpec,
+) -> DFResult<IcebergSchemaRef> {
+    for schema in all_schemas {
+        if partition_spec.partition_type(schema).is_ok() {
+            return Ok(schema.clone());
+        }
+    }
+    Err(DataFusionError::Internal(format!(
+        "Cannot find compatible schema for partition spec {}: \
+         no schema contains all referenced source fields",
+        partition_spec.spec_id()
+    )))
+}
 
 /// Execution plan for UPDATE operations using Copy-on-Write semantics.
 ///
@@ -329,9 +346,6 @@ async fn execute_update(
     predicate: Option<Predicate>,
     filter_exprs: Vec<Expr>,
 ) -> DFResult<RecordBatch> {
-    // Guard: Reject tables with partition evolution before expensive scan
-    reject_partition_evolution(&table, "UPDATE")?;
-
     // Build the scan - predicate is used for file-level pruning
     let mut scan_builder = table.scan().select_all();
     if let Some(pred) = predicate {
@@ -360,16 +374,15 @@ async fn execute_update(
     let partition_spec = table.metadata().default_partition_spec().clone();
     let default_spec_id = partition_spec.spec_id();
     let iceberg_schema = table.metadata().current_schema().clone();
+    // Collect all schemas for partition evolution schema compatibility
+    let all_schemas: Vec<_> = table.metadata().schemas_iter().cloned().collect();
     let is_partitioned = !partition_spec.is_unpartitioned();
     let format_version = table.metadata().format_version();
     let file_io = table.file_io().clone();
 
-    // Build file partition map for partition-evolution-aware deletes
-    let file_partition_map = if is_partitioned {
-        build_file_partition_map(&table).await?
-    } else {
-        HashMap::new()
-    };
+    // Always build file partition map for partition-evolution-aware deletes.
+    // Even if the default spec is unpartitioned, historical files may be partitioned.
+    let file_partition_map = build_file_partition_map(&table).await?;
 
     let target_file_size = table
         .metadata()
@@ -454,28 +467,22 @@ async fn execute_update(
         None
     };
 
-    // Create writers based on partition status
-    let (mut data_writer, mut delete_writer) = if is_partitioned {
-        (
-            UpdateDataWriter::Partitioned(FanoutWriter::new(data_file_builder)),
-            UpdateDeleteWriter::Partitioned(FanoutWriter::new(delete_file_builder)),
-        )
+    // Create writers based on partition status.
+    // Data writer: based on default spec (new data goes to default partition layout)
+    // Delete writer: always FanoutWriter (must handle files from any historical spec)
+    let mut data_writer = if is_partitioned {
+        UpdateDataWriter::Partitioned(FanoutWriter::new(data_file_builder))
     } else {
-        (
-            UpdateDataWriter::Unpartitioned(
-                data_file_builder
-                    .build(None)
-                    .await
-                    .map_err(to_datafusion_error)?,
-            ),
-            UpdateDeleteWriter::Unpartitioned(
-                delete_file_builder
-                    .build(None)
-                    .await
-                    .map_err(to_datafusion_error)?,
-            ),
+        UpdateDataWriter::Unpartitioned(
+            data_file_builder
+                .build(None)
+                .await
+                .map_err(to_datafusion_error)?,
         )
     };
+    // Delete writer always uses FanoutWriter to handle partition evolution:
+    // historical files may have different partition specs than the current default
+    let mut delete_writer: UpdateDeleteWriter = FanoutWriter::new(delete_file_builder);
 
     let mut total_count = 0u64;
 
@@ -483,20 +490,43 @@ async fn execute_update(
     for task in file_scan_tasks {
         let file_path = task.data_file_path().to_string();
 
-        // Get the file's partition info for delete routing
-        let file_partition_key = if is_partitioned {
-            let info = file_partition_map.get(&file_path).ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "No partition info found for file '{file_path}'. This may indicate a consistency issue."
-                ))
-            })?;
-            Some(PartitionKey::new(
-                (*info.partition_spec).clone(),
-                iceberg_schema.clone(),
-                info.partition.clone(),
-            ))
-        } else {
-            None
+        // Get the file's partition info for delete routing.
+        // Delete writer always uses FanoutWriter, so we always need a PartitionKey.
+        // This supports partition evolution: files may have different specs than the current default.
+        let file_partition_key = match file_partition_map.get(&file_path) {
+            Some(info) if !info.partition.fields().is_empty() => {
+                // File has partition data - use compatible schema for historical specs
+                let compatible_schema = find_compatible_schema(&all_schemas, &info.partition_spec)?;
+                PartitionKey::new(
+                    (*info.partition_spec).clone(),
+                    compatible_schema,
+                    info.partition.clone(),
+                )
+            }
+            Some(info) => {
+                // File in map but with empty partition - use info's spec
+                PartitionKey::new(
+                    (*info.partition_spec).clone(),
+                    iceberg_schema.clone(),
+                    info.partition.clone(),
+                )
+            }
+            None => {
+                // File not in map - only valid if default spec is unpartitioned
+                if is_partitioned {
+                    return Err(DataFusionError::Internal(format!(
+                        "No partition info found for file '{}'. This may indicate a consistency issue \
+                         between the scan and write phases.",
+                        file_path
+                    )));
+                }
+                // Default spec is unpartitioned, so empty partition is correct
+                PartitionKey::new(
+                    (*partition_spec).clone(),
+                    iceberg_schema.clone(),
+                    Struct::empty(),
+                )
+            }
         };
 
         // Clear task predicate to read ALL rows for position tracking
@@ -559,7 +589,7 @@ async fn execute_update(
                 // Write position deletes for original rows (with partition awareness)
                 let delete_batch =
                     make_position_delete_batch(&file_path, &positions, delete_schema.clone())?;
-                write_delete_batch(&mut delete_writer, delete_batch, file_partition_key.as_ref())
+                write_delete_batch(&mut delete_writer, delete_batch, &file_partition_key)
                     .await?;
 
                 total_count += positions.len() as u64;
@@ -603,7 +633,7 @@ async fn execute_update(
                 // Write position deletes for original rows (with partition awareness)
                 let delete_batch =
                     make_position_delete_batch(&file_path, &positions, delete_schema.clone())?;
-                write_delete_batch(&mut delete_writer, delete_batch, file_partition_key.as_ref())
+                write_delete_batch(&mut delete_writer, delete_batch, &file_partition_key)
                     .await?;
 
                 total_count += positions.len() as u64;
@@ -617,11 +647,9 @@ async fn execute_update(
     let data_files = close_data_writer(data_writer).await?;
     let delete_files = close_delete_writer(delete_writer).await?;
 
-    // Serialize to JSON with partition spec wrapper
-    // Using default_spec_id for all files is safe here because:
-    // 1. Tables with partition evolution are rejected by reject_partition_evolution() above
-    // 2. Single-spec tables: all files use the same (default) partition spec
-    let partition_type = partition_types.get(&default_spec_id).ok_or_else(|| {
+    // Serialize data files to JSON with partition spec wrapper.
+    // Data files use the default partition spec (Migrate Forward semantic: new data uses current default).
+    let default_partition_type = partition_types.get(&default_spec_id).ok_or_else(|| {
         DataFusionError::Internal(format!(
             "Missing partition type for default partition spec {default_spec_id}"
         ))
@@ -630,8 +658,9 @@ async fn execute_update(
     let data_files_json: Vec<String> = data_files
         .into_iter()
         .map(|df| {
-            let file_json = serialize_data_file_to_json(df, partition_type, format_version)
-                .map_err(to_datafusion_error)?;
+            let file_json =
+                serialize_data_file_to_json(df, default_partition_type, format_version)
+                    .map_err(to_datafusion_error)?;
             serde_json::to_string(&SerializedFileWithSpec {
                 spec_id: default_spec_id,
                 file_json,
@@ -644,16 +673,22 @@ async fn execute_update(
         })
         .collect::<DFResult<Vec<_>>>()?;
 
+    // Serialize delete files to JSON with partition spec wrapper.
+    // Delete files use the spec_id of the data file they reference (set by the writer).
+    // This is required for partition evolution support: position deletes must use the
+    // same partition spec as the data file being deleted, not the current default spec.
     let delete_files_json: Vec<String> = delete_files
         .into_iter()
         .map(|df| {
+            let spec_id = df.partition_spec_id();
+            let partition_type = partition_types.get(&spec_id).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Missing partition type for partition spec {spec_id}"
+                ))
+            })?;
             let file_json = serialize_data_file_to_json(df, partition_type, format_version)
                 .map_err(to_datafusion_error)?;
-            serde_json::to_string(&SerializedFileWithSpec {
-                spec_id: default_spec_id,
-                file_json,
-            })
-            .map_err(|e| {
+            serde_json::to_string(&SerializedFileWithSpec { spec_id, file_json }).map_err(|e| {
                 DataFusionError::Execution(format!(
                     "Failed to serialize delete file metadata: {e}"
                 ))
@@ -833,25 +868,17 @@ async fn write_data_batch(
     Ok(())
 }
 
-/// Writes a delete batch to the appropriate writer, handling partitioned and unpartitioned cases.
+/// Writes a delete batch to the FanoutWriter.
+/// Uses partition key routing to handle partition evolution (historical files may have different specs).
 async fn write_delete_batch(
     writer: &mut UpdateDeleteWriter,
     batch: RecordBatch,
-    partition_key: Option<&PartitionKey>,
+    partition_key: &PartitionKey,
 ) -> DFResult<()> {
-    match writer {
-        UpdateDeleteWriter::Unpartitioned(w) => {
-            w.write(batch).await.map_err(to_datafusion_error)?;
-        }
-        UpdateDeleteWriter::Partitioned(w) => {
-            let pk = partition_key.ok_or_else(|| {
-                DataFusionError::Internal(
-                    "Partition key required for partitioned tables".to_string(),
-                )
-            })?;
-            w.write(pk.clone(), batch).await.map_err(to_datafusion_error)?;
-        }
-    }
+    writer
+        .write(partition_key.clone(), batch)
+        .await
+        .map_err(to_datafusion_error)?;
     Ok(())
 }
 
@@ -869,14 +896,7 @@ async fn close_data_writer(writer: UpdateDataWriter) -> DFResult<Vec<DataFile>> 
 
 /// Closes the delete writer and returns all delete files written.
 async fn close_delete_writer(writer: UpdateDeleteWriter) -> DFResult<Vec<DataFile>> {
-    match writer {
-        UpdateDeleteWriter::Unpartitioned(mut w) => {
-            w.close().await.map_err(to_datafusion_error)
-        }
-        UpdateDeleteWriter::Partitioned(w) => {
-            w.close().await.map_err(to_datafusion_error)
-        }
-    }
+    writer.close().await.map_err(to_datafusion_error)
 }
 
 #[cfg(test)]
