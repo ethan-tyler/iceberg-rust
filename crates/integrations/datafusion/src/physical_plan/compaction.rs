@@ -55,7 +55,6 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use iceberg::table::Table;
 use iceberg::transaction::rewrite_data_files::{
@@ -92,6 +91,7 @@ pub fn compaction_output_schema() -> ArrowSchemaRef {
 /// - Progress reporting via callbacks
 /// - Cancellation via token
 /// - Position delete application
+#[allow(dead_code)]
 pub struct IcebergCompactionExec {
     /// The Iceberg table being compacted.
     table: Table,
@@ -239,10 +239,12 @@ impl ExecutionPlan for IcebergCompactionExec {
         }
 
         // TODO: Implement in Task 7
-        // For now, return an empty stream
-        let schema = self.output_schema.clone();
-        let empty_stream = futures::stream::empty();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, empty_stream)))
+        // Return NotImplemented to prevent silent "success" with zero output
+        Err(DataFusionError::NotImplemented(
+            "IcebergCompactionExec::execute() not yet implemented - \
+             file group reading and writing requires full implementation"
+                .to_string(),
+        ))
     }
 }
 
@@ -252,6 +254,7 @@ impl ExecutionPlan for IcebergCompactionExec {
 
 /// Result from processing a single file group.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct FileGroupWriteResult {
     /// The group ID that was processed.
     pub group_id: u32,
@@ -350,20 +353,37 @@ pub async fn process_file_group(
 
 /// Serialize a vector of DataFiles to JSON for output.
 ///
+/// Handles partition evolution by looking up each file's partition spec
+/// rather than assuming all files use the default spec.
+///
 /// # Arguments
 /// * `files` - DataFiles to serialize
-/// * `table` - The table (for partition type and format version)
+/// * `table` - The table (for partition specs and format version)
+#[allow(dead_code)]
 pub fn serialize_data_files(files: Vec<DataFile>, table: &Table) -> DFResult<Vec<String>> {
     let metadata = table.metadata();
-    let default_spec = metadata.default_partition_spec();
-    let partition_type = default_spec.partition_type(metadata.current_schema()).map_err(|e| {
-        DataFusionError::Internal(format!("Failed to get partition type: {}", e))
-    })?;
     let format_version = metadata.format_version();
 
     files
         .into_iter()
         .map(|f| {
+            // Look up the partition spec for this specific file
+            let spec_id = f.partition_spec_id();
+            let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Partition spec {} not found for DataFile",
+                    spec_id
+                ))
+            })?;
+            let partition_type =
+                spec.partition_type(metadata.current_schema())
+                    .map_err(|e| {
+                        DataFusionError::Internal(format!(
+                            "Failed to get partition type for spec {}: {}",
+                            spec_id, e
+                        ))
+                    })?;
+
             serialize_data_file_to_json(f, &partition_type, format_version).map_err(|e| {
                 DataFusionError::Internal(format!("Failed to serialize DataFile: {}", e))
             })
