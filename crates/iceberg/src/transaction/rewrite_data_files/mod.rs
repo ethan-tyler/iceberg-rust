@@ -559,29 +559,12 @@ impl RewriteDataFilesAction {
 
     /// Set a cancellation token for aborting the operation.
     ///
-    /// When the token is cancelled, the operation will stop processing
-    /// new file groups and return early with partial results.
+    /// When the token is cancelled, external executors should stop processing
+    /// new file groups and return early. Use [`is_cancelled()`] to check
+    /// the token state during execution.
     ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use tokio_util::sync::CancellationToken;
-    /// use std::time::Duration;
-    ///
-    /// let token = CancellationToken::new();
-    /// let token_clone = token.clone();
-    ///
-    /// // Spawn task to cancel after timeout
-    /// tokio::spawn(async move {
-    ///     tokio::time::sleep(Duration::from_secs(60)).await;
-    ///     token_clone.cancel();
-    /// });
-    ///
-    /// let result = table.rewrite_data_files()
-    ///     .with_cancellation_token(token)
-    ///     .execute()
-    ///     .await?;
-    /// ```
+    /// **Note:** This is used by external query engines (like DataFusion) that
+    /// execute the compaction. The token is checked during file group processing.
     #[must_use]
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = Some(token);
@@ -590,27 +573,12 @@ impl RewriteDataFilesAction {
 
     /// Set a progress callback for monitoring the operation.
     ///
-    /// The callback will be invoked for each progress event during
-    /// the compaction operation.
+    /// The callback will be invoked by external executors for each progress
+    /// event during the compaction operation.
     ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use std::sync::Arc;
-    /// use iceberg::transaction::rewrite_data_files::CompactionProgressEvent;
-    ///
-    /// let result = table.rewrite_data_files()
-    ///     .with_progress_callback(Arc::new(|event| {
-    ///         match event {
-    ///             CompactionProgressEvent::GroupCompleted { group_id, .. } => {
-    ///                 println!("Completed group {}", group_id);
-    ///             }
-    ///             _ => {}
-    ///         }
-    ///     }))
-    ///     .execute()
-    ///     .await?;
-    /// ```
+    /// **Note:** This is used by external query engines (like DataFusion) that
+    /// execute the compaction. The callback receives [`CompactionProgressEvent`]
+    /// instances for Started, GroupStarted, GroupCompleted, etc.
     #[must_use]
     pub fn with_progress_callback(mut self, callback: ProgressCallback) -> Self {
         self.progress_callback = Some(callback);
@@ -622,6 +590,16 @@ impl RewriteDataFilesAction {
         self.cancellation_token
             .as_ref()
             .is_some_and(|t| t.is_cancelled())
+    }
+
+    /// Get a reference to the cancellation token, if set.
+    pub fn cancellation_token(&self) -> Option<&CancellationToken> {
+        self.cancellation_token.as_ref()
+    }
+
+    /// Get a reference to the progress callback, if set.
+    pub fn progress_callback(&self) -> Option<&ProgressCallback> {
+        self.progress_callback.as_ref()
     }
 
     // ═══════════════════════════════════════════════════════════════════════
