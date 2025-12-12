@@ -278,23 +278,18 @@ mod tests {
     }
 
     #[test]
-    fn test_sorted_compaction_documented_behavior() {
-        // Sorted compaction should:
-        // 1. Read all files in a partition
-        // 2. Apply any position/equality deletes
-        // 3. Sort all data by the specified sort order
-        // 4. Write to new files at target size
-        // 5. Produce files with non-overlapping key ranges
+    #[ignore = "TODO: requires catalog/table infrastructure for end-to-end test"]
+    fn test_sorted_compaction_integration() {
+        // TODO: Full integration test for sorted compaction
         //
-        // This enables row group skipping in Parquet readers
-        // because min/max statistics will be tighter.
+        // Test should:
+        // 1. Create an in-memory catalog and table with sort order
+        // 2. Insert unsorted data across multiple small files
+        // 3. Run sorted compaction via compact_table()
+        // 4. Verify output files are sorted by reading back
+        // 5. Verify min/max statistics show non-overlapping ranges
         //
-        // The sort order can be:
-        // - Explicitly specified via RewriteStrategy::Sort { sort_order: Some(...) }
-        // - Derived from table's default sort order when sort_order is None
-        // - Multi-column with mixed directions (ASC/DESC) and null orders
-        //
-        // Integration tests require full catalog/table infrastructure.
         // See physical_plan::compaction::tests for unit tests of sort_batches().
+        panic!("Integration test not yet implemented");
     }
 }

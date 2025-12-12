@@ -837,10 +837,19 @@ pub async fn sort_batches(
         // Build the base expression based on transform
         let expr = match sort_field.transform {
             Transform::Identity => col(column_name),
-            Transform::Bucket(_) | Transform::Truncate(_) => {
-                // For bucket and truncate, we sort on the original value
-                // The transform creates the bucket but we cluster by natural order
+            Transform::Truncate(_) => {
+                // For truncate, sorting on the original value clusters similar
+                // truncated values together (e.g., strings with same prefix)
                 col(column_name)
+            }
+            Transform::Bucket(_) => {
+                // Bucket transform hashes values, so sorting by original value
+                // doesn't produce correct bucket ordering. Not supported.
+                return Err(DataFusionError::NotImplemented(
+                    "Bucket transform not supported for sorted compaction. \
+                     Use Identity transform or remove bucket from sort order."
+                        .to_string(),
+                ));
             }
             _ => {
                 return Err(DataFusionError::NotImplemented(format!(

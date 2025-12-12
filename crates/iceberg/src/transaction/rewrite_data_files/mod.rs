@@ -559,7 +559,8 @@ impl RewriteDataFilesAction {
     /// Sorts data during compaction using the table's defined sort order.
     /// Improves query performance for sorted access patterns.
     ///
-    /// **Note**: This is a placeholder for Phase 2.2 implementation.
+    /// Sort execution is provided by external executors (e.g., `iceberg-datafusion`).
+    /// The core library provides planner and committer support.
     #[must_use]
     pub fn sort(mut self) -> Self {
         self.strategy = RewriteStrategy::Sort { sort_order: None };
@@ -568,7 +569,8 @@ impl RewriteDataFilesAction {
 
     /// Use sort strategy with custom sort order.
     ///
-    /// **Note**: This is a placeholder for Phase 2.2 implementation.
+    /// Sort execution is provided by external executors (e.g., `iceberg-datafusion`).
+    /// The core library provides planner and committer support.
     #[must_use]
     pub fn sort_by(mut self, sort_order: crate::spec::SortOrder) -> Self {
         self.strategy = RewriteStrategy::Sort {

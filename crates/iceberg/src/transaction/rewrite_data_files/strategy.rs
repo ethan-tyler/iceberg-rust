@@ -63,7 +63,8 @@ pub enum RewriteStrategy {
     /// 2. Apply sort order (DataFusion sort)
     /// 3. Write sorted data to target-sized files
     ///
-    /// **Note**: Phase 2.2 - Not yet implemented.
+    /// Sort execution is provided by external executors (e.g., `iceberg-datafusion`).
+    /// The core library provides planner and committer support.
     Sort {
         /// Custom sort order, or None to use table's default.
         sort_order: Option<SortOrder>,
