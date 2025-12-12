@@ -276,4 +276,25 @@ mod tests {
         assert!(options.strategy.is_some());
         assert!(options.strategy.as_ref().unwrap().is_sort());
     }
+
+    #[test]
+    fn test_sorted_compaction_documented_behavior() {
+        // Sorted compaction should:
+        // 1. Read all files in a partition
+        // 2. Apply any position/equality deletes
+        // 3. Sort all data by the specified sort order
+        // 4. Write to new files at target size
+        // 5. Produce files with non-overlapping key ranges
+        //
+        // This enables row group skipping in Parquet readers
+        // because min/max statistics will be tighter.
+        //
+        // The sort order can be:
+        // - Explicitly specified via RewriteStrategy::Sort { sort_order: Some(...) }
+        // - Derived from table's default sort order when sort_order is None
+        // - Multi-column with mixed directions (ASC/DESC) and null orders
+        //
+        // Integration tests require full catalog/table infrastructure.
+        // See physical_plan::compaction::tests for unit tests of sort_batches().
+    }
 }
