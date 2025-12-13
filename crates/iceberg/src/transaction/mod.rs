@@ -54,6 +54,9 @@ mod action;
 
 pub use action::*;
 pub use evolve_partition::EvolvePartitionAction;
+pub use expire_snapshots::{
+    CleanupLevel, ExpireSnapshotsAction, ExpireSnapshotsResult, RetentionPolicy,
+};
 pub use overwrite::OverwriteAction;
 pub use replace_partitions::ReplacePartitionsAction;
 pub use rewrite_data_files::{
@@ -65,6 +68,7 @@ pub use row_delta::RowDeltaAction;
 mod append;
 mod delete;
 mod evolve_partition;
+pub mod expire_snapshots;
 mod overwrite;
 mod replace_partitions;
 pub mod rewrite_data_files;
@@ -352,6 +356,58 @@ impl Transaction {
     /// - **V2+ tables**: Full compaction with delete file reconciliation
     pub fn rewrite_data_files(&self) -> RewriteDataFilesAction {
         RewriteDataFilesAction::new()
+    }
+
+    /// Creates an expire snapshots action for table maintenance.
+    ///
+    /// This action removes old snapshots that are no longer needed for time travel
+    /// or branch/tag references, and optionally deletes the orphaned data files
+    /// and manifest files.
+    ///
+    /// # Use Cases
+    ///
+    /// - Remove snapshots older than a retention period
+    /// - Clean up storage after data deletion operations
+    /// - Reduce metadata size for faster query planning
+    /// - Comply with data retention policies
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use chrono::{Duration, Utc};
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    ///
+    /// // Expire snapshots older than 7 days, keep at least 10
+    /// let action = tx.expire_snapshots()
+    ///     .older_than(Utc::now() - Duration::days(7))
+    ///     .retain_last(10);
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    ///
+    /// // Dry run to preview what would be deleted
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.expire_snapshots()
+    ///     .older_than(Utc::now() - Duration::days(7))
+    ///     .dry_run(true);
+    /// let tx = action.apply(tx)?;
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The action protects:
+    /// - The current snapshot
+    /// - Snapshots referenced by branches and tags
+    /// - Minimum number of snapshots per branch (configurable)
+    ///
+    /// # Cleanup Levels
+    ///
+    /// - `Full`: Delete data files, manifests, and manifest lists (default)
+    /// - `MetadataOnly`: Delete only manifest metadata, not data files
+    /// - `None`: Only remove snapshots from metadata, no file deletion
+    pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
+        ExpireSnapshotsAction::new()
     }
 
     /// Commit transaction.
