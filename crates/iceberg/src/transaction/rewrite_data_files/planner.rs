@@ -127,7 +127,7 @@ impl<'a> RewriteDataFilesPlanner<'a> {
     /// This ensures correctness at the cost of potentially compacting more
     /// files than strictly necessary.
     ///
-    /// Use [`plan_with_stats`] to get diagnostics about fail-open behavior.
+    /// Use [`Self::plan_with_stats`] to get diagnostics about fail-open behavior.
     #[must_use]
     pub fn with_partition_filter(mut self, filter: &'a Predicate) -> Self {
         self.partition_filter = Some(filter);
@@ -306,7 +306,7 @@ impl<'a> RewriteDataFilesPlanner<'a> {
 
     /// Execute the planning phase.
     ///
-    /// This is a convenience method that delegates to [`plan_with_stats`] and
+    /// This is a convenience method that delegates to [`Self::plan_with_stats`] and
     /// discards the filter diagnostics. Use `plan_with_stats` when you need
     /// visibility into partition filter evaluation behavior.
     ///

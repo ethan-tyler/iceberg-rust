@@ -39,8 +39,6 @@ use crate::spec::Struct;
 /// - `file_group_results` - Per-group metrics (empty by default)
 /// - `failed_file_groups` - Failure details (empty by default)
 /// - `duration_ms` - Caller should time the operation
-/// - `removed_delete_files_count` - Not yet implemented
-/// - `commits_count` - Always 1 (partial progress not yet implemented)
 ///
 /// # Computed Metrics
 ///
