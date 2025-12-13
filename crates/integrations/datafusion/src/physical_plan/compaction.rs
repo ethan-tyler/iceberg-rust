@@ -51,9 +51,27 @@
 //! IcebergCompactionCommitExec
 //!     │ Collects all DataFile JSON
 //!     │ Calls RewriteDataFilesCommitter::commit()
+//!     │ (Optional) Adds sort order metadata update
 //!     ▼
-//! Updated Table Snapshot
+//! Updated Table Snapshot + Sort Order Metadata
 //! ```
+//!
+//! ## Sort Order Metadata Updates
+//!
+//! When using the **Sort** strategy, the compaction commit can optionally update
+//! the table's default sort order metadata. This is handled atomically in the same
+//! catalog commit as the data file rewrite, ensuring consistency.
+//!
+//! - If an explicit sort order is provided via `RewriteStrategy::Sort { sort_order }`,
+//!   that order is added to the table and set as the new default.
+//! - If using `None` (table's existing default), the sort order is preserved.
+//!
+//! ## Row Group Configuration
+//!
+//! Use `CompactionOptions::with_row_group_size(max_rows)` to control the maximum
+//! number of rows per Parquet row group in output files. Smaller row groups provide
+//! more granular statistics for predicate pushdown but increase metadata overhead.
+//! If not specified, the Parquet default is used.
 //!
 //! ## Example: Sorted Compaction
 //!
@@ -168,13 +186,15 @@ pub struct IcebergCompactionExec {
     cancellation_token: Option<CancellationToken>,
     /// Optional progress callback.
     progress_callback: Option<ProgressCallback>,
+    /// Maximum rows per Parquet row group.
+    row_group_size: Option<usize>,
 }
 
 #[allow(dead_code)]
 impl IcebergCompactionExec {
     /// Create a new compaction executor with default bin-pack strategy.
     pub fn new(table: Table, plan: RewriteDataFilesPlan) -> DFResult<Self> {
-        Self::new_with_strategy(table, plan, RewriteStrategy::BinPack)
+        Self::new_with_strategy(table, plan, RewriteStrategy::BinPack, None)
     }
 
     /// Create a new compaction executor with specified strategy.
@@ -182,6 +202,7 @@ impl IcebergCompactionExec {
         table: Table,
         plan: RewriteDataFilesPlan,
         strategy: RewriteStrategy,
+        row_group_size: Option<usize>,
     ) -> DFResult<Self> {
         let output_schema = compaction_output_schema();
         let plan_properties = Self::compute_properties(output_schema.clone());
@@ -194,6 +215,7 @@ impl IcebergCompactionExec {
             plan_properties,
             cancellation_token: None,
             progress_callback: None,
+            row_group_size,
         })
     }
 
@@ -324,6 +346,7 @@ impl ExecutionPlan for IcebergCompactionExec {
         let total_bytes = self.plan.total_bytes;
         let total_files = self.plan.total_data_files;
         let strategy = self.strategy.clone();
+        let row_group_size = self.row_group_size;
 
         // Build partition type map for serialization
         let partition_types = build_partition_type_map(&table)?;
@@ -346,6 +369,7 @@ impl ExecutionPlan for IcebergCompactionExec {
                 let cancellation_token = cancellation_token.clone();
                 let progress_callback = progress_callback.clone();
                 let strategy = strategy.clone();
+                let row_group_size = row_group_size;
 
                 async move {
                     let group_id = file_group.group_id;
@@ -379,7 +403,7 @@ impl ExecutionPlan for IcebergCompactionExec {
 
                     // Process the file group (read + optional sort + write)
                     let result =
-                        process_file_group_with_strategy(&table, &file_group, &strategy).await;
+                        process_file_group_with_strategy(&table, &file_group, &strategy, row_group_size).await;
 
                     match result {
                         Ok(write_result) => {
@@ -613,6 +637,7 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
 /// * `batches` - RecordBatches to write
 /// * `partition` - Optional partition struct for the output files
 /// * `spec_id` - The partition spec ID for the output files
+/// * `row_group_size` - Optional max rows per Parquet row group
 ///
 /// # Returns
 /// Vector of DataFile entries for the newly written files.
@@ -621,9 +646,16 @@ pub async fn write_compacted_files(
     batches: Vec<RecordBatch>,
     partition: Option<&Struct>,
     spec_id: i32,
+    row_group_size: Option<usize>,
 ) -> DFResult<Vec<DataFile>> {
     if batches.is_empty() {
         return Ok(vec![]);
+    }
+
+    if row_group_size == Some(0) {
+        return Err(DataFusionError::Plan(
+            "row_group_size must be greater than 0".to_string(),
+        ));
     }
 
     let metadata = table.metadata();
@@ -648,9 +680,16 @@ pub async fn write_compacted_files(
         DataFileFormat::Parquet,
     );
 
+    // Build writer properties with optional row group size
+    let writer_props = match row_group_size {
+        Some(size) => WriterProperties::builder()
+            .set_max_row_group_size(size)
+            .build(),
+        None => WriterProperties::default(),
+    };
+
     // Build writer stack: Parquet -> Rolling -> DataFile
-    let parquet_writer_builder =
-        ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone());
+    let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, iceberg_schema.clone());
 
     let rolling_writer_builder = RollingFileWriterBuilder::new(
         parquet_writer_builder,
@@ -743,6 +782,7 @@ fn resolve_sort_order(
 /// * `table` - The Iceberg table
 /// * `file_group` - The file group to process
 /// * `strategy` - The rewrite strategy (determines if sorting is applied)
+/// * `row_group_size` - Optional max rows per Parquet row group
 ///
 /// # Returns
 /// Result containing new data files and metrics.
@@ -750,6 +790,7 @@ pub async fn process_file_group_with_strategy(
     table: &Table,
     file_group: &FileGroup,
     strategy: &RewriteStrategy,
+    row_group_size: Option<usize>,
 ) -> DFResult<FileGroupWriteResult> {
     let start_time = Instant::now();
     let group_id = file_group.group_id;
@@ -776,7 +817,8 @@ pub async fn process_file_group_with_strategy(
 
     // Step 3: Write output to new compacted files
     let partition = file_group.partition.as_ref();
-    let new_data_files = write_compacted_files(table, sorted_batches, partition, spec_id).await?;
+    let new_data_files =
+        write_compacted_files(table, sorted_batches, partition, spec_id, row_group_size).await?;
 
     // Calculate metrics
     let bytes_written: u64 = new_data_files.iter().map(|f| f.file_size_in_bytes()).sum();

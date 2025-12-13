@@ -71,6 +71,13 @@ pub struct CompactionOptions {
     pub cancellation_token: Option<CancellationToken>,
     /// Progress callback for monitoring.
     pub progress_callback: Option<ProgressCallback>,
+    /// Maximum rows per Parquet row group.
+    ///
+    /// Smaller row groups can improve row group filtering (more granular statistics)
+    /// but increase metadata overhead.
+    ///
+    /// Default: `None` (uses Parquet default).
+    pub row_group_size: Option<usize>,
 }
 
 impl CompactionOptions {
@@ -99,6 +106,13 @@ impl CompactionOptions {
     #[must_use]
     pub fn with_strategy(mut self, strategy: RewriteStrategy) -> Self {
         self.strategy = Some(strategy);
+        self
+    }
+
+    /// Set maximum rows per Parquet row group.
+    #[must_use]
+    pub fn with_row_group_size(mut self, max_rows: usize) -> Self {
+        self.row_group_size = Some(max_rows);
         self
     }
 }
@@ -196,8 +210,12 @@ pub async fn compact_table(
     };
 
     // Step 2: Create execution plan with strategy, progress and cancellation
-    let mut compaction_exec =
-        IcebergCompactionExec::new_with_strategy(table.clone(), plan.clone(), strategy)?;
+    let mut compaction_exec = IcebergCompactionExec::new_with_strategy(
+        table.clone(),
+        plan.clone(),
+        strategy,
+        options.row_group_size,
+    )?;
 
     if let Some(token) = options.cancellation_token {
         compaction_exec = compaction_exec.with_cancellation_token(token);
@@ -268,6 +286,7 @@ mod tests {
         assert!(options.rewrite_options.is_none());
         assert!(options.cancellation_token.is_none());
         assert!(options.progress_callback.is_none());
+        assert!(options.row_group_size.is_none());
     }
 
     #[test]
@@ -278,11 +297,13 @@ mod tests {
         let options = CompactionOptions::default()
             .with_rewrite_options(RewriteDataFilesOptions::default())
             .with_cancellation_token(token)
-            .with_progress_callback(callback);
+            .with_progress_callback(callback)
+            .with_row_group_size(1_000);
 
         assert!(options.rewrite_options.is_some());
         assert!(options.cancellation_token.is_some());
         assert!(options.progress_callback.is_some());
+        assert_eq!(options.row_group_size, Some(1_000));
     }
 
     #[test]
@@ -305,8 +326,24 @@ mod tests {
         // 3. Run sorted compaction via compact_table()
         // 4. Verify output files are sorted by reading back
         // 5. Verify min/max statistics show non-overlapping ranges
+        // 6. Verify table's default sort order metadata was updated
         //
         // See physical_plan::compaction::tests for unit tests of sort_batches().
+        panic!("Integration test not yet implemented");
+    }
+
+    #[test]
+    #[ignore = "TODO: requires catalog/table infrastructure for end-to-end test"]
+    fn test_sorted_compaction_updates_table_sort_order() {
+        // TODO: Test that sorted compaction atomically updates table metadata
+        //
+        // Test should:
+        // 1. Create catalog and table with NO sort order (unsorted default)
+        // 2. Run sorted compaction with explicit sort order
+        // 3. Verify the table's default sort order metadata was updated
+        // 4. Verify the sort order ID incremented correctly
+        //
+        // This verifies AC2: "Updates table sort order metadata"
         panic!("Integration test not yet implemented");
     }
 }
