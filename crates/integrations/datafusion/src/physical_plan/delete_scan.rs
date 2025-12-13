@@ -30,6 +30,7 @@ use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, 
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
+use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::planner::create_physical_expr;
@@ -39,7 +40,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use datafusion::common::DFSchema;
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
@@ -297,8 +297,8 @@ async fn scan_file_for_deletes(
     let batch_stream = reader.read(task_stream).map_err(to_datafusion_error)?;
 
     // Track row offset and lazily-built physical filter across batches
-    use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     // Determine if we have filters to apply
     let has_filters = !filter_exprs.is_empty();
@@ -306,8 +306,8 @@ async fn scan_file_for_deletes(
     // Cache the physical filter expression after building it from the first batch's schema.
     // This handles schema evolution: files written under older schemas have different Arrow schemas.
     // Result<Option<Arc<...>>>: Ok(Some) = filter built, Ok(None) = no filters, Err = filter failed
-    let cached_filter: Arc<OnceLock<Result<Option<Arc<dyn PhysicalExpr>>, String>>> =
-        Arc::new(OnceLock::new());
+    type CachedFilter = Arc<OnceLock<Result<Option<Arc<dyn PhysicalExpr>>, String>>>;
+    let cached_filter: CachedFilter = Arc::new(OnceLock::new());
 
     let stream = batch_stream
         .map(move |batch_result| {
@@ -333,9 +333,8 @@ async fn scan_file_for_deletes(
                                 // We MUST fail here rather than silently skip - users need to know
                                 // their DELETE predicate couldn't be evaluated on all files.
                                 Err(format!(
-                                    "Cannot evaluate DELETE predicate on file '{}': {}. \
-                                     This may indicate schema evolution incompatibility.",
-                                    file_path, e
+                                    "Cannot evaluate DELETE predicate on file '{file_path}': {e}. \
+                                     This may indicate schema evolution incompatibility."
                                 ))
                             }
                         }
@@ -357,15 +356,15 @@ async fn scan_file_for_deletes(
                             // Filter failed to build - fail the operation explicitly.
                             // Silent skips are a correctness hazard: users must know if
                             // their DELETE wasn't fully applied.
-                            return Err(datafusion::error::DataFusionError::Execution(
-                                msg.clone(),
-                            ));
+                            return Err(datafusion::error::DataFusionError::Execution(msg.clone()));
                         }
                     };
 
                     if positions.is_empty() {
                         // Return empty batch instead of None to keep stream structure simple
-                        Ok(RecordBatch::new_empty(IcebergDeleteScanExec::make_output_schema()))
+                        Ok(RecordBatch::new_empty(
+                            IcebergDeleteScanExec::make_output_schema(),
+                        ))
                     } else {
                         IcebergDeleteScanExec::make_delete_batch(&file_path, positions)
                     }
@@ -459,11 +458,11 @@ mod tests {
 
     #[test]
     fn test_make_delete_batch() {
-        let batch = IcebergDeleteScanExec::make_delete_batch(
-            "s3://bucket/table/data/file.parquet",
-            vec![0, 1, 5, 10],
-        )
-        .unwrap();
+        let batch =
+            IcebergDeleteScanExec::make_delete_batch("s3://bucket/table/data/file.parquet", vec![
+                0, 1, 5, 10,
+            ])
+            .unwrap();
 
         assert_eq!(batch.num_rows(), 4);
         assert_eq!(batch.num_columns(), 2);
@@ -489,11 +488,8 @@ mod tests {
 
     #[test]
     fn test_make_delete_batch_empty() {
-        let batch = IcebergDeleteScanExec::make_delete_batch(
-            "s3://bucket/file.parquet",
-            vec![],
-        )
-        .unwrap();
+        let batch =
+            IcebergDeleteScanExec::make_delete_batch("s3://bucket/file.parquet", vec![]).unwrap();
 
         assert_eq!(batch.num_rows(), 0);
     }

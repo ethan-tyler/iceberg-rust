@@ -36,12 +36,14 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
+use iceberg::Catalog;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::Catalog;
+use iceberg::writer::base_writer::position_delete_writer::position_delete_schema;
 
 use super::delete_write::DELETE_FILES_COL_NAME;
+use crate::partition_utils::{SerializedFileWithSpec, build_partition_type_map};
 use crate::to_datafusion_error;
 
 /// Column name for the count of deleted rows in output
@@ -51,6 +53,13 @@ pub const DELETE_COUNT_COL_NAME: &str = "count";
 ///
 /// Collects serialized delete file JSON from input and commits them using
 /// the DeleteAction transaction. Returns a count of the deleted rows.
+///
+/// # Concurrency Safety
+///
+/// This executor captures a baseline snapshot ID at plan construction time and validates
+/// it at commit time. If the table has been modified since the scan started (i.e., another
+/// transaction committed), the commit will fail with a clear error rather than potentially
+/// applying stale position deletes to reorganized files.
 #[derive(Debug)]
 pub struct IcebergDeleteCommitExec {
     table: Table,
@@ -59,15 +68,28 @@ pub struct IcebergDeleteCommitExec {
     input_schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
     plan_properties: PlanProperties,
+    /// Snapshot ID captured at plan construction time for concurrency validation.
+    /// If set, commit will fail if the table's current snapshot has changed.
+    baseline_snapshot_id: Option<i64>,
 }
 
 impl IcebergDeleteCommitExec {
     /// Creates a new `IcebergDeleteCommitExec`.
+    ///
+    /// # Arguments
+    /// * `table` - The Iceberg table to commit to
+    /// * `catalog` - The catalog for committing changes
+    /// * `input` - The input execution plan providing delete files
+    /// * `input_schema` - Schema of the input plan
+    /// * `baseline_snapshot_id` - Snapshot ID captured at plan construction time.
+    ///   If provided, commit will validate that the table hasn't been modified since
+    ///   the scan started to prevent applying stale position deletes.
     pub fn new(
         table: Table,
         catalog: Arc<dyn Catalog>,
         input: Arc<dyn ExecutionPlan>,
         input_schema: ArrowSchemaRef,
+        baseline_snapshot_id: Option<i64>,
     ) -> Self {
         let count_schema = Self::make_count_schema();
         let plan_properties = Self::compute_properties(count_schema.clone());
@@ -79,6 +101,7 @@ impl IcebergDeleteCommitExec {
             input_schema,
             count_schema,
             plan_properties,
+            baseline_snapshot_id,
         }
     }
 
@@ -177,6 +200,7 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
             self.catalog.clone(),
             children[0].clone(),
             self.input_schema.clone(),
+            self.baseline_snapshot_id,
         )))
     }
 
@@ -192,14 +216,17 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
             )));
         }
 
-        let table = self.table.clone();
         let catalog = self.catalog.clone();
         let input_plan = self.input.clone();
         let count_schema = self.count_schema.clone();
+        let baseline_snapshot_id = self.baseline_snapshot_id;
+        let table_ident = self.table.identifier().clone();
+        // Note: We don't clone the table here because we refresh it from the catalog
+        // at commit time to get the latest state for validation.
 
-        let spec_id = self.table.metadata().default_partition_spec_id();
-        let partition_type = self.table.metadata().default_partition_type().clone();
-        let current_schema = self.table.metadata().current_schema().clone();
+        let partition_types = build_partition_type_map(&self.table)?;
+        let delete_schema = position_delete_schema(self.table.metadata().current_schema_id())
+            .map_err(to_datafusion_error)?;
 
         // Process the input and commit delete files
         let stream = futures::stream::once(async move {
@@ -216,16 +243,14 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
                     .column_by_name(DELETE_FILES_COL_NAME)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            DELETE_FILES_COL_NAME
+                            "Expected '{DELETE_FILES_COL_NAME}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be StringArray",
-                            DELETE_FILES_COL_NAME
+                            "Expected '{DELETE_FILES_COL_NAME}' column to be StringArray"
                         ))
                     })?;
 
@@ -234,8 +259,28 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
                     .into_iter()
                     .flatten()
                     .map(|f| -> DFResult<DataFile> {
-                        deserialize_data_file_from_json(f, spec_id, &partition_type, &current_schema)
-                            .map_err(to_datafusion_error)
+                        let serialized: SerializedFileWithSpec =
+                            serde_json::from_str(f).map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to parse delete file payload: {e}"
+                                ))
+                            })?;
+
+                        let partition_type =
+                            partition_types.get(&serialized.spec_id).ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "Partition spec {} not found while committing deletes",
+                                    serialized.spec_id
+                                ))
+                            })?;
+
+                        deserialize_data_file_from_json(
+                            &serialized.file_json,
+                            serialized.spec_id,
+                            partition_type,
+                            &delete_schema,
+                        )
+                        .map_err(to_datafusion_error)
                     })
                     .collect::<DFResult<Vec<_>>>()?;
 
@@ -248,6 +293,25 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
             // If no delete files were collected, return zero count
             if delete_files.is_empty() {
                 return Self::make_count_batch(0);
+            }
+
+            // Refresh table from catalog to get current state for commit
+            let table = catalog
+                .load_table(&table_ident)
+                .await
+                .map_err(to_datafusion_error)?;
+
+            // Validate baseline snapshot if provided - ensures position deletes
+            // are still valid (table hasn't been reorganized since scan started)
+            if let Some(baseline) = baseline_snapshot_id {
+                let current = table.metadata().current_snapshot_id();
+                if current != Some(baseline) {
+                    return Err(DataFusionError::Execution(format!(
+                        "DELETE conflict: table '{table_ident}' was modified by another transaction. \
+                         Expected snapshot {baseline}, but current snapshot is {current:?}. \
+                         Position deletes may be stale. Please retry the DELETE."
+                    )));
+                }
             }
 
             // Commit delete files using DeleteAction transaction
@@ -267,7 +331,10 @@ impl ExecutionPlan for IcebergDeleteCommitExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema,
+            stream,
+        )))
     }
 }
 

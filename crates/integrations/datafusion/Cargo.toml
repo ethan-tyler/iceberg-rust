@@ -36,9 +36,17 @@ futures = { workspace = true }
 iceberg = { workspace = true }
 parquet = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 expect-test = { workspace = true }
 parquet = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "update_benchmark"
+harness = false

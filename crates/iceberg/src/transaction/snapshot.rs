@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::ops::RangeFrom;
 
@@ -34,6 +34,40 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
 
+/// Groups data files by their partition spec ID.
+///
+/// This is used when committing files from evolved tables where files may
+/// have been written under different partition specs. Each group will be
+/// written to a separate manifest to comply with the Iceberg specification
+/// that "a manifest stores files for a single partition spec."
+///
+/// Uses BTreeMap for deterministic iteration order (sorted by spec_id),
+/// ensuring consistent manifest numbering across runs.
+fn group_files_by_spec(files: Vec<DataFile>) -> BTreeMap<i32, Vec<DataFile>> {
+    let mut groups: BTreeMap<i32, Vec<DataFile>> = BTreeMap::new();
+    for file in files {
+        groups.entry(file.partition_spec_id).or_default().push(file);
+    }
+    groups
+}
+
+/// Groups manifest entries by their data file's partition spec ID.
+///
+/// This is used when writing deleted or existing entries from evolved tables
+/// where entries may reference files from different partition specs.
+/// Each group will be written to a separate manifest.
+///
+/// Uses BTreeMap for deterministic iteration order (sorted by spec_id),
+/// ensuring consistent manifest numbering across runs.
+fn group_entries_by_spec(entries: Vec<ManifestEntry>) -> BTreeMap<i32, Vec<ManifestEntry>> {
+    let mut groups: BTreeMap<i32, Vec<ManifestEntry>> = BTreeMap::new();
+    for entry in entries {
+        let spec_id = entry.data_file().partition_spec_id;
+        groups.entry(spec_id).or_default().push(entry);
+    }
+    groups
+}
+
 /// A trait that defines how different table operations produce new snapshots.
 ///
 /// `SnapshotProduceOperation` is used by [`SnapshotProducer`] to customize snapshot creation
@@ -43,7 +77,7 @@ const META_ROOT_PATH: &str = "metadata";
 /// - Which existing manifest files should be included in the new snapshot
 /// - Which manifest entries should be marked as deleted
 ///
-/// # When it accomplishes
+/// # Usage in Snapshot Creation
 ///
 /// This trait is used during the snapshot creation process in [`SnapshotProducer::commit()`]:
 ///
@@ -57,8 +91,9 @@ const META_ROOT_PATH: &str = "metadata";
 ///    - An `Append` operation typically includes all existing manifests plus new ones
 ///    - An `Overwrite` operation might exclude manifests for partitions being overwritten
 ///
-/// 3. **Delete Entry Processing**: The `delete_entries()` method is intended for future delete
-///    operations to specify which manifest entries should be marked as deleted.
+/// 3. **Delete Entry Processing**: The `delete_entries()` method specifies which manifest
+///    entries should be marked as deleted. This is used by operations like `ReplacePartitions`
+///    and `Overwrite` to atomically remove existing data files while adding new ones.
 pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// Returns the operation type that will be recorded in the snapshot summary.
     ///
@@ -67,7 +102,9 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     fn operation(&self) -> Operation;
 
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
-    #[allow(unused)]
+    ///
+    /// These entries represent data files being removed from the table. They will be
+    /// written to a new manifest with status=DELETED to track the removal.
     fn delete_entries(
         &self,
         snapshot_produce: &SnapshotProducer,
@@ -85,6 +122,36 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+
+    /// Returns manifest entries that should be carried forward as EXISTING status.
+    ///
+    /// This is used when a manifest contains a mix of files: some to keep and some to replace.
+    /// Instead of including the original manifest (which would cause both Added and Deleted
+    /// entries for the same file), we return only the entries we want to keep.
+    /// These will be written to a new manifest with status=EXISTING.
+    ///
+    /// Default implementation returns empty (most operations don't need this).
+    fn existing_entries(
+        &self,
+        _snapshot_produce: &SnapshotProducer<'_>,
+    ) -> impl Future<Output = Result<Vec<ManifestEntry>>> + Send {
+        async { Ok(vec![]) }
+    }
+
+    /// Returns the data sequence number to use for added files.
+    ///
+    /// For most operations, this returns `None` which means the sequence number
+    /// will be inherited from the manifest list at commit time (the normal V2 behavior).
+    ///
+    /// For compaction operations with `use_starting_sequence_number=true`, this returns
+    /// the sequence number from when the compaction was planned. This ensures that
+    /// equality deletes written after planning will still apply to the compacted files,
+    /// maintaining MoR (Merge-on-Read) correctness.
+    ///
+    /// Default implementation returns `None`.
+    fn data_sequence_number(&self) -> Option<i64> {
+        None
+    }
 }
 
 pub(crate) struct DefaultManifestProcess;
@@ -142,6 +209,11 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
+    /// Validates added data files.
+    ///
+    /// For tables with partition evolution, data files may use any valid partition spec
+    /// from the table metadata (not just the default spec). This enables operations on
+    /// tables where files were written under different partition schemes.
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
         for data_file in &self.added_data_files {
             if data_file.content_type() != DataContentType::Data {
@@ -150,17 +222,33 @@ impl<'a> SnapshotProducer<'a> {
                     "Only data content type is allowed for fast append",
                 ));
             }
-            // Check if the data file partition spec id matches the table default partition spec id.
-            if self.table.metadata().default_partition_spec_id() != data_file.partition_spec_id {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Data file partition spec id does not match table default partition spec id",
-                ));
-            }
-            Self::validate_partition_value(
-                data_file.partition(),
-                self.table.metadata().default_partition_type(),
-            )?;
+            // Validate that the data file references a valid partition spec from table metadata
+            let partition_spec = self
+                .table
+                .metadata()
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Data file references unknown partition spec: {}",
+                            data_file.partition_spec_id
+                        ),
+                    )
+                })?;
+            // Validate partition value against the file's actual partition type
+            let partition_type = self
+                .find_compatible_partition_type(partition_spec)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Failed to compute partition type for spec {}: {}",
+                            data_file.partition_spec_id, e
+                        ),
+                    )
+                })?;
+            Self::validate_partition_value(data_file.partition(), &partition_type)?;
         }
 
         Ok(())
@@ -332,7 +420,22 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_id
     }
 
-    fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
+    /// Creates a manifest writer for a specific partition spec.
+    ///
+    /// This is used when writing manifests for files that belong to a non-default
+    /// partition spec, which can happen in tables with partition evolution.
+    ///
+    /// For evolved tables where the partition spec references fields not present
+    /// in the current schema, this method finds a compatible historical schema.
+    fn new_manifest_writer_for_spec(
+        &mut self,
+        partition_spec: &crate::spec::PartitionSpecRef,
+        content: ManifestContentType,
+    ) -> Result<ManifestWriter> {
+        // Find a schema compatible with this partition spec.
+        // For evolved tables, old specs may reference fields not in the current schema.
+        let compatible_schema = self.find_compatible_schema(partition_spec)?;
+
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
             self.table.metadata().location(),
@@ -346,12 +449,8 @@ impl<'a> SnapshotProducer<'a> {
             output_file,
             Some(self.snapshot_id),
             self.key_metadata.clone(),
-            self.table.metadata().current_schema().clone(),
-            self.table
-                .metadata()
-                .default_partition_spec()
-                .as_ref()
-                .clone(),
+            compatible_schema,
+            partition_spec.as_ref().clone(),
         );
         match self.table.metadata().format_version() {
             FormatVersion::V1 => Ok(builder.build_v1()),
@@ -385,13 +484,13 @@ impl<'a> SnapshotProducer<'a> {
                     "Partition field should only be primitive type.",
                 )
             })?;
-            if let Some(value) = value {
-                if !field.compatible(&value.as_primitive_literal().unwrap()) {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "Partition value is not compatible partition type",
-                    ));
-                }
+            if let Some(value) = value
+                && !field.compatible(&value.as_primitive_literal().unwrap())
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Partition value is not compatible partition type",
+                ));
             }
         }
         Ok(())
@@ -421,8 +520,54 @@ impl<'a> SnapshotProducer<'a> {
         ))
     }
 
-    // Write manifest file for added data files and return the ManifestFile for ManifestList.
-    async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
+    /// Finds a schema compatible with the given partition spec.
+    ///
+    /// For evolved tables, old partition specs may reference fields that no longer
+    /// exist in the current schema. This method finds a schema that can compute
+    /// the partition type for the given spec.
+    ///
+    /// Returns the current schema if compatible, otherwise searches historical schemas.
+    fn find_compatible_schema(
+        &self,
+        partition_spec: &crate::spec::PartitionSpecRef,
+    ) -> Result<crate::spec::SchemaRef> {
+        let current_schema = self.table.metadata().current_schema();
+        if partition_spec.partition_type(current_schema).is_ok() {
+            return Ok(current_schema.clone());
+        }
+
+        for schema in self.table.metadata().schemas_iter() {
+            if partition_spec.partition_type(schema).is_ok() {
+                return Ok(schema.clone());
+            }
+        }
+
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot find compatible schema for partition spec {}: no schema contains all referenced fields",
+                partition_spec.spec_id()
+            ),
+        ))
+    }
+
+    /// Write manifest files for added data files, grouping by partition spec.
+    ///
+    /// For tables with partition evolution, files may have different partition specs.
+    /// Each spec's files are written to a separate manifest to comply with the Iceberg
+    /// specification that "a manifest stores files for a single partition spec."
+    ///
+    /// # Arguments
+    ///
+    /// * `data_sequence_number` - Optional sequence number to use for the added entries.
+    ///   If `Some`, this sequence number will be set on each manifest entry (used for
+    ///   compaction operations where `use_starting_sequence_number=true`).
+    ///   If `None`, the sequence number will be inherited from the manifest list at
+    ///   commit time (normal V2+ behavior).
+    async fn write_added_manifests(
+        &mut self,
+        data_sequence_number: Option<i64>,
+    ) -> Result<Vec<ManifestFile>> {
         let added_data_files = std::mem::take(&mut self.added_data_files);
         if added_data_files.is_empty() {
             return Err(Error::new(
@@ -433,27 +578,59 @@ impl<'a> SnapshotProducer<'a> {
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
-        let manifest_entries = added_data_files.into_iter().map(|data_file| {
-            let builder = ManifestEntry::builder()
-                .status(crate::spec::ManifestStatus::Added)
-                .data_file(data_file);
-            if format_version == FormatVersion::V1 {
-                builder.snapshot_id(snapshot_id).build()
-            } else {
-                // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
-                // commit failed.
-                builder.build()
+
+        // Group files by partition spec for per-spec manifest writing
+        let file_groups = group_files_by_spec(added_data_files);
+
+        let mut manifests = Vec::with_capacity(file_groups.len());
+        for (spec_id, files) in file_groups {
+            let partition_spec = self
+                .table
+                .metadata()
+                .partition_spec_by_id(spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Data file references unknown partition spec: {spec_id}"),
+                    )
+                })?;
+
+            let manifest_entries = files.into_iter().map(|data_file| {
+                let builder = ManifestEntry::builder()
+                    .status(crate::spec::ManifestStatus::Added)
+                    .data_file(data_file);
+                if format_version == FormatVersion::V1 {
+                    builder.snapshot_id(snapshot_id).build()
+                } else {
+                    // For format version > 1, we set the snapshot id at the inherited time
+                    // to avoid rewriting the manifest file when commit fails.
+                    // However, for compaction with use_starting_sequence_number=true,
+                    // we must set the sequence number explicitly to ensure MoR correctness.
+                    if let Some(seq_num) = data_sequence_number {
+                        builder.sequence_number(seq_num).build()
+                    } else {
+                        builder.build()
+                    }
+                }
+            });
+
+            let mut writer =
+                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
+            for entry in manifest_entries {
+                writer.add_entry(entry)?;
             }
-        });
-        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
-        for entry in manifest_entries {
-            writer.add_entry(entry)?;
+            manifests.push(writer.write_manifest_file().await?);
         }
-        writer.write_manifest_file().await
+
+        Ok(manifests)
     }
 
-    // Write manifest file for added delete files and return the ManifestFile for ManifestList.
-    async fn write_delete_manifest(&mut self) -> Result<ManifestFile> {
+    /// Write manifest files for added delete files, grouping by partition spec.
+    ///
+    /// For tables with partition evolution, position delete files inherit the partition
+    /// spec of the data file they reference. Each spec's delete files are written to
+    /// a separate manifest to comply with the Iceberg specification.
+    async fn write_delete_manifests(&mut self) -> Result<Vec<ManifestFile>> {
         let added_delete_files = std::mem::take(&mut self.added_delete_files);
         if added_delete_files.is_empty() {
             return Err(Error::new(
@@ -464,21 +641,135 @@ impl<'a> SnapshotProducer<'a> {
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
-        let manifest_entries = added_delete_files.into_iter().map(|delete_file| {
-            let builder = ManifestEntry::builder()
-                .status(crate::spec::ManifestStatus::Added)
-                .data_file(delete_file);
-            if format_version == FormatVersion::V1 {
-                builder.snapshot_id(snapshot_id).build()
-            } else {
-                builder.build()
+
+        // Group delete files by partition spec for per-spec manifest writing
+        let file_groups = group_files_by_spec(added_delete_files);
+
+        let mut manifests = Vec::with_capacity(file_groups.len());
+        for (spec_id, files) in file_groups {
+            let partition_spec = self
+                .table
+                .metadata()
+                .partition_spec_by_id(spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Delete file references unknown partition spec: {spec_id}"),
+                    )
+                })?;
+
+            let manifest_entries = files.into_iter().map(|delete_file| {
+                let builder = ManifestEntry::builder()
+                    .status(crate::spec::ManifestStatus::Added)
+                    .data_file(delete_file);
+                if format_version == FormatVersion::V1 {
+                    builder.snapshot_id(snapshot_id).build()
+                } else {
+                    builder.build()
+                }
+            });
+
+            let mut writer =
+                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Deletes)?;
+            for entry in manifest_entries {
+                writer.add_entry(entry)?;
             }
-        });
-        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
-        for entry in manifest_entries {
-            writer.add_entry(entry)?;
+            manifests.push(writer.write_manifest_file().await?);
         }
-        writer.write_manifest_file().await
+
+        Ok(manifests)
+    }
+
+    /// Write manifest files for deleted data file entries (files being removed from the table).
+    ///
+    /// This is used by operations like `ReplacePartitions` and `Overwrite` that need to
+    /// mark existing data files as deleted in a new manifest.
+    ///
+    /// For tables with partition evolution, entries may reference files from different
+    /// partition specs. Each spec's entries are written to a separate manifest.
+    pub(crate) async fn write_deleted_data_manifests(
+        &mut self,
+        deleted_entries: Vec<ManifestEntry>,
+    ) -> Result<Vec<ManifestFile>> {
+        if deleted_entries.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No deleted entries to write",
+            ));
+        }
+
+        // Group entries by partition spec for per-spec manifest writing
+        let entry_groups = group_entries_by_spec(deleted_entries);
+
+        let mut manifests = Vec::with_capacity(entry_groups.len());
+        for (spec_id, entries) in entry_groups {
+            let partition_spec = self
+                .table
+                .metadata()
+                .partition_spec_by_id(spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Deleted entry references unknown partition spec: {spec_id}"),
+                    )
+                })?;
+
+            let mut writer =
+                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
+            for entry in entries {
+                // Use add_delete_entry to properly set status=Deleted
+                // (add_entry would override status to Added)
+                writer.add_delete_entry(entry)?;
+            }
+            manifests.push(writer.write_manifest_file().await?);
+        }
+
+        Ok(manifests)
+    }
+
+    /// Write manifest files for existing data file entries (files being carried forward).
+    ///
+    /// This is used when a manifest contains a mix of files: some to keep and some to replace.
+    /// The entries to keep are written to new manifests with status=EXISTING.
+    ///
+    /// For tables with partition evolution, entries may reference files from different
+    /// partition specs. Each spec's entries are written to a separate manifest.
+    pub(crate) async fn write_existing_data_manifests(
+        &mut self,
+        existing_entries: Vec<ManifestEntry>,
+    ) -> Result<Vec<ManifestFile>> {
+        if existing_entries.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No existing entries to write",
+            ));
+        }
+
+        // Group entries by partition spec for per-spec manifest writing
+        let entry_groups = group_entries_by_spec(existing_entries);
+
+        let mut manifests = Vec::with_capacity(entry_groups.len());
+        for (spec_id, entries) in entry_groups {
+            let partition_spec = self
+                .table
+                .metadata()
+                .partition_spec_by_id(spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Existing entry references unknown partition spec: {spec_id}"),
+                    )
+                })?;
+
+            let mut writer =
+                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
+            for entry in entries {
+                writer.add_existing_entry(entry)?;
+            }
+            manifests.push(writer.write_manifest_file().await?);
+        }
+
+        Ok(manifests)
     }
 
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
@@ -486,6 +777,14 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
+        // Get entries to delete (files being removed from the table)
+        let deleted_entries = snapshot_produce_operation.delete_entries(self).await?;
+        let has_deleted_entries = !deleted_entries.is_empty();
+
+        // Get existing entries (files being carried forward from partially affected manifests)
+        let existing_entries = snapshot_produce_operation.existing_entries(self).await?;
+        let has_existing_entries = !existing_entries.is_empty();
+
         // Assert current snapshot producer contains new content to add to new snapshot.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
@@ -495,26 +794,50 @@ impl<'a> SnapshotProducer<'a> {
         let has_delete_files = !self.added_delete_files.is_empty();
         let has_properties = !self.snapshot_properties.is_empty();
 
-        if !has_data_files && !has_delete_files && !has_properties {
+        if !has_data_files
+            && !has_delete_files
+            && !has_properties
+            && !has_deleted_entries
+            && !has_existing_entries
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files, delete files, or snapshot properties found when write a manifest file",
+                "No added data files, delete files, deleted entries, existing entries, or snapshot properties found when write a manifest file",
             ));
         }
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
 
-        // Process added data file entries.
-        if has_data_files {
-            let added_manifest = self.write_added_manifest().await?;
-            manifest_files.push(added_manifest);
+        // Process existing data file entries (files being carried forward from mixed manifests).
+        // Entries are grouped by partition spec, with separate manifests per spec.
+        if has_existing_entries {
+            let existing_manifests = self.write_existing_data_manifests(existing_entries).await?;
+            manifest_files.extend(existing_manifests);
         }
 
-        // Process added delete file entries.
+        // Process deleted data file entries (files being removed from the table).
+        // Entries are grouped by partition spec, with separate manifests per spec.
+        if has_deleted_entries {
+            let deleted_manifests = self.write_deleted_data_manifests(deleted_entries).await?;
+            manifest_files.extend(deleted_manifests);
+        }
+
+        // Process added data file entries.
+        // Files are grouped by partition spec, with separate manifests per spec.
+        // For compaction operations, the data sequence number may be explicitly set
+        // to maintain MoR correctness (use_starting_sequence_number=true).
+        if has_data_files {
+            let data_sequence_number = snapshot_produce_operation.data_sequence_number();
+            let added_manifests = self.write_added_manifests(data_sequence_number).await?;
+            manifest_files.extend(added_manifests);
+        }
+
+        // Process added delete file entries (position/equality deletes).
+        // Delete files are grouped by partition spec, with separate manifests per spec.
         if has_delete_files {
-            let delete_manifest = self.write_delete_manifest().await?;
-            manifest_files.push(delete_manifest);
+            let delete_manifests = self.write_delete_manifests().await?;
+            manifest_files.extend(delete_manifests);
         }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
@@ -544,20 +867,47 @@ impl<'a> SnapshotProducer<'a> {
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
 
+        // Add data files to summary collector, using each file's actual partition spec
+        // and a schema compatible with that spec (for evolved tables with historical schemas)
         for data_file in &self.added_data_files {
+            let partition_spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Data file references unknown partition spec: {}",
+                            data_file.partition_spec_id
+                        ),
+                    )
+                })?;
+            let compatible_schema = self.find_compatible_schema(partition_spec)?;
             summary_collector.add_file(
                 data_file,
-                table_metadata.current_schema().clone(),
-                table_metadata.default_partition_spec().clone(),
+                compatible_schema.clone(),
+                partition_spec.clone(),
             );
         }
 
-        // Add delete files to summary collector
+        // Add delete files to summary collector, using each file's actual partition spec
+        // and a schema compatible with that spec (for evolved tables with historical schemas)
         for delete_file in &self.added_delete_files {
+            let partition_spec = table_metadata
+                .partition_spec_by_id(delete_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Delete file references unknown partition spec: {}",
+                            delete_file.partition_spec_id
+                        ),
+                    )
+                })?;
+            let compatible_schema = self.find_compatible_schema(partition_spec)?;
             summary_collector.add_file(
                 delete_file,
-                table_metadata.current_schema().clone(),
-                table_metadata.default_partition_spec().clone(),
+                compatible_schema.clone(),
+                partition_spec.clone(),
             );
         }
 
@@ -687,5 +1037,128 @@ impl<'a> SnapshotProducer<'a> {
         ];
 
         Ok(ActionCommit::new(updates, requirements))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, ManifestStatus, Struct};
+
+    fn make_data_file_with_spec(spec_id: i32, path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition_spec_id(spec_id)
+            .partition(Struct::empty())
+            .build()
+            .unwrap()
+    }
+
+    fn make_manifest_entry_with_spec(spec_id: i32, path: &str) -> ManifestEntry {
+        let data_file = make_data_file_with_spec(spec_id, path);
+        ManifestEntry::builder()
+            .status(ManifestStatus::Added)
+            .data_file(data_file)
+            .build()
+    }
+
+    #[test]
+    fn test_group_files_by_spec_empty() {
+        let files: Vec<DataFile> = vec![];
+        let groups = group_files_by_spec(files);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_group_files_by_spec_single_spec() {
+        let files = vec![
+            make_data_file_with_spec(0, "file1.parquet"),
+            make_data_file_with_spec(0, "file2.parquet"),
+        ];
+        let groups = group_files_by_spec(files);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[&0].len(), 2);
+    }
+
+    #[test]
+    fn test_group_files_by_spec_multiple_specs() {
+        let files = vec![
+            make_data_file_with_spec(0, "file1.parquet"),
+            make_data_file_with_spec(1, "file2.parquet"),
+            make_data_file_with_spec(0, "file3.parquet"),
+            make_data_file_with_spec(2, "file4.parquet"),
+        ];
+        let groups = group_files_by_spec(files);
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[&0].len(), 2);
+        assert_eq!(groups[&1].len(), 1);
+        assert_eq!(groups[&2].len(), 1);
+    }
+
+    #[test]
+    fn test_group_files_by_spec_deterministic_order() {
+        // BTreeMap should produce deterministic iteration order sorted by spec_id
+        let files = vec![
+            make_data_file_with_spec(2, "file1.parquet"),
+            make_data_file_with_spec(0, "file2.parquet"),
+            make_data_file_with_spec(1, "file3.parquet"),
+        ];
+        let groups = group_files_by_spec(files);
+
+        // Verify iteration order is sorted by spec_id
+        let spec_ids: Vec<i32> = groups.keys().copied().collect();
+        assert_eq!(spec_ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_group_entries_by_spec_empty() {
+        let entries: Vec<ManifestEntry> = vec![];
+        let groups = group_entries_by_spec(entries);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_group_entries_by_spec_single_spec() {
+        let entries = vec![
+            make_manifest_entry_with_spec(0, "file1.parquet"),
+            make_manifest_entry_with_spec(0, "file2.parquet"),
+        ];
+        let groups = group_entries_by_spec(entries);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[&0].len(), 2);
+    }
+
+    #[test]
+    fn test_group_entries_by_spec_multiple_specs() {
+        let entries = vec![
+            make_manifest_entry_with_spec(0, "file1.parquet"),
+            make_manifest_entry_with_spec(1, "file2.parquet"),
+            make_manifest_entry_with_spec(0, "file3.parquet"),
+        ];
+        let groups = group_entries_by_spec(entries);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[&0].len(), 2);
+        assert_eq!(groups[&1].len(), 1);
+    }
+
+    #[test]
+    fn test_group_entries_by_spec_deterministic_order() {
+        // BTreeMap should produce deterministic iteration order sorted by spec_id
+        let entries = vec![
+            make_manifest_entry_with_spec(2, "file1.parquet"),
+            make_manifest_entry_with_spec(0, "file2.parquet"),
+            make_manifest_entry_with_spec(1, "file3.parquet"),
+        ];
+        let groups = group_entries_by_spec(entries);
+
+        // Verify iteration order is sorted by spec_id
+        let spec_ids: Vec<i32> = groups.keys().copied().collect();
+        assert_eq!(spec_ids, vec![0, 1, 2]);
     }
 }

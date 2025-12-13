@@ -54,6 +54,10 @@ impl TableProvider for IcebergMetadataTableProvider {
         let schema = match self.r#type {
             MetadataTableType::Snapshots => metadata_table.snapshots().schema(),
             MetadataTableType::Manifests => metadata_table.manifests().schema(),
+            MetadataTableType::History => metadata_table.history().schema(),
+            MetadataTableType::Refs => metadata_table.refs().schema(),
+            MetadataTableType::Files => metadata_table.files().schema(),
+            MetadataTableType::Properties => metadata_table.properties().schema(),
         };
         schema_to_arrow_schema(&schema).unwrap().into()
     }
@@ -79,6 +83,10 @@ impl IcebergMetadataTableProvider {
         let stream = match self.r#type {
             MetadataTableType::Snapshots => metadata_table.snapshots().scan().await,
             MetadataTableType::Manifests => metadata_table.manifests().scan().await,
+            MetadataTableType::History => metadata_table.history().scan().await,
+            MetadataTableType::Refs => metadata_table.refs().scan().await,
+            MetadataTableType::Files => metadata_table.files().scan().await,
+            MetadataTableType::Properties => metadata_table.properties().scan().await,
         }
         .map_err(to_datafusion_error)?;
         let stream = stream.map_err(to_datafusion_error);

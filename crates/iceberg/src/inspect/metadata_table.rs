@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{ManifestsTable, SnapshotsTable};
+use super::{FilesTable, HistoryTable, ManifestsTable, PropertiesTable, RefsTable, SnapshotsTable};
 use crate::table::Table;
 
 /// Metadata table is used to inspect a table's history, snapshots, and other metadata as a table.
@@ -34,6 +34,14 @@ pub enum MetadataTableType {
     Snapshots,
     /// [`ManifestsTable`]
     Manifests,
+    /// [`HistoryTable`]
+    History,
+    /// [`RefsTable`]
+    Refs,
+    /// [`FilesTable`]
+    Files,
+    /// [`PropertiesTable`]
+    Properties,
 }
 
 impl MetadataTableType {
@@ -42,6 +50,10 @@ impl MetadataTableType {
         match self {
             MetadataTableType::Snapshots => "snapshots",
             MetadataTableType::Manifests => "manifests",
+            MetadataTableType::History => "history",
+            MetadataTableType::Refs => "refs",
+            MetadataTableType::Files => "files",
+            MetadataTableType::Properties => "properties",
         }
     }
 
@@ -59,6 +71,10 @@ impl TryFrom<&str> for MetadataTableType {
         match value {
             "snapshots" => Ok(Self::Snapshots),
             "manifests" => Ok(Self::Manifests),
+            "history" => Ok(Self::History),
+            "refs" => Ok(Self::Refs),
+            "files" => Ok(Self::Files),
+            "properties" => Ok(Self::Properties),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -71,12 +87,32 @@ impl<'a> MetadataTable<'a> {
     }
 
     /// Get the snapshots table.
-    pub fn snapshots(&self) -> SnapshotsTable {
+    pub fn snapshots(&self) -> SnapshotsTable<'_> {
         SnapshotsTable::new(self.0)
     }
 
     /// Get the manifests table.
-    pub fn manifests(&self) -> ManifestsTable {
+    pub fn manifests(&self) -> ManifestsTable<'_> {
         ManifestsTable::new(self.0)
+    }
+
+    /// Get the history table.
+    pub fn history(&self) -> HistoryTable<'_> {
+        HistoryTable::new(self.0)
+    }
+
+    /// Get the refs table.
+    pub fn refs(&self) -> RefsTable<'_> {
+        RefsTable::new(self.0)
+    }
+
+    /// Get the files table.
+    pub fn files(&self) -> FilesTable<'_> {
+        FilesTable::new(self.0)
+    }
+
+    /// Get the properties table.
+    pub fn properties(&self) -> PropertiesTable<'_> {
+        PropertiesTable::new(self.0)
     }
 }

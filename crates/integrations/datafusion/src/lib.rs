@@ -18,12 +18,15 @@
 mod catalog;
 pub use catalog::*;
 
+pub mod compaction;
 pub mod delete;
+pub mod merge;
 pub mod update;
 
 mod error;
 pub use error::*;
 
+pub(crate) mod partition_utils;
 pub mod physical_plan;
 mod schema;
 pub mod table;

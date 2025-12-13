@@ -53,8 +53,21 @@
 mod action;
 
 pub use action::*;
+pub use evolve_partition::EvolvePartitionAction;
+pub use overwrite::OverwriteAction;
+pub use replace_partitions::ReplacePartitionsAction;
+pub use rewrite_data_files::{
+    FileGroup, FileGroupFailure, FileGroupResult, FileGroupRewriteResult, RewriteDataFilesAction,
+    RewriteDataFilesCommitter, RewriteDataFilesOptions, RewriteDataFilesPlan,
+    RewriteDataFilesPlanner, RewriteDataFilesResult, RewriteJobOrder, RewriteStrategy,
+};
+pub use row_delta::RowDeltaAction;
 mod append;
 mod delete;
+mod evolve_partition;
+mod overwrite;
+mod replace_partitions;
+pub mod rewrite_data_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -178,6 +191,76 @@ impl Transaction {
         RowDeltaAction::new()
     }
 
+    /// Creates a replace partitions action for dynamic partition replacement.
+    ///
+    /// This action implements Hive-compatible INSERT OVERWRITE semantics:
+    /// partitions are determined from the added files' partition values,
+    /// and ALL existing files in those partitions are atomically replaced.
+    ///
+    /// # Use Cases
+    ///
+    /// - Dynamic ETL pipelines where partitions are determined at runtime
+    /// - Idempotent partition refresh operations
+    /// - INSERT OVERWRITE with dynamic partition mode
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.replace_partitions()
+    ///     .add_data_files(new_files);
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    ///
+    /// # Partition Evolution
+    ///
+    /// Only files with the same partition spec ID as the current default
+    /// partition spec are replaced. Files written with older partition specs
+    /// are preserved.
+    pub fn replace_partitions(&self) -> ReplacePartitionsAction {
+        ReplacePartitionsAction::new()
+    }
+
+    /// Creates an overwrite action for filter-based data replacement.
+    ///
+    /// This action implements INSERT OVERWRITE semantics with an explicit filter:
+    /// files matching the filter are deleted and replaced with new files.
+    /// Unlike `replace_partitions()` where partitions are dynamically determined
+    /// from added files, this action takes an explicit row filter.
+    ///
+    /// # Use Cases
+    ///
+    /// - INSERT OVERWRITE with explicit WHERE clause
+    /// - Targeted data correction/replacement
+    /// - Conditional bulk delete operations
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::expr::Reference;
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    /// // Delete all data where date = '2024-01-01' and add new files
+    /// let filter = Reference::new("date").equal_to(Datum::string("2024-01-01"));
+    /// let action = tx.overwrite()
+    ///     .overwrite_filter(filter)
+    ///     .add_data_files(new_files);
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    ///
+    /// # Filter Semantics
+    ///
+    /// The filter is projected to partition predicates using `InclusiveProjection`,
+    /// meaning files are deleted if their partition **could contain** matching rows.
+    pub fn overwrite(&self) -> OverwriteAction {
+        OverwriteAction::new()
+    }
+
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
         ReplaceSortOrderAction::new()
@@ -191,6 +274,84 @@ impl Transaction {
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
+    }
+
+    /// Creates a partition evolution action.
+    ///
+    /// This action allows adding a new partition spec to the table and optionally
+    /// setting it as the default for new writes. Existing data files retain their
+    /// original partition spec.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::spec::{Transform, UnboundPartitionSpec};
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    ///
+    /// // Add a new partition spec and set it as default
+    /// let new_spec = UnboundPartitionSpec::builder()
+    ///     .add_partition_field(1, "year", Transform::Year)?
+    ///     .build();
+    ///
+    /// let action = tx.evolve_partition_spec()
+    ///     .add_spec(new_spec)
+    ///     .set_default();
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    pub fn evolve_partition_spec(&self) -> EvolvePartitionAction {
+        EvolvePartitionAction::new()
+    }
+
+    /// Creates a rewrite data files action for table compaction.
+    ///
+    /// This action consolidates small data files into larger, target-sized files
+    /// using bin-packing. It is the Rust-native implementation of Iceberg's
+    /// `rewrite_data_files` maintenance action.
+    ///
+    /// # Use Cases
+    ///
+    /// - Consolidate small files from streaming ingestion
+    /// - Reduce query planning overhead from high file count
+    /// - Merge position/equality deletes into data files (V2 tables)
+    /// - Optimize storage costs by reducing object store API calls
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    ///
+    /// // Basic compaction with default settings
+    /// let action = tx.rewrite_data_files();
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    ///
+    /// // Compaction with custom settings
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.rewrite_data_files()
+    ///     .target_file_size_bytes(128 * 1024 * 1024)  // 128 MB target
+    ///     .min_input_files(10)                         // Require more files
+    ///     .max_concurrent_file_group_rewrites(4)       // Limit parallelism
+    ///     .remove_dangling_deletes(true);              // Clean up deletes
+    /// let tx = action.apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    ///
+    /// # Atomicity
+    ///
+    /// The operation is atomic: files are only replaced on successful commit.
+    /// On failure, original files remain unchanged.
+    ///
+    /// # Format Version Support
+    ///
+    /// - **V1 tables**: Simple bin-packing of data files
+    /// - **V2+ tables**: Full compaction with delete file reconciliation
+    pub fn rewrite_data_files(&self) -> RewriteDataFilesAction {
+        RewriteDataFilesAction::new()
     }
 
     /// Commit transaction.
@@ -561,7 +722,7 @@ mod test_row_lineage {
         fn file_with_rows(record_count: u64) -> DataFile {
             DataFileBuilder::default()
                 .content(DataContentType::Data)
-                .file_path(format!("test/{}.parquet", record_count))
+                .file_path(format!("test/{record_count}.parquet"))
                 .file_format(DataFileFormat::Parquet)
                 .file_size_in_bytes(100)
                 .record_count(record_count)

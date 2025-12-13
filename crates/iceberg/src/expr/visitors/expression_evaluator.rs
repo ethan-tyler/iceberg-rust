@@ -48,6 +48,15 @@ impl ExpressionEvaluator {
 
         visit(&mut visitor, &self.partition_filter)
     }
+
+    /// Evaluate this filter against a partition struct directly.
+    ///
+    /// This is useful when you have a partition Struct without a DataFile wrapper,
+    /// such as during partition filtering in rewrite_data_files.
+    pub(crate) fn eval_struct(&self, partition: &Struct) -> Result<bool> {
+        let mut visitor = ExpressionEvaluatorVisitor::new(partition);
+        visit(&mut visitor, &self.partition_filter)
+    }
 }
 
 /// Acts as a visitor for [`ExpressionEvaluator`] to apply

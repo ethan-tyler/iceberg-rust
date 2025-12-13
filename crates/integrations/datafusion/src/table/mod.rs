@@ -36,9 +36,10 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::DataFusionError;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::dml::{DmlCapabilities, InsertOp};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -49,13 +50,17 @@ use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
+use crate::merge::MergeBuilder;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::delete_commit::IcebergDeleteCommitExec;
 use crate::physical_plan::delete_scan::IcebergDeleteScanExec;
 use crate::physical_plan::delete_write::IcebergDeleteWriteExec;
+use crate::physical_plan::overwrite_commit::IcebergOverwriteCommitExec;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
+use crate::physical_plan::update::IcebergUpdateExec;
+use crate::physical_plan::update_commit::IcebergUpdateCommitExec;
 use crate::physical_plan::write::IcebergWriteExec;
 use crate::update::UpdateBuilder;
 
@@ -130,11 +135,7 @@ impl IcebergTableProvider {
     ///     .await?;
     /// println!("Deleted {} rows", deleted_count);
     /// ```
-    pub async fn delete(
-        &self,
-        _state: &dyn Session,
-        predicate: Option<Expr>,
-    ) -> DFResult<u64> {
+    pub async fn delete(&self, _state: &dyn Session, predicate: Option<Expr>) -> DFResult<u64> {
         use datafusion::execution::context::TaskContext;
         use datafusion::physical_plan::collect;
 
@@ -144,6 +145,9 @@ impl IcebergTableProvider {
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
+
+        // Capture baseline snapshot ID for concurrency validation
+        let baseline_snapshot_id = table.metadata().current_snapshot_id();
 
         // Build the delete execution plan chain
         let filters: Vec<Expr> = predicate.into_iter().collect();
@@ -156,20 +160,18 @@ impl IcebergTableProvider {
         ));
 
         // Step 2: Write position delete files
-        let delete_write = Arc::new(IcebergDeleteWriteExec::new(
-            table.clone(),
-            delete_scan,
-        ));
+        let delete_write = Arc::new(IcebergDeleteWriteExec::new(table.clone(), delete_scan));
 
         // Step 3: Coalesce partitions for single commit
         let coalesce = Arc::new(CoalescePartitionsExec::new(delete_write));
 
-        // Step 4: Commit delete files
+        // Step 4: Commit delete files with baseline validation
         let delete_commit = Arc::new(IcebergDeleteCommitExec::new(
             table,
             self.catalog.clone(),
             coalesce.clone(),
             coalesce.schema(),
+            baseline_snapshot_id,
         ));
 
         // Execute the plan
@@ -215,7 +217,54 @@ impl IcebergTableProvider {
     pub async fn update(&self) -> Result<UpdateBuilder> {
         // Load fresh table metadata from catalog
         let table = self.catalog.load_table(&self.table_ident).await?;
-        Ok(UpdateBuilder::new(table, self.catalog.clone(), self.schema.clone()))
+        Ok(UpdateBuilder::new(
+            table,
+            self.catalog.clone(),
+            self.schema.clone(),
+        ))
+    }
+
+    /// Creates a MergeBuilder for MERGE (UPSERT) operations on the table.
+    ///
+    /// MERGE combines INSERT, UPDATE, and DELETE operations into a single atomic
+    /// transaction. This is essential for CDC (Change Data Capture) patterns where
+    /// you need to synchronize a target table with a source dataset.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The source DataFrame to merge into this table
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use datafusion::prelude::*;
+    ///
+    /// // CDC-style merge: update existing, insert new, delete missing
+    /// let stats = provider
+    ///     .merge(source_df)
+    ///     .await?
+    ///     .on(col("target.id").eq(col("source.id")))
+    ///     .when_matched(None)
+    ///         .update_all()
+    ///     .when_not_matched(None)
+    ///         .insert_all()
+    ///     .when_not_matched_by_source(None)
+    ///         .delete()
+    ///     .execute(&session_state)
+    ///     .await?;
+    ///
+    /// println!("Inserted: {}, Updated: {}, Deleted: {}",
+    ///     stats.rows_inserted, stats.rows_updated, stats.rows_deleted);
+    /// ```
+    pub async fn merge(&self, source: DataFrame) -> Result<MergeBuilder> {
+        // Load fresh table metadata from catalog
+        let table = self.catalog.load_table(&self.table_ident).await?;
+        Ok(MergeBuilder::new(
+            table,
+            self.catalog.clone(),
+            self.schema.clone(),
+            source,
+        ))
     }
 }
 
@@ -269,7 +318,7 @@ impl TableProvider for IcebergTableProvider {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
+        insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Load fresh table metadata from catalog
         let table = self
@@ -307,11 +356,169 @@ impl TableProvider for IcebergTableProvider {
         // Merge the outputs of write_plan into one so we can commit all files together
         let coalesce_partitions = Arc::new(CoalescePartitionsExec::new(write_plan));
 
-        Ok(Arc::new(IcebergCommitExec::new(
+        // Choose commit executor based on insert operation type
+        let commit_exec: Arc<dyn ExecutionPlan> = match insert_op {
+            InsertOp::Append => {
+                // Standard INSERT: append new files without modifying existing data
+                Arc::new(IcebergCommitExec::new(
+                    table,
+                    self.catalog.clone(),
+                    coalesce_partitions,
+                    self.schema.clone(),
+                ))
+            }
+            InsertOp::Overwrite => {
+                // INSERT OVERWRITE: replace partitions touched by the new data
+                // Uses ReplacePartitionsAction for dynamic partition replacement
+                Arc::new(IcebergOverwriteCommitExec::new(
+                    table,
+                    self.catalog.clone(),
+                    coalesce_partitions,
+                    self.schema.clone(),
+                ))
+            }
+            InsertOp::Replace => {
+                // REPLACE INTO: Not yet supported
+                // Could use OverwriteAction with explicit filter in the future
+                return Err(DataFusionError::NotImplemented(
+                    "REPLACE INTO is not yet supported for Iceberg tables. \
+                    Use INSERT OVERWRITE for partition-level replacement."
+                        .to_string(),
+                ));
+            }
+        };
+
+        Ok(commit_exec)
+    }
+
+    /// Returns the DML capabilities supported by this table.
+    ///
+    /// IcebergTableProvider supports both DELETE and UPDATE operations
+    /// using Copy-on-Write semantics with position delete files.
+    fn dml_capabilities(&self) -> DmlCapabilities {
+        DmlCapabilities::ALL
+    }
+
+    /// Handles SQL DELETE statements by building an execution plan.
+    ///
+    /// Creates position delete files for all rows matching the filter predicates
+    /// and commits them atomically using the DeleteAction transaction.
+    ///
+    /// # Arguments
+    /// * `_state` - The DataFusion session state
+    /// * `filters` - Filter predicates from the DELETE WHERE clause
+    ///
+    /// # Returns
+    /// An execution plan that produces a single row with column `count` (UInt64)
+    /// indicating the number of rows deleted.
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Load fresh table metadata from catalog
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // Capture baseline snapshot ID for concurrency validation.
+        // If another transaction commits between our scan and commit,
+        // we'll detect it and fail rather than apply stale position deletes.
+        let baseline_snapshot_id = table.metadata().current_snapshot_id();
+
+        // Note: IcebergDeleteScanExec uses the table's current schema internally,
+        // so schema evolution is handled correctly within the scan operator.
+
+        // Step 1: Scan for rows to delete
+        let delete_scan = Arc::new(IcebergDeleteScanExec::new(
+            table.clone(),
+            None, // Use current snapshot
+            &filters,
+        ));
+
+        // Step 2: Write position delete files
+        let delete_write = Arc::new(IcebergDeleteWriteExec::new(table.clone(), delete_scan));
+
+        // Step 3: Coalesce partitions for single commit
+        let coalesce = Arc::new(CoalescePartitionsExec::new(delete_write));
+
+        // Step 4: Commit delete files with baseline validation
+        Ok(Arc::new(IcebergDeleteCommitExec::new(
             table,
             self.catalog.clone(),
-            coalesce_partitions,
-            self.schema.clone(),
+            coalesce.clone(),
+            coalesce.schema(),
+            baseline_snapshot_id,
+        )))
+    }
+
+    /// Handles SQL UPDATE statements by building an execution plan.
+    ///
+    /// Uses Copy-on-Write semantics: reads matching rows, applies SET expressions,
+    /// writes new data files, creates position delete files for originals,
+    /// and commits everything atomically.
+    ///
+    /// # Arguments
+    /// * `_state` - The DataFusion session state
+    /// * `assignments` - Column assignments from SET clause (column_name, expression)
+    /// * `filters` - Filter predicates from the UPDATE WHERE clause
+    ///
+    /// # Returns
+    /// An execution plan that produces a single row with column `count` (UInt64)
+    /// indicating the number of rows updated.
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Load fresh table metadata from catalog
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // Use fresh schema from loaded table to handle schema evolution
+        let current_schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(to_datafusion_error)?,
+        );
+
+        // Validate that all assigned columns exist in the current schema
+        for (column_name, _) in &assignments {
+            if current_schema.field_with_name(column_name).is_err() {
+                return Err(DataFusionError::Plan(format!(
+                    "Column '{column_name}' not found in table schema"
+                )));
+            }
+        }
+
+        // Capture baseline snapshot ID for concurrency validation.
+        // If another transaction commits between our scan and commit,
+        // we'll detect it and fail rather than apply stale position deletes.
+        let baseline_snapshot_id = table.metadata().current_snapshot_id();
+
+        // Build the UPDATE execution plan with fresh schema
+        let update_exec = Arc::new(IcebergUpdateExec::new(
+            table.clone(),
+            current_schema,
+            assignments,
+            filters,
+        ));
+
+        // Coalesce partitions for single commit
+        let coalesce = Arc::new(CoalescePartitionsExec::new(update_exec));
+
+        // Commit both data files and delete files atomically
+        Ok(Arc::new(IcebergUpdateCommitExec::new(
+            table,
+            self.catalog.clone(),
+            coalesce.clone(),
+            coalesce.schema(),
+            baseline_snapshot_id,
         )))
     }
 }
@@ -492,7 +699,7 @@ mod tests {
 
         let table_creation = TableCreation::builder()
             .name("test_table".to_string())
-            .location(format!("{}/test_table", warehouse_path))
+            .location(format!("{warehouse_path}/test_table"))
             .schema(schema)
             .properties(HashMap::new())
             .build();

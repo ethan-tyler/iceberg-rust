@@ -90,6 +90,7 @@
 //! # Current Limitations
 //!
 //! - Copy-on-Write only (no Merge-on-Read support)
+//! - Updating partition columns is not supported (would require moving rows between partitions)
 //! - Type coercion is strict (expression type must exactly match column type)
 //! - Only works with Iceberg format version 2 tables (position deletes require v2)
 //!
@@ -201,6 +202,8 @@ impl UpdateBuilder {
     /// Checks:
     /// - At least one SET assignment is provided
     /// - All target columns exist in the table schema
+    /// - No partition columns are being updated (partition column updates require rewriting
+    ///   entire files to new partitions, which is not supported)
     fn validate(&self) -> DFResult<()> {
         use datafusion::error::DataFusionError;
 
@@ -211,14 +214,30 @@ impl UpdateBuilder {
             ));
         }
 
-        // Validate each assignment
+        // Get partition source columns (the columns that partition transforms are applied to)
+        let partition_spec = self.table.metadata().default_partition_spec();
         let iceberg_schema = self.table.metadata().current_schema();
+
+        // Build set of partition source field IDs
+        let partition_source_ids: std::collections::HashSet<i32> = partition_spec
+            .fields()
+            .iter()
+            .map(|f| f.source_id)
+            .collect();
+
+        // Validate each assignment
         for (column_name, _expr) in &self.assignments {
             // Column must exist
-            if iceberg_schema.field_by_name(column_name).is_none() {
+            let field = iceberg_schema.field_by_name(column_name).ok_or_else(|| {
+                DataFusionError::Plan(format!("Column '{column_name}' not found in table schema"))
+            })?;
+
+            // Cannot update partition source columns
+            if partition_source_ids.contains(&field.id) {
                 return Err(DataFusionError::Plan(format!(
-                    "Column '{}' not found in table schema",
-                    column_name
+                    "Cannot UPDATE partition column '{column_name}'. Updating partition columns would \
+                     require moving rows between partitions, which is not supported. \
+                     Consider using DELETE + INSERT instead."
                 )));
             }
 
@@ -248,8 +267,7 @@ impl UpdateBuilder {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Validation fails (missing assignments, invalid columns)
-    /// - The table is partitioned (not yet supported)
+    /// - Validation fails (missing assignments, invalid columns, partition column update)
     /// - The update operation fails
     /// - The commit fails (e.g., due to conflicts)
     pub async fn execute(self, _session: &dyn Session) -> DFResult<u64> {
@@ -261,8 +279,11 @@ impl UpdateBuilder {
         use crate::physical_plan::update::IcebergUpdateExec;
         use crate::physical_plan::update_commit::IcebergUpdateCommitExec;
 
-        // Validate first
+        // Validate first (includes check for partition column updates)
         self.validate()?;
+
+        // Capture baseline snapshot ID for conflict detection during commit
+        let baseline_snapshot_id = self.table.metadata().current_snapshot_id();
 
         // Build the update execution plan chain
         let filters: Vec<Expr> = self.filter.into_iter().collect();
@@ -278,12 +299,13 @@ impl UpdateBuilder {
         // Step 4: Coalesce partitions for single commit
         let coalesce = Arc::new(CoalescePartitionsExec::new(update_exec));
 
-        // Step 5: Commit both data files and delete files
+        // Step 5: Commit both data files and delete files with baseline validation
         let update_commit = Arc::new(IcebergUpdateCommitExec::new(
             self.table,
             self.catalog,
             coalesce.clone(),
             coalesce.schema(),
+            baseline_snapshot_id,
         ));
 
         // Execute the plan

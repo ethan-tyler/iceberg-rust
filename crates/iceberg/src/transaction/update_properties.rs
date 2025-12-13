@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, Result, TableUpdate};
@@ -72,6 +73,38 @@ impl UpdatePropertiesAction {
         self.removals.insert(key);
         self
     }
+
+    /// Validates that no reserved properties are being modified.
+    ///
+    /// Reserved properties are managed internally by Iceberg and cannot be
+    /// directly set or removed via the UpdateProperties API.
+    fn validate_no_reserved_properties(&self) -> Result<()> {
+        // Check updates for reserved properties
+        for key in self.updates.keys() {
+            if TableProperties::RESERVED_PROPERTIES.contains(&key.as_str()) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot set reserved property '{key}'. Reserved properties are managed by Iceberg internally."
+                    ),
+                ));
+            }
+        }
+
+        // Check removals for reserved properties
+        for key in &self.removals {
+            if TableProperties::RESERVED_PROPERTIES.contains(&key.as_str()) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot remove reserved property '{key}'. Reserved properties are managed by Iceberg internally."
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for UpdatePropertiesAction {
@@ -83,6 +116,10 @@ impl Default for UpdatePropertiesAction {
 #[async_trait]
 impl TransactionAction for UpdatePropertiesAction {
     async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
+        // Validate that no reserved properties are being modified
+        self.validate_no_reserved_properties()?;
+
+        // Validate that no key is in both updates and removals
         if let Some(overlapping_key) = self.removals.iter().find(|k| self.updates.contains_key(*k))
         {
             return Err(Error::new(
@@ -110,6 +147,7 @@ mod tests {
 
     use as_any::Downcast;
 
+    use crate::spec::TableProperties;
     use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
     use crate::transaction::tests::make_v2_table;
@@ -137,5 +175,78 @@ mod tests {
         );
 
         assert_eq!(action.removals, HashSet::from(["b".to_string()]));
+    }
+
+    #[test]
+    fn test_cannot_set_reserved_property_format_version() {
+        let action = UpdatePropertiesAction::new().set(
+            TableProperties::PROPERTY_FORMAT_VERSION.to_string(),
+            "3".to_string(),
+        );
+
+        let result = action.validate_no_reserved_properties();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message().contains("reserved property"));
+        assert!(err.message().contains("format-version"));
+    }
+
+    #[test]
+    fn test_cannot_set_reserved_property_uuid() {
+        let action = UpdatePropertiesAction::new().set(
+            TableProperties::PROPERTY_UUID.to_string(),
+            "new-uuid".to_string(),
+        );
+
+        let result = action.validate_no_reserved_properties();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message().contains("reserved property"));
+        assert!(err.message().contains("uuid"));
+    }
+
+    #[test]
+    fn test_cannot_remove_reserved_property() {
+        let action = UpdatePropertiesAction::new()
+            .remove(TableProperties::PROPERTY_CURRENT_SNAPSHOT_ID.to_string());
+
+        let result = action.validate_no_reserved_properties();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message().contains("reserved property"));
+        assert!(err.message().contains("current-snapshot-id"));
+    }
+
+    #[test]
+    fn test_can_set_non_reserved_properties() {
+        let action = UpdatePropertiesAction::new()
+            .set("write.delete.mode".to_string(), "merge-on-read".to_string())
+            .set("custom.property".to_string(), "value".to_string());
+
+        let result = action.validate_no_reserved_properties();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_can_remove_non_reserved_properties() {
+        let action = UpdatePropertiesAction::new()
+            .remove("write.delete.mode".to_string())
+            .remove("old.property".to_string());
+
+        let result = action.validate_no_reserved_properties();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mixed_reserved_and_non_reserved_fails() {
+        let action = UpdatePropertiesAction::new()
+            .set("write.delete.mode".to_string(), "merge-on-read".to_string())
+            .set(
+                TableProperties::PROPERTY_FORMAT_VERSION.to_string(),
+                "3".to_string(),
+            );
+
+        let result = action.validate_no_reserved_properties();
+        assert!(result.is_err());
     }
 }
