@@ -39,8 +39,9 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
-use iceberg::Catalog;
-use iceberg::spec::{DataFile, deserialize_data_file_from_json};
+use iceberg::{Catalog, TableRequirement, TableUpdate};
+use iceberg::transaction::ActionCommit;
+use iceberg::spec::{DataFile, SortOrder, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::rewrite_data_files::{
     FileGroupRewriteResult, RewriteDataFilesCommitter, RewriteDataFilesPlan,
@@ -78,6 +79,9 @@ pub struct IcebergCompactionCommitExec {
     output_schema: ArrowSchemaRef,
     /// Plan properties.
     plan_properties: PlanProperties,
+    /// Optional sort order to set as table default after commit.
+    /// Used when sorted compaction should update the table's sort order metadata.
+    sort_order_for_update: Option<SortOrder>,
 }
 
 impl IcebergCompactionCommitExec {
@@ -89,12 +93,14 @@ impl IcebergCompactionCommitExec {
     /// * `catalog` - The catalog for committing changes
     /// * `plan` - The compaction plan containing file groups to rewrite
     /// * `input` - The input execution plan (IcebergCompactionExec)
+    /// * `sort_order_for_update` - Optional sort order to set as table default after commit
     #[allow(dead_code)]
     pub fn new(
         table: Table,
         catalog: Arc<dyn Catalog>,
         plan: RewriteDataFilesPlan,
         input: Arc<dyn ExecutionPlan>,
+        sort_order_for_update: Option<SortOrder>,
     ) -> DFResult<Self> {
         let output_schema = compaction_commit_output_schema();
         let plan_properties = Self::compute_properties(output_schema.clone());
@@ -106,6 +112,7 @@ impl IcebergCompactionCommitExec {
             input,
             output_schema,
             plan_properties,
+            sort_order_for_update,
         })
     }
 
@@ -187,6 +194,7 @@ impl ExecutionPlan for IcebergCompactionCommitExec {
             input: children[0].clone(),
             output_schema: self.output_schema.clone(),
             plan_properties: self.plan_properties.clone(),
+            sort_order_for_update: self.sort_order_for_update.clone(),
         }))
     }
 
@@ -205,6 +213,7 @@ impl ExecutionPlan for IcebergCompactionCommitExec {
         let catalog = self.catalog.clone();
         let plan = self.plan.clone();
         let output_schema = self.output_schema.clone();
+        let sort_order_for_update = self.sort_order_for_update.clone();
 
         // Execute input plan
         let input_stream = self.input.execute(0, context)?;
@@ -310,13 +319,37 @@ impl ExecutionPlan for IcebergCompactionCommitExec {
             // which is included in the ActionCommit and enforced atomically by the catalog.
             let table_ident = table.identifier().clone();
             let committer = RewriteDataFilesCommitter::new(&table, plan);
-            let (action_commit, result) = committer
+            let (mut action_commit, result) = committer
                 .commit(results)
                 .await
                 .map_err(to_datafusion_error)?;
 
+            // If a sort order update was requested, include it in the same atomic commit.
+            // This ensures the sort order metadata update happens together with the data
+            // file rewrite, avoiding a separate commit that could fail independently.
+            let final_commit = if let Some(ref sort_order) = sort_order_for_update {
+                // Extract the base updates and requirements from the compaction commit
+                let mut updates = action_commit.take_updates();
+                let mut requirements = action_commit.take_requirements();
+
+                // Add sort order updates: first add the new order, then set it as default
+                updates.push(TableUpdate::AddSortOrder {
+                    sort_order: sort_order.clone(),
+                });
+                updates.push(TableUpdate::SetDefaultSortOrder { sort_order_id: -1 });
+
+                // Add requirement to ensure sort order hasn't changed concurrently
+                requirements.push(TableRequirement::DefaultSortOrderIdMatch {
+                    default_sort_order_id: table.metadata().default_sort_order().order_id,
+                });
+
+                ActionCommit::new(updates, requirements)
+            } else {
+                action_commit
+            };
+
             // Apply the commit to the catalog (this is the actual catalog write)
-            action_commit
+            final_commit
                 .commit_to_catalog(table_ident, catalog.as_ref())
                 .await
                 .map_err(to_datafusion_error)?;

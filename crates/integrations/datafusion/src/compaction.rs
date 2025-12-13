@@ -179,6 +179,22 @@ pub async fn compact_table(
         return Ok(RewriteDataFilesResult::empty());
     }
 
+    // Determine if we should update the table's sort order after commit
+    let sort_order_for_update = match &strategy {
+        RewriteStrategy::Sort { sort_order } => {
+            // Use provided sort order, or fall back to table's default
+            sort_order.clone().or_else(|| {
+                let default = table.metadata().default_sort_order();
+                if default.is_unsorted() {
+                    None // Don't update if already unsorted and no custom order
+                } else {
+                    Some(default.as_ref().clone())
+                }
+            })
+        }
+        _ => None, // BinPack and ZOrder don't update sort order
+    };
+
     // Step 2: Create execution plan with strategy, progress and cancellation
     let mut compaction_exec =
         IcebergCompactionExec::new_with_strategy(table.clone(), plan.clone(), strategy)?;
@@ -197,6 +213,7 @@ pub async fn compact_table(
         catalog,
         plan,
         compaction_exec,
+        sort_order_for_update,
     )?);
 
     // Step 3: Execute
