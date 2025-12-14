@@ -57,6 +57,10 @@ pub use evolve_partition::EvolvePartitionAction;
 pub use expire_snapshots::{
     CleanupLevel, ExpireSnapshotsAction, ExpireSnapshotsResult, RetentionPolicy,
 };
+pub use remove_orphan_files::{
+    FileUriNormalizer, NormalizedUri, OrphanFileInfo, OrphanFileType, PrefixMismatchMode,
+    ReferenceFileCollector, RemoveOrphanFilesAction, RemoveOrphanFilesResult,
+};
 pub use overwrite::OverwriteAction;
 pub use replace_partitions::ReplacePartitionsAction;
 pub use rewrite_data_files::{
@@ -70,6 +74,7 @@ mod delete;
 mod evolve_partition;
 pub mod expire_snapshots;
 mod overwrite;
+pub mod remove_orphan_files;
 mod replace_partitions;
 pub mod rewrite_data_files;
 mod row_delta;
@@ -91,7 +96,6 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::delete::DeleteAction;
-use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;

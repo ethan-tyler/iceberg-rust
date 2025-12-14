@@ -577,6 +577,7 @@ pub mod tests {
     };
     use futures::{TryStreamExt, stream};
     use minijinja::value::Value;
+    use arrow_cast::cast;
     use minijinja::{AutoEscape, Environment, context};
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
@@ -585,6 +586,23 @@ pub mod tests {
     use uuid::Uuid;
 
     use crate::TableIdent;
+
+    /// Helper to convert an array to primitive, handling Run-End Encoded (REE) arrays.
+    /// Arrow 57+ may return REE arrays for columns with repeated values.
+    fn to_primitive_i64(array: &ArrayRef) -> Int64Array {
+        match array.data_type() {
+            arrow_schema::DataType::Int64 => {
+                array.as_primitive::<arrow_array::types::Int64Type>().clone()
+            }
+            arrow_schema::DataType::RunEndEncoded(_, _) => {
+                // Cast REE to primitive Int64
+                let casted = cast(array, &arrow_schema::DataType::Int64)
+                    .expect("Failed to cast REE to Int64");
+                casted.as_primitive::<arrow_array::types::Int64Type>().clone()
+            }
+            other => panic!("Unexpected array type: {:?}", other),
+        }
+    }
     use crate::arrow::ArrowReaderBuilder;
     use crate::expr::{BoundPredicate, Reference};
     use crate::io::{FileIO, OutputFile};
@@ -1310,8 +1328,15 @@ pub mod tests {
 
         let col = batches[0].column_by_name("x").unwrap();
 
-        let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int64_arr.value(0), 1);
+        // Column x is identity-partitioned, so value comes from partition metadata.
+        // The test fixture has two partitions: x=100 and x=300. Order is non-deterministic.
+        // Arrow 57+ may return REE arrays for repeated values.
+        let int64_arr = to_primitive_i64(col);
+        let x_val = int64_arr.value(0);
+        assert!(
+            x_val == 100 || x_val == 300,
+            "Expected partition value 100 or 300, got {x_val}"
+        );
     }
 
     #[tokio::test]
@@ -1349,7 +1374,16 @@ pub mod tests {
             .unwrap();
         let batch_2: Vec<_> = batch_stream.try_collect().await.unwrap();
 
-        assert_eq!(batch_1, batch_2);
+        // Verify both batches have the same structure
+        assert_eq!(batch_1.len(), batch_2.len());
+        assert_eq!(batch_1[0].num_columns(), batch_2[0].num_columns());
+        assert_eq!(batch_1[0].num_rows(), batch_2[0].num_rows());
+
+        // Verify non-partitioned columns (y, z, etc.) have the same values.
+        // Note: Column x is identity-partitioned, so it has different values
+        // (100 vs 300) from partition metadata, not the data files.
+        assert_eq!(batch_1[0].column_by_name("y"), batch_2[0].column_by_name("y"));
+        assert_eq!(batch_1[0].column_by_name("z"), batch_2[0].column_by_name("z"));
     }
 
     #[tokio::test]
@@ -1372,9 +1406,16 @@ pub mod tests {
 
         assert_eq!(batches[0].num_columns(), 2);
 
+        // Column x is identity-partitioned, so value comes from partition metadata.
+        // The test fixture has two partitions: x=100 and x=300. Order is non-deterministic.
+        // Arrow 57+ may return REE arrays for repeated values.
         let col1 = batches[0].column_by_name("x").unwrap();
-        let int64_arr = col1.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int64_arr.value(0), 1);
+        let int64_arr = to_primitive_i64(col1);
+        let x_val = int64_arr.value(0);
+        assert!(
+            x_val == 100 || x_val == 300,
+            "Expected partition value 100 or 300, got {x_val}"
+        );
 
         let col2 = batches[0].column_by_name("z").unwrap();
         let int64_arr = col2.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1408,9 +1449,16 @@ pub mod tests {
 
         assert_eq!(batches[0].num_rows(), 512);
 
+        // Column x is identity-partitioned, so value comes from partition metadata.
+        // The test fixture has two partitions: x=100 and x=300. Order is non-deterministic.
+        // Arrow 57+ may return REE arrays for repeated values.
         let col = batches[0].column_by_name("x").unwrap();
-        let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int64_arr.value(0), 1);
+        let int64_arr = to_primitive_i64(col);
+        let x_val = int64_arr.value(0);
+        assert!(
+            x_val == 100 || x_val == 300,
+            "Expected partition value 100 or 300, got {x_val}"
+        );
 
         let col = batches[0].column_by_name("y").unwrap();
         let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1436,9 +1484,16 @@ pub mod tests {
 
         assert_eq!(batches[0].num_rows(), 12);
 
+        // Column x is identity-partitioned, so value comes from partition metadata.
+        // The test fixture has two partitions: x=100 and x=300. Order is non-deterministic.
+        // Arrow 57+ may return REE arrays for repeated values.
         let col = batches[0].column_by_name("x").unwrap();
-        let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int64_arr.value(0), 1);
+        let int64_arr = to_primitive_i64(col);
+        let x_val = int64_arr.value(0);
+        assert!(
+            x_val == 100 || x_val == 300,
+            "Expected partition value 100 or 300, got {x_val}"
+        );
 
         let col = batches[0].column_by_name("y").unwrap();
         let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1603,9 +1658,21 @@ pub mod tests {
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
         assert_eq!(batches[0].num_rows(), 500);
 
+        // Column x is identity-partitioned, so value comes from partition metadata.
+        // The test fixture has two partitions: x=100 and x=300. Order is non-deterministic.
+        // Arrow 57+ may return REE arrays for repeated values.
         let col = batches[0].column_by_name("x").unwrap();
-        let expected_x = Arc::new(Int64Array::from_iter_values(vec![1; 500])) as ArrayRef;
-        assert_eq!(col, &expected_x);
+        let x_arr = to_primitive_i64(col);
+        let x_val = x_arr.value(0);
+        assert!(
+            x_val == 100 || x_val == 300,
+            "Expected partition value 100 or 300, got {x_val}"
+        );
+        // All values in the same batch should be from the same partition
+        assert!(
+            x_arr.iter().all(|v| v == Some(x_val)),
+            "All x values in batch should match"
+        );
 
         let col = batches[0].column_by_name("y").unwrap();
         let mut values = vec![];
@@ -1639,9 +1706,21 @@ pub mod tests {
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
         assert_eq!(batches[0].num_rows(), 1024);
 
+        // Column x is identity-partitioned, so value comes from partition metadata.
+        // The test fixture has two partitions: x=100 and x=300. Order is non-deterministic.
+        // Arrow 57+ may return REE arrays for repeated values.
         let col = batches[0].column_by_name("x").unwrap();
-        let expected_x = Arc::new(Int64Array::from_iter_values(vec![1; 1024])) as ArrayRef;
-        assert_eq!(col, &expected_x);
+        let x_arr = to_primitive_i64(col);
+        let x_val = x_arr.value(0);
+        assert!(
+            x_val == 100 || x_val == 300,
+            "Expected partition value 100 or 300, got {x_val}"
+        );
+        // All values in the same batch should be from the same partition
+        assert!(
+            x_arr.iter().all(|v| v == Some(x_val)),
+            "All x values in batch should match"
+        );
 
         let col = batches[0].column_by_name("y").unwrap();
         let mut values = vec![2; 512];
@@ -1840,9 +1919,17 @@ pub mod tests {
         assert_eq!(batches[0].num_columns(), 2);
 
         // Verify the x column exists and has correct data
+        // Note: Column x is an identity-partitioned field, so per Iceberg spec
+        // its value comes from partition metadata, not the data file.
+        // The test fixture has two partitions: x=100 and x=300. Order is non-deterministic.
+        // Arrow 57+ may return REE arrays for repeated values.
         let x_col = batches[0].column_by_name("x").unwrap();
-        let x_arr = x_col.as_primitive::<arrow_array::types::Int64Type>();
-        assert_eq!(x_arr.value(0), 1);
+        let x_arr = to_primitive_i64(x_col);
+        let x_val = x_arr.value(0);
+        assert!(
+            x_val == 100 || x_val == 300,
+            "Expected partition value 100 or 300, got {x_val}"
+        );
 
         // Verify the _file column exists
         let file_col = batches[0].column_by_name(RESERVED_COL_NAME_FILE);
@@ -2098,13 +2185,20 @@ pub mod tests {
         );
 
         // Verify all columns have correct data types
+        // Note: Column x is identity-partitioned, so Arrow 57+ may return REE for repeated values
         assert!(
-            matches!(schema.field(0).data_type(), arrow_schema::DataType::Int64),
-            "Column x should be Int64"
+            matches!(
+                schema.field(0).data_type(),
+                arrow_schema::DataType::Int64 | arrow_schema::DataType::RunEndEncoded(_, _)
+            ),
+            "Column x should be Int64 or RunEndEncoded"
         );
         assert!(
-            matches!(schema.field(2).data_type(), arrow_schema::DataType::Int64),
-            "Column x (duplicate) should be Int64"
+            matches!(
+                schema.field(2).data_type(),
+                arrow_schema::DataType::Int64 | arrow_schema::DataType::RunEndEncoded(_, _)
+            ),
+            "Column x (duplicate) should be Int64 or RunEndEncoded"
         );
         assert!(
             matches!(schema.field(3).data_type(), arrow_schema::DataType::Int64),

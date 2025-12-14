@@ -1537,13 +1537,11 @@ mod tests {
         // Verify the JSON contains the partition field and spec_id
         assert!(
             json.contains("category"),
-            "JSON should contain category field: {}",
-            json
+            "JSON should contain category field: {json}"
         );
         assert!(
             json.contains("\"spec_id\":0") || json.contains("\"spec_id\": 0"),
-            "JSON should contain spec_id: {}",
-            json
+            "JSON should contain spec_id: {json}"
         );
 
         // Deserialize with the WRONG partition type (spec 1 instead of spec 0)

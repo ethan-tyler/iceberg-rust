@@ -498,7 +498,7 @@ impl ExecutionPlan for IcebergMergeCommitExec {
             let action = tx
                 .row_delta()
                 .add_data_files(data_files)
-                .add_delete_files(delete_files);
+                .add_position_delete_files(delete_files);
             let tx = action.apply(tx).map_err(to_datafusion_error)?;
             let _updated_table = tx
                 .commit(catalog.as_ref())

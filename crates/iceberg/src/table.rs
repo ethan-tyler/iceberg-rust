@@ -26,7 +26,7 @@ use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
-use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::transaction::{ApplyTransactionAction, RemoveOrphanFilesAction, Transaction};
 use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -245,6 +245,57 @@ impl Table {
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
         ArrowReaderBuilder::new(self.file_io.clone())
+    }
+
+    /// Creates a remove orphan files action for table maintenance.
+    ///
+    /// This action identifies and removes files that exist in the table's storage
+    /// location but are not referenced by any snapshot. These "orphan" files
+    /// typically result from failed writes, crashed jobs, or incomplete transactions.
+    ///
+    /// # Use Cases
+    ///
+    /// - Clean up storage after failed writes or crashes
+    /// - Reduce storage costs from accumulated orphan files
+    /// - Prepare for compliance audits by removing untracked data
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use chrono::{Duration, Utc};
+    ///
+    /// // Basic usage with dry-run to preview deletions
+    /// let result = table.remove_orphan_files()
+    ///     .dry_run(true)
+    ///     .execute()
+    ///     .await?;
+    ///
+    /// println!("Would delete {} orphan files ({} bytes)",
+    ///     result.orphan_files.len(),
+    ///     result.bytes_reclaimed);
+    ///
+    /// // Production usage with custom retention
+    /// let result = table.remove_orphan_files()
+    ///     .older_than(Utc::now() - Duration::days(7))
+    ///     .max_concurrent_deletes(100)
+    ///     .execute()
+    ///     .await?;
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The action includes several safety measures:
+    /// - Default 3-day retention period (files younger than 3 days are never deleted)
+    /// - Dry-run mode to preview deletions
+    /// - Path normalization to handle scheme variations (s3/s3a/s3n)
+    ///
+    /// # Note
+    ///
+    /// Unlike transaction-based operations, this action operates directly on storage
+    /// and does not modify table metadata. Call `execute()` directly on the returned
+    /// action.
+    pub fn remove_orphan_files(&self) -> RemoveOrphanFilesAction {
+        RemoveOrphanFilesAction::new(self.clone())
     }
 
     // =========================================================================

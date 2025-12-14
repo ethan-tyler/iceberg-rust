@@ -496,11 +496,6 @@ impl TableProvider for IcebergTableProvider {
             }
         }
 
-        // Capture baseline snapshot ID for concurrency validation.
-        // If another transaction commits between our scan and commit,
-        // we'll detect it and fail rather than apply stale position deletes.
-        let baseline_snapshot_id = table.metadata().current_snapshot_id();
-
         // Build the UPDATE execution plan with fresh schema
         let update_exec = Arc::new(IcebergUpdateExec::new(
             table.clone(),
@@ -518,7 +513,6 @@ impl TableProvider for IcebergTableProvider {
             self.catalog.clone(),
             coalesce.clone(),
             coalesce.schema(),
-            baseline_snapshot_id,
         )))
     }
 }

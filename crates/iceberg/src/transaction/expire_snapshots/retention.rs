@@ -253,10 +253,10 @@ fn check_ref_expired(
             // Note: We'd need the snapshot timestamp to check this properly
             // For now, we rely on the ref's snapshot being present
             // A more complete implementation would check the snapshot timestamp
-            let cutoff = now_ms - max_age_ms;
+            let _cutoff = now_ms - max_age_ms;
             // This is a simplified check - in practice we'd check the ref creation time
             // or the snapshot timestamp
-            cutoff > 0 && false // Conservative: don't expire refs without more info
+            false // Conservative: don't expire refs without more info
         }
         _ => false, // No max age = never expires
     }

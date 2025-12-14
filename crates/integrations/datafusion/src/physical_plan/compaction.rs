@@ -553,7 +553,7 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
             FileScanTaskDeleteFile {
                 file_path: delete_file.file_path().to_string(),
                 file_type: delete_file.content_type(),
-                partition_spec_id: delete_file.partition_spec_id(),
+                partition_spec_id: delete_file.partition_spec_id_or_default(),
                 equality_ids: if delete_file.content_type() == DataContentType::EqualityDeletes {
                     delete_file.equality_ids().map(|ids| ids.to_vec())
                 } else {
@@ -579,7 +579,7 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
 
     for entry in &file_group.data_files {
         let data_file = &entry.data_file;
-        let data_file_spec_id = data_file.partition_spec_id();
+        let data_file_spec_id = data_file.partition_spec_id_or_default();
         if data_file_spec_id != file_group.partition_spec_id {
             return Err(DataFusionError::Internal(format!(
                 "File group {} contains data file with partition spec id {}, expected {}",
@@ -598,6 +598,7 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
             predicate: None, // Read all rows
             deletes: delete_files.clone(),
             partition: Some(data_file.partition().clone()),
+            partition_spec_id: Some(file_group.partition_spec_id),
             partition_spec: Some(partition_spec.clone()),
             name_mapping: None,
         };
@@ -933,7 +934,7 @@ pub fn serialize_data_files(files: Vec<DataFile>, table: &Table) -> DFResult<Vec
     files
         .into_iter()
         .map(|f| {
-            let spec_id = f.partition_spec_id();
+            let spec_id = f.partition_spec_id_or_default();
             let partition_type = partition_types.get(&spec_id).ok_or_else(|| {
                 DataFusionError::Internal(format!("Partition type not found for spec {spec_id}"))
             })?;

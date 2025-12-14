@@ -59,9 +59,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::delete_scan::{DELETE_FILE_PATH_COL, DELETE_POS_COL};
-use crate::partition_utils::{
-    FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
-};
+use crate::partition_utils::{FilePartitionInfo, build_file_partition_map};
 use crate::to_datafusion_error;
 
 /// Column name for serialized delete files in output
@@ -613,8 +611,7 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             // Iceberg guarantees field IDs are stable across schema evolution.
             let delete_files_json: Vec<String> = delete_files
                 .into_iter()
-                .map(|df| {
-                    let spec_id = df.partition_spec_id_or_default();
+                .map(|(spec_id, data_file)| {
                     let ptype = partition_specs
                         .get(&spec_id)
                         .ok_or_else(|| {
@@ -631,7 +628,7 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                         .map_err(to_datafusion_error)?
                         .partition_type(&current_schema)
                         .map_err(to_datafusion_error)?;
-                    serialize_data_file_to_json(df, &ptype, format_version)
+                    serialize_data_file_to_json(data_file, &ptype, format_version)
                         .map_err(to_datafusion_error)
                 })
                 .collect::<DFResult<Vec<String>>>()?;
