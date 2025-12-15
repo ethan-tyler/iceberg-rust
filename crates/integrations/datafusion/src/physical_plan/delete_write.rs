@@ -492,10 +492,14 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
         // Build spec_id -> PartitionSpec lookup for partition evolution support.
         // Currently DELETE only supports unpartitioned tables, but this prepares
         // for future support and maintains consistency with UPDATE.
-        let partition_specs: std::collections::HashMap<i32, std::sync::Arc<iceberg::spec::PartitionSpec>> =
-            table.metadata().partition_specs_iter()
-                .map(|spec| (spec.spec_id(), spec.clone()))
-                .collect();
+        let partition_specs: std::collections::HashMap<
+            i32,
+            std::sync::Arc<iceberg::spec::PartitionSpec>,
+        > = table
+            .metadata()
+            .partition_specs_iter()
+            .map(|spec| (spec.spec_id(), spec.clone()))
+            .collect();
         let current_schema = table.metadata().current_schema().clone();
         let result_schema = self.result_schema.clone();
 

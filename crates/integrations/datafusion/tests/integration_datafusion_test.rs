@@ -996,12 +996,8 @@ async fn test_delete_with_predicate() -> Result<()> {
     let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_predicate").await?;
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "delete_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "delete_table").await?;
 
     // Delete rows where foo1 > 3 (should delete diana and eve)
     let deleted_count = provider
@@ -1032,18 +1028,11 @@ async fn test_delete_full_table() -> Result<()> {
     let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_full").await?;
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "delete_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "delete_table").await?;
 
     // Delete all rows (no predicate)
-    let deleted_count = provider
-        .delete(&ctx.state(), None)
-        .await
-        .unwrap();
+    let deleted_count = provider.delete(&ctx.state(), None).await.unwrap();
 
     assert_eq!(deleted_count, 5, "Expected 5 rows deleted");
 
@@ -1070,12 +1059,8 @@ async fn test_delete_no_match() -> Result<()> {
     let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_nomatch").await?;
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "delete_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "delete_table").await?;
 
     // Delete rows that don't exist
     let deleted_count = provider
@@ -1108,12 +1093,8 @@ async fn test_select_after_delete() -> Result<()> {
     let (catalog, namespace, ctx) = setup_delete_test_table("test_select_after_delete").await?;
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "delete_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "delete_table").await?;
 
     // Delete specific row (bob)
     let deleted_count = provider
@@ -1143,10 +1124,7 @@ async fn test_select_after_delete() -> Result<()> {
         .collect();
 
     assert_eq!(names, vec!["alice", "charlie", "diana", "eve"]);
-    assert!(
-        !names.contains(&"bob".to_string()),
-        "bob should be deleted"
-    );
+    assert!(!names.contains(&"bob".to_string()), "bob should be deleted");
 
     Ok(())
 }
@@ -1219,7 +1197,10 @@ async fn test_delete_partitioned_table() -> Result<()> {
         .delete(&ctx.state(), Some(col("category").eq(lit("electronics"))))
         .await;
 
-    assert!(result.is_err(), "Expected NotImplemented error for partitioned table DELETE");
+    assert!(
+        result.is_err(),
+        "Expected NotImplemented error for partitioned table DELETE"
+    );
     let err = result.unwrap_err();
     let err_msg = err.to_string();
     assert!(
@@ -1240,7 +1221,10 @@ async fn test_delete_partitioned_table() -> Result<()> {
         .downcast_ref::<datafusion::arrow::array::Int64Array>()
         .unwrap()
         .value(0);
-    assert_eq!(count, 4, "All 4 rows should still exist since delete failed");
+    assert_eq!(
+        count, 4,
+        "All 4 rows should still exist since delete failed"
+    );
 
     Ok(())
 }
@@ -1263,12 +1247,8 @@ async fn test_delete_empty_table() -> Result<()> {
     ctx.register_catalog("catalog", catalog);
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "empty_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "empty_table").await?;
 
     // DELETE from empty table
     let deleted_count = provider
@@ -1326,12 +1306,8 @@ async fn test_update_with_predicate() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_update_predicate").await?;
 
     // Create provider for programmatic update
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update rows where foo1 > 3 (diana and eve) to have foo2 = 'updated'
     let updated_count = provider
@@ -1378,12 +1354,8 @@ async fn test_update_with_predicate() -> Result<()> {
 async fn test_update_full_table() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_update_full").await?;
 
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update all rows to have foo2 = 'all_updated'
     let updated_count = provider
@@ -1417,7 +1389,10 @@ async fn test_update_full_table() -> Result<()> {
         })
         .collect();
 
-    assert!(names.iter().all(|n| n == "all_updated"), "All rows should be 'all_updated'");
+    assert!(
+        names.iter().all(|n| n == "all_updated"),
+        "All rows should be 'all_updated'"
+    );
     assert_eq!(names.len(), 5);
 
     Ok(())
@@ -1460,12 +1435,9 @@ async fn test_update_multiple_columns() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "multi_update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "multi_update_table")
+            .await?;
 
     // Update both name and status where id = 1
     let updated_count = provider
@@ -1483,7 +1455,9 @@ async fn test_update_multiple_columns() -> Result<()> {
 
     // Verify the updates
     let df = ctx
-        .sql("SELECT id, name, status FROM catalog.test_update_multi.multi_update_table ORDER BY id")
+        .sql(
+            "SELECT id, name, status FROM catalog.test_update_multi.multi_update_table ORDER BY id",
+        )
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
@@ -1556,12 +1530,9 @@ async fn test_update_with_expression() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "expr_update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "expr_update_table")
+            .await?;
 
     // Update: value = value + 100 where value > 15
     let updated_count = provider
@@ -1574,7 +1545,10 @@ async fn test_update_with_expression() -> Result<()> {
         .await
         .unwrap();
 
-    assert_eq!(updated_count, 2, "Expected 2 rows updated (value 20 and 30)");
+    assert_eq!(
+        updated_count, 2,
+        "Expected 2 rows updated (value 20 and 30)"
+    );
 
     // Verify the updates
     let df = ctx
@@ -1607,12 +1581,8 @@ async fn test_update_with_expression() -> Result<()> {
 async fn test_update_no_match() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_update_no_match").await?;
 
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update with predicate that matches nothing
     let updated_count = provider
@@ -1620,7 +1590,7 @@ async fn test_update_no_match() -> Result<()> {
         .await
         .unwrap()
         .set("foo2", lit("never_seen"))
-        .filter(col("foo1").gt(lit(100)))  // No rows have foo1 > 100
+        .filter(col("foo1").gt(lit(100))) // No rows have foo1 > 100
         .execute(&ctx.state())
         .await
         .unwrap();
@@ -1650,12 +1620,8 @@ async fn test_update_no_match() -> Result<()> {
 async fn test_select_after_update() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_select_after_update").await?;
 
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update bob's name to 'robert'
     let updated_count = provider
@@ -1691,7 +1657,10 @@ async fn test_select_after_update() -> Result<()> {
         .collect();
 
     assert_eq!(names, vec!["alice", "robert", "charlie", "diana", "eve"]);
-    assert!(!names.contains(&"bob".to_string()), "bob should be replaced with robert");
+    assert!(
+        !names.contains(&"bob".to_string()),
+        "bob should be replaced with robert"
+    );
 
     Ok(())
 }
@@ -1811,12 +1780,8 @@ async fn test_update_partitioned_table() -> Result<()> {
 async fn test_update_self_reference() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_update_self_ref").await?;
 
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update foo2 = foo2 (self-reference, effectively no change in values)
     let updated_count = provider
@@ -1829,7 +1794,10 @@ async fn test_update_self_reference() -> Result<()> {
         .await
         .unwrap();
 
-    assert_eq!(updated_count, 1, "Expected 1 row updated (even though value is same)");
+    assert_eq!(
+        updated_count, 1,
+        "Expected 1 row updated (even though value is same)"
+    );
 
     // Verify data is unchanged
     let df = ctx
@@ -1845,7 +1813,10 @@ async fn test_update_self_reference() -> Result<()> {
         .unwrap()
         .value(0);
 
-    assert_eq!(name, "alice", "Value should remain 'alice' after self-reference update");
+    assert_eq!(
+        name, "alice",
+        "Value should remain 'alice' after self-reference update"
+    );
 
     Ok(())
 }
@@ -1867,12 +1838,9 @@ async fn test_update_empty_table() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "empty_update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "empty_update_table")
+            .await?;
 
     // UPDATE on empty table
     let updated_count = provider
@@ -1928,12 +1896,8 @@ async fn test_update_cross_column_swap() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "swap_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "swap_table").await?;
 
     // Swap: SET first = second, second = first
     // If evaluated incorrectly (first updated, then second reads updated first),
@@ -1973,8 +1937,14 @@ async fn test_update_cross_column_swap() -> Result<()> {
         .value(0);
 
     // After swap: first should be 'B' (original second), second should be 'A' (original first)
-    assert_eq!(first_val, "B", "first should be swapped to original second value");
-    assert_eq!(second_val, "A", "second should be swapped to original first value");
+    assert_eq!(
+        first_val, "B",
+        "first should be swapped to original second value"
+    );
+    assert_eq!(
+        second_val, "A",
+        "second should be swapped to original first value"
+    );
 
     Ok(())
 }
@@ -2034,12 +2004,9 @@ async fn test_update_partitioned_cross_partition() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "cross_partition_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "cross_partition_table")
+            .await?;
 
     // Update rows across multiple partitions (value > 150 touches US(id=2), EU(id=4), ASIA(id=5))
     let update_count = provider
@@ -2052,7 +2019,10 @@ async fn test_update_partitioned_cross_partition() -> Result<()> {
         .await
         .expect("UPDATE across partitions should succeed");
 
-    assert_eq!(update_count, 3, "Should have updated 3 rows across partitions");
+    assert_eq!(
+        update_count, 3,
+        "Should have updated 3 rows across partitions"
+    );
 
     // Re-register catalog to pick up changes
     let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
@@ -2160,12 +2130,9 @@ async fn test_update_partitioned_year_transform() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "year_partitioned_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "year_partitioned_table")
+            .await?;
 
     // Update all rows to 'processed'
     let update_count = provider
@@ -2275,12 +2242,9 @@ async fn test_update_partitioned_multiple_in_single_insert() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "multi_part_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "multi_part_table")
+            .await?;
 
     // Update all category 'A' rows (spans two different data files)
     let update_count = provider
@@ -2377,12 +2341,8 @@ async fn test_update_partitioned_full_table() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "full_part_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "full_part_table").await?;
 
     // Full table UPDATE (no filter) - all partitions affected
     let update_count = provider
@@ -2419,7 +2379,11 @@ async fn test_update_partitioned_full_table() -> Result<()> {
         .unwrap();
 
     for i in 0..4 {
-        assert!(processed_array.value(i), "Row {} should have processed=true", i + 1);
+        assert!(
+            processed_array.value(i),
+            "Row {} should have processed=true",
+            i + 1
+        );
     }
 
     Ok(())

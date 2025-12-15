@@ -42,10 +42,10 @@ use iceberg::spec::{DataFile, PartitionKey, PartitionSpecRef, SchemaRef};
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
 };
-use iceberg::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use iceberg::writer::file_writer::FileWriterBuilder;
-use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
+use iceberg::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use iceberg::writer::partitioning::PartitioningWriter;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Error, ErrorKind, Result};
 
@@ -69,8 +69,11 @@ use iceberg::{Error, ErrorKind, Result};
 /// 1. Accepting partition keys with their original partition spec (from FileScanTask)
 /// 2. Using FanoutWriter to create separate delete files per partition
 /// 3. Each delete file gets the correct `partition_spec_id` from its partition key
-pub struct PositionDeleteTaskWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator>
-{
+pub struct PositionDeleteTaskWriter<
+    B: FileWriterBuilder,
+    L: LocationGenerator,
+    F: FileNameGenerator,
+> {
     writer: SupportedDeleteWriter<B, L, F>,
     config: PositionDeleteWriterConfig,
 }
@@ -222,10 +225,6 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use parquet::file::properties::WriterProperties;
-    use tempfile::TempDir;
-
-    use super::*;
     use iceberg::io::FileIOBuilder;
     use iceberg::spec::{
         DataContentType, DataFileFormat, Literal, NestedField, PartitionSpec, PrimitiveType,
@@ -234,11 +233,15 @@ mod tests {
     use iceberg::writer::base_writer::position_delete_writer::{
         POSITION_DELETE_FILE_PATH_FIELD_ID, POSITION_DELETE_POS_FIELD_ID,
     };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
+    use parquet::file::properties::WriterProperties;
+    use tempfile::TempDir;
+
+    use super::*;
 
     fn create_test_schema() -> Result<Arc<Schema>> {
         Ok(Arc::new(
@@ -364,8 +367,11 @@ mod tests {
 
         // Create partition key for "US" region
         let partition_value = Struct::from_iter([Some(Literal::string("US"))]);
-        let partition_key =
-            PartitionKey::new((*partition_spec).clone(), schema.clone(), partition_value.clone());
+        let partition_key = PartitionKey::new(
+            (*partition_spec).clone(),
+            schema.clone(),
+            partition_value.clone(),
+        );
 
         // Write position deletes with partition key
         task_writer
@@ -421,8 +427,11 @@ mod tests {
         let us_key = PartitionKey::new((*partition_spec).clone(), schema.clone(), us_partition);
 
         let eu_partition = Struct::from_iter([Some(Literal::string("EU"))]);
-        let eu_key =
-            PartitionKey::new((*partition_spec).clone(), schema.clone(), eu_partition.clone());
+        let eu_key = PartitionKey::new(
+            (*partition_spec).clone(),
+            schema.clone(),
+            eu_partition.clone(),
+        );
 
         let asia_partition = Struct::from_iter([Some(Literal::string("ASIA"))]);
         let asia_key = PartitionKey::new(
@@ -523,11 +532,7 @@ mod tests {
             PartitionKey::new((*partition_spec).clone(), schema.clone(), partition_value);
 
         let result = task_writer
-            .write(
-                "s3://bucket/data/file1.parquet",
-                &[0],
-                Some(partition_key),
-            )
+            .write("s3://bucket/data/file1.parquet", &[0], Some(partition_key))
             .await;
 
         assert!(result.is_err());

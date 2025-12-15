@@ -124,7 +124,13 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         schema: SchemaRef,
         partition_spec: PartitionSpecRef,
     ) -> Result<Self> {
-        Self::try_new_internal(writer_builder, fanout_enabled, schema, partition_spec, false)
+        Self::try_new_internal(
+            writer_builder,
+            fanout_enabled,
+            schema,
+            partition_spec,
+            false,
+        )
     }
 
     /// Create a new TaskWriter with computed partition values.

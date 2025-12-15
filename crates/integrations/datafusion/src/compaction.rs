@@ -308,8 +308,8 @@ mod tests {
 
     #[test]
     fn test_compaction_options_with_strategy() {
-        let options = CompactionOptions::default()
-            .with_strategy(RewriteStrategy::Sort { sort_order: None });
+        let options =
+            CompactionOptions::default().with_strategy(RewriteStrategy::Sort { sort_order: None });
 
         assert!(options.strategy.is_some());
         assert!(options.strategy.as_ref().unwrap().is_sort());

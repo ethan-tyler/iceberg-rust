@@ -59,12 +59,16 @@ use datafusion::physical_expr::planner::create_physical_expr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataFileFormat, PartitionKey, Struct, TableProperties, serialize_data_file_to_json};
+use iceberg::spec::{
+    DataFileFormat, PartitionKey, Struct, TableProperties, serialize_data_file_to_json,
+};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
@@ -182,10 +186,11 @@ impl IcebergUpdateExec {
         let count_array =
             Arc::new(datafusion::arrow::array::UInt64Array::from(vec![count])) as ArrayRef;
 
-        RecordBatch::try_new(
-            Self::make_output_schema(),
-            vec![data_files_array, delete_files_array, count_array],
-        )
+        RecordBatch::try_new(Self::make_output_schema(), vec![
+            data_files_array,
+            delete_files_array,
+            count_array,
+        ])
         .map_err(|e| {
             DataFusionError::ArrowError(
                 Box::new(e),
@@ -278,7 +283,10 @@ impl ExecutionPlan for IcebergUpdateExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }
 
@@ -405,10 +413,14 @@ async fn execute_update(
     // Build spec_id -> PartitionSpec lookup for partition evolution support.
     // This allows us to serialize each file's partition data using its correct partition type,
     // even when the table has evolved partition specs.
-    let partition_specs: std::collections::HashMap<i32, std::sync::Arc<iceberg::spec::PartitionSpec>> =
-        table.metadata().partition_specs_iter()
-            .map(|spec| (spec.spec_id(), spec.clone()))
-            .collect();
+    let partition_specs: std::collections::HashMap<
+        i32,
+        std::sync::Arc<iceberg::spec::PartitionSpec>,
+    > = table
+        .metadata()
+        .partition_specs_iter()
+        .map(|spec| (spec.spec_id(), spec.clone()))
+        .collect();
 
     let mut delete_task_writer = PositionDeleteTaskWriter::try_new(
         delete_file_builder,
@@ -463,9 +475,8 @@ async fn execute_update(
 
         // Read batches from this file - stream to prevent OOM
         let reader = iceberg::arrow::ArrowReaderBuilder::new(file_io.clone()).build();
-        let task_stream =
-            Box::pin(futures::stream::iter(vec![Ok(task_without_predicate)]))
-                as iceberg::scan::FileScanTaskStream;
+        let task_stream = Box::pin(futures::stream::iter(vec![Ok(task_without_predicate)]))
+            as iceberg::scan::FileScanTaskStream;
         let mut batch_stream = reader
             .read(task_stream)
             .map_err(to_datafusion_error)?
@@ -661,7 +672,11 @@ fn build_physical_expressions(
             .cloned()
             .reduce(|a, b| a.and(b))
             .unwrap();
-        Some(create_physical_expr(&combined, &df_schema, &execution_props)?)
+        Some(create_physical_expr(
+            &combined,
+            &df_schema,
+            &execution_props,
+        )?)
     };
 
     // Build physical assignment expressions

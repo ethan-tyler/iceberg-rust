@@ -39,13 +39,13 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
-use iceberg::{Catalog, TableRequirement, TableUpdate};
-use iceberg::transaction::ActionCommit;
 use iceberg::spec::{DataFile, SortOrder, deserialize_data_file_from_json};
 use iceberg::table::Table;
+use iceberg::transaction::ActionCommit;
 use iceberg::transaction::rewrite_data_files::{
     FileGroupRewriteResult, RewriteDataFilesCommitter, RewriteDataFilesPlan,
 };
+use iceberg::{Catalog, TableRequirement, TableUpdate};
 
 use super::compaction::{COMPACTION_DATA_FILES_COL, COMPACTION_GROUP_ID_COL};
 use crate::partition_utils::build_partition_type_map;

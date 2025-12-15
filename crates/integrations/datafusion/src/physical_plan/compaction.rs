@@ -402,8 +402,13 @@ impl ExecutionPlan for IcebergCompactionExec {
                     }
 
                     // Process the file group (read + optional sort + write)
-                    let result =
-                        process_file_group_with_strategy(&table, &file_group, &strategy, row_group_size).await;
+                    let result = process_file_group_with_strategy(
+                        &table,
+                        &file_group,
+                        &strategy,
+                        row_group_size,
+                    )
+                    .await;
 
                     match result {
                         Ok(write_result) => {
@@ -750,10 +755,7 @@ fn build_column_id_map(schema: &iceberg::spec::Schema) -> HashMap<i32, String> {
 /// If an explicit sort order is provided, uses that.
 /// Otherwise, uses the table's default sort order.
 /// Returns None if strategy is not Sort.
-fn resolve_sort_order(
-    table: &Table,
-    strategy: &RewriteStrategy,
-) -> DFResult<Option<SortOrder>> {
+fn resolve_sort_order(table: &Table, strategy: &RewriteStrategy) -> DFResult<Option<SortOrder>> {
     match strategy {
         RewriteStrategy::Sort {
             sort_order: Some(order),
@@ -803,8 +805,8 @@ pub async fn process_file_group_with_strategy(
     // Step 2: Apply sorting if using sort strategy
     let sorted_batches = match strategy {
         RewriteStrategy::Sort { .. } => {
-            let sort_order = resolve_sort_order(table, strategy)?
-                .expect("Sort strategy should have sort order");
+            let sort_order =
+                resolve_sort_order(table, strategy)?.expect("Sort strategy should have sort order");
             let column_id_map = build_column_id_map(table.metadata().current_schema());
             sort_batches(batches, &sort_order, &column_id_map).await?
         }
@@ -989,13 +991,10 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![3, 1, 2])),
-                Arc::new(StringArray::from(vec!["c", "a", "b"])),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![3, 1, 2])),
+            Arc::new(StringArray::from(vec!["c", "a", "b"])),
+        ])
         .unwrap();
 
         // Create sort order: ORDER BY id ASC
@@ -1047,15 +1046,12 @@ mod tests {
         )]));
 
         // Include a null value
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![
-                Some(1),
-                None,
-                Some(3),
-                Some(2),
-            ]))],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+            Some(2),
+        ]))])
         .unwrap();
 
         // ORDER BY id DESC NULLS LAST
@@ -1101,13 +1097,10 @@ mod tests {
             Field::new("id", DataType::Int64, false),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["b", "a", "b", "a"])),
-                Arc::new(Int64Array::from(vec![2, 1, 1, 2])),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(vec!["b", "a", "b", "a"])),
+            Arc::new(Int64Array::from(vec![2, 1, 1, 2])),
+        ])
         .unwrap();
 
         // ORDER BY category ASC, id ASC
@@ -1195,10 +1188,9 @@ mod tests {
             false,
         )]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![3, 1, 2]))],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![
+            3, 1, 2,
+        ]))])
         .unwrap();
 
         // Unsorted order (empty fields) should pass through unchanged

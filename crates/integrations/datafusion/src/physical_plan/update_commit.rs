@@ -22,6 +22,7 @@
 //! atomically using `Transaction::row_delta()`.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
@@ -36,13 +37,12 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
+use iceberg::Catalog;
 use iceberg::spec::{
     DataFile, PartitionSpec, deserialize_data_file_from_json, extract_spec_id_from_data_file_json,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::Catalog;
-use std::collections::HashMap;
 
 use super::update::{UPDATE_COUNT_COL, UPDATE_DATA_FILES_COL, UPDATE_DELETE_FILES_COL};
 use crate::to_datafusion_error;
@@ -116,13 +116,17 @@ impl IcebergUpdateCommitExec {
     fn make_count_batch(count: u64) -> DFResult<RecordBatch> {
         let count_array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
 
-        RecordBatch::try_from_iter_with_nullable(vec![(UPDATE_RESULT_COUNT_COL, count_array, false)])
-            .map_err(|e| {
-                DataFusionError::ArrowError(
-                    Box::new(e),
-                    Some("Failed to make update count batch".to_string()),
-                )
-            })
+        RecordBatch::try_from_iter_with_nullable(vec![(
+            UPDATE_RESULT_COUNT_COL,
+            count_array,
+            false,
+        )])
+        .map_err(|e| {
+            DataFusionError::ArrowError(
+                Box::new(e),
+                Some("Failed to make update count batch".to_string()),
+            )
+        })
     }
 }
 
@@ -419,7 +423,10 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema,
+            stream,
+        )))
     }
 }
 
