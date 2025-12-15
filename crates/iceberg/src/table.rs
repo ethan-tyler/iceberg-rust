@@ -19,11 +19,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::arrow::ArrowReaderBuilder;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
-use crate::io::object_cache::ObjectCache;
+use crate::io::object_cache::{CacheStats, ObjectCache, ObjectCacheConfig};
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
 use crate::transaction::{ApplyTransactionAction, RemoveOrphanFilesAction, Transaction};
@@ -38,6 +39,11 @@ pub struct TableBuilder {
     readonly: bool,
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
+    /// Cache TTL configuration:
+    /// - `None`: not set by user, use default TTL (5 minutes)
+    /// - `Some(None)`: explicitly disable TTL (entries only expire via LRU)
+    /// - `Some(Some(duration))`: use custom TTL duration
+    cache_ttl: Option<Option<Duration>>,
 }
 
 impl TableBuilder {
@@ -50,6 +56,7 @@ impl TableBuilder {
             readonly: false,
             disable_cache: false,
             cache_size_bytes: None,
+            cache_ttl: None,
         }
     }
 
@@ -91,9 +98,28 @@ impl TableBuilder {
         self
     }
 
-    /// optionally set a non-default metadata cache size
+    /// Optionally set a non-default metadata cache size in bytes.
+    ///
+    /// Default is 32MB. Setting this to 0 disables caching (equivalent to `disable_cache()`).
     pub fn cache_size_bytes(mut self, cache_size_bytes: u64) -> Self {
         self.cache_size_bytes = Some(cache_size_bytes);
+        self
+    }
+
+    /// Optionally set a time-to-live (TTL) for cache entries.
+    ///
+    /// When set, cache entries will automatically expire after this duration.
+    /// This is useful for ensuring the cache doesn't hold stale data for too long.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` - The TTL duration:
+    ///   - `Some(duration)` - Cache entries expire after this duration
+    ///   - `None` - Disable TTL (entries only expire via LRU eviction)
+    ///
+    /// Default is 5 minutes if this method is not called.
+    pub fn cache_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.cache_ttl = Some(ttl);
         self
     }
 
@@ -107,6 +133,7 @@ impl TableBuilder {
             readonly,
             disable_cache,
             cache_size_bytes,
+            cache_ttl,
         } = self;
 
         let Some(file_io) = file_io else {
@@ -130,16 +157,26 @@ impl TableBuilder {
             ));
         };
 
-        let object_cache = if disable_cache {
-            Arc::new(ObjectCache::with_disabled_cache(file_io.clone()))
-        } else if let Some(cache_size_bytes) = cache_size_bytes {
-            Arc::new(ObjectCache::new_with_capacity(
-                file_io.clone(),
-                cache_size_bytes,
-            ))
-        } else {
-            Arc::new(ObjectCache::new(file_io.clone()))
+        // Build cache config with precedence: builder overrides > table properties > defaults
+        let base_config = ObjectCacheConfig::from_properties(metadata.properties());
+
+        let object_cache_config = ObjectCacheConfig {
+            // Builder's disable_cache() takes precedence; otherwise use table property/default
+            enabled: if disable_cache {
+                false
+            } else {
+                base_config.enabled
+            },
+            // Builder's cache_size_bytes() takes precedence if explicitly set
+            max_total_bytes: cache_size_bytes.unwrap_or(base_config.max_total_bytes),
+            // Builder's cache_ttl() takes precedence if explicitly set
+            expiration_interval: cache_ttl.unwrap_or(base_config.expiration_interval),
         };
+
+        let object_cache = Arc::new(ObjectCache::new_with_config(
+            file_io.clone(),
+            object_cache_config,
+        ));
 
         Ok(Table {
             file_io,
@@ -165,7 +202,17 @@ pub struct Table {
 
 impl Table {
     /// Sets the [`Table`] metadata and returns an updated instance with the new metadata applied.
+    ///
+    /// This method invalidates the object cache to ensure stale manifest references
+    /// are not retained. While Iceberg manifests are immutable by path (so cached
+    /// data is always valid), clearing the cache on metadata update helps:
+    /// - Free memory from manifests no longer referenced by any snapshot
+    /// - Ensure subsequent scans start fresh with the new metadata
     pub(crate) fn with_metadata(mut self, metadata: TableMetadataRef) -> Self {
+        // Invalidate cache to release references to potentially unreferenced manifests
+        if !Arc::ptr_eq(&self.metadata, &metadata) {
+            self.object_cache.invalidate_all();
+        }
         self.metadata = metadata;
         self
     }
@@ -219,6 +266,38 @@ impl Table {
     /// Returns this table's object cache
     pub(crate) fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()
+    }
+
+    /// Invalidates (clears) the manifest cache.
+    ///
+    /// This method clears all cached ManifestList and Manifest objects.
+    /// Use this when you need to force re-reading manifests from storage,
+    /// for example:
+    /// - After external modifications to the table
+    /// - To free memory when the table won't be scanned for a while
+    /// - When debugging cache-related issues
+    ///
+    /// Note: This is rarely needed in normal operation. The cache automatically
+    /// handles TTL-based expiration and LRU eviction.
+    pub fn invalidate_cache(&self) {
+        self.object_cache.invalidate_all();
+    }
+
+    /// Returns cache statistics for monitoring.
+    ///
+    /// This provides visibility into the manifest cache utilization and can be
+    /// used for operational monitoring, debugging, and tuning cache configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let stats = table.cache_stats();
+    /// println!("Cache entries: {}", stats.entry_count);
+    /// println!("Cache utilization: {:.1}%", stats.utilization() * 100.0);
+    /// println!("Cache active: {}", stats.is_active());
+    /// ```
+    pub fn cache_stats(&self) -> CacheStats {
+        self.object_cache.stats()
     }
 
     /// Creates a table scan.
@@ -939,5 +1018,270 @@ mod tests {
         assert!(result.is_ok());
         let returned_table = result.unwrap();
         assert_eq!(returned_table.identifier(), table.identifier());
+    }
+
+    // =========================================================================
+    // Cache Property Precedence Tests
+    // =========================================================================
+
+    use crate::io::object_cache::{
+        DEFAULT_CACHE_SIZE_BYTES, DEFAULT_CACHE_TTL, MANIFEST_CACHE_ENABLED,
+        MANIFEST_CACHE_EXPIRATION_INTERVAL_MS, MANIFEST_CACHE_MAX_TOTAL_BYTES,
+    };
+
+    /// Helper to create table metadata with cache properties set
+    fn create_metadata_with_cache_properties(
+        enabled: &str,
+        max_bytes: &str,
+        ttl_ms: &str,
+    ) -> TableMetadata {
+        let json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+                "location": "s3://bucket/test/location",
+                "last-sequence-number": 0,
+                "last-updated-ms": 1515100955770,
+                "last-column-id": 1,
+                "schemas": [
+                    {{
+                        "schema-id": 0,
+                        "type": "struct",
+                        "fields": [
+                            {{"id": 1, "name": "x", "required": true, "type": "long"}}
+                        ]
+                    }}
+                ],
+                "current-schema-id": 0,
+                "partition-specs": [{{"spec-id": 0, "fields": []}}],
+                "default-spec-id": 0,
+                "last-partition-id": 999,
+                "properties": {{
+                    "{}": "{}",
+                    "{}": "{}",
+                    "{}": "{}"
+                }},
+                "sort-orders": [{{"order-id": 0, "fields": []}}],
+                "default-sort-order-id": 0
+            }}"#,
+            MANIFEST_CACHE_ENABLED,
+            enabled,
+            MANIFEST_CACHE_MAX_TOTAL_BYTES,
+            max_bytes,
+            MANIFEST_CACHE_EXPIRATION_INTERVAL_MS,
+            ttl_ms
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_cache_config_from_table_properties() {
+        // Table metadata has: cache disabled, 100MB size, 10 minute TTL
+        let metadata = create_metadata_with_cache_properties("false", "104857600", "600000");
+        let file_io = FileIO::from_path("memory:///").unwrap().build().unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .build()
+            .unwrap();
+
+        let stats = table.cache_stats();
+        // Cache should be disabled per table property
+        assert!(!stats.enabled);
+        assert_eq!(stats.max_capacity, 0);
+        assert_eq!(table.object_cache().time_to_live(), None);
+    }
+
+    #[tokio::test]
+    async fn test_cache_config_table_properties_enabled() {
+        // Table metadata has: cache enabled, 64MB size, 2 minute TTL
+        let metadata = create_metadata_with_cache_properties("true", "67108864", "120000");
+        let file_io = FileIO::from_path("memory:///").unwrap().build().unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .build()
+            .unwrap();
+
+        let stats = table.cache_stats();
+        assert!(stats.enabled);
+        // Size should be from table property (64MB)
+        assert_eq!(stats.max_capacity, 67108864);
+        assert_eq!(
+            table.object_cache().time_to_live(),
+            Some(Duration::from_millis(120000))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_builder_disable_overrides_table_property() {
+        // Table property enables cache, but builder disables it
+        let metadata = create_metadata_with_cache_properties("true", "104857600", "600000");
+        let file_io = FileIO::from_path("memory:///").unwrap().build().unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .disable_cache() // Builder override
+            .build()
+            .unwrap();
+
+        let stats = table.cache_stats();
+        // Builder's disable_cache() should take precedence
+        assert!(!stats.enabled);
+        assert_eq!(stats.max_capacity, 0);
+        assert_eq!(table.object_cache().time_to_live(), None);
+    }
+
+    #[tokio::test]
+    async fn test_cache_builder_size_overrides_table_property() {
+        // Table property says 64MB, but builder sets 128MB
+        let metadata = create_metadata_with_cache_properties("true", "67108864", "600000");
+        let file_io = FileIO::from_path("memory:///").unwrap().build().unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .cache_size_bytes(128 * 1024 * 1024) // Builder override: 128MB
+            .build()
+            .unwrap();
+
+        let stats = table.cache_stats();
+        assert!(stats.enabled);
+        // Builder's cache_size_bytes() should take precedence
+        assert_eq!(stats.max_capacity, 128 * 1024 * 1024);
+        assert_eq!(
+            table.object_cache().time_to_live(),
+            Some(Duration::from_millis(600000))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_defaults_when_no_properties() {
+        // Table metadata without cache properties should use defaults
+        let json = r#"{
+            "format-version": 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "s3://bucket/test/location",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1515100955770,
+            "last-column-id": 1,
+            "schemas": [
+                {
+                    "schema-id": 0,
+                    "type": "struct",
+                    "fields": [
+                        {"id": 1, "name": "x", "required": true, "type": "long"}
+                    ]
+                }
+            ],
+            "current-schema-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "default-spec-id": 0,
+            "last-partition-id": 999,
+            "properties": {},
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "default-sort-order-id": 0
+        }"#;
+        let metadata: TableMetadata = serde_json::from_str(json).unwrap();
+        let file_io = FileIO::from_path("memory:///").unwrap().build().unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .build()
+            .unwrap();
+
+        let stats = table.cache_stats();
+        // Should use defaults
+        assert!(stats.enabled);
+        assert_eq!(stats.max_capacity, DEFAULT_CACHE_SIZE_BYTES);
+        assert_eq!(table.object_cache().time_to_live(), Some(DEFAULT_CACHE_TTL));
+    }
+
+    #[tokio::test]
+    async fn test_cache_mixed_precedence() {
+        // Table property: enabled=false, size=64MB, ttl=2min
+        // Builder: size=128MB (but not disabling cache explicitly)
+        // Expected: enabled=false (from table); cache remains disabled regardless of size override
+        let metadata = create_metadata_with_cache_properties("false", "67108864", "120000");
+        let file_io = FileIO::from_path("memory:///").unwrap().build().unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .cache_size_bytes(128 * 1024 * 1024) // Only override size
+            .build()
+            .unwrap();
+
+        let stats = table.cache_stats();
+        // Table property disabled cache, builder didn't enable it
+        assert!(!stats.enabled);
+        assert_eq!(stats.max_capacity, 0);
+        assert_eq!(table.object_cache().time_to_live(), None);
+    }
+
+    #[tokio::test]
+    async fn test_cache_ttl_from_table_property() {
+        // Table metadata has: cache enabled, default size, 10 minute TTL
+        let metadata = create_metadata_with_cache_properties("true", "33554432", "600000");
+        let file_io = FileIO::from_path("memory:///").unwrap().build().unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+
+        // No builder TTL override - should use table property
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .build()
+            .unwrap();
+
+        let stats = table.cache_stats();
+        assert!(stats.enabled);
+        // Size from table property
+        assert_eq!(stats.max_capacity, DEFAULT_CACHE_SIZE_BYTES);
+        assert_eq!(
+            table.object_cache().time_to_live(),
+            Some(Duration::from_millis(600000))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_builder_ttl_overrides_table_property() {
+        // Table property: 10 minute TTL
+        // Builder: 1 minute TTL
+        let metadata = create_metadata_with_cache_properties("true", "33554432", "600000");
+        let file_io = FileIO::from_path("memory:///").unwrap().build().unwrap();
+        let identifier = TableIdent::from_strs(["ns", "table"]).unwrap();
+
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .cache_ttl(Some(Duration::from_secs(60))) // Override to 1 minute
+            .build()
+            .unwrap();
+
+        let stats = table.cache_stats();
+        assert!(stats.enabled);
+        assert_eq!(stats.max_capacity, DEFAULT_CACHE_SIZE_BYTES);
+        assert_eq!(
+            table.object_cache().time_to_live(),
+            Some(Duration::from_secs(60))
+        );
     }
 }
