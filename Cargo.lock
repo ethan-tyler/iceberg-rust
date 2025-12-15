@@ -3410,6 +3410,7 @@ dependencies = [
  "bimap",
  "bytes",
  "chrono",
+ "criterion",
  "ctor",
  "derive_builder",
  "expect-test",
