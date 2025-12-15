@@ -575,9 +575,9 @@ pub mod tests {
         Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
         StringArray,
     };
+    use arrow_cast::cast;
     use futures::{TryStreamExt, stream};
     use minijinja::value::Value;
-    use arrow_cast::cast;
     use minijinja::{AutoEscape, Environment, context};
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
@@ -591,14 +591,16 @@ pub mod tests {
     /// Arrow 57+ may return REE arrays for columns with repeated values.
     fn to_primitive_i64(array: &ArrayRef) -> Int64Array {
         match array.data_type() {
-            arrow_schema::DataType::Int64 => {
-                array.as_primitive::<arrow_array::types::Int64Type>().clone()
-            }
+            arrow_schema::DataType::Int64 => array
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .clone(),
             arrow_schema::DataType::RunEndEncoded(_, _) => {
                 // Cast REE to primitive Int64
                 let casted = cast(array, &arrow_schema::DataType::Int64)
                     .expect("Failed to cast REE to Int64");
-                casted.as_primitive::<arrow_array::types::Int64Type>().clone()
+                casted
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .clone()
             }
             other => panic!("Unexpected array type: {:?}", other),
         }
@@ -1382,8 +1384,14 @@ pub mod tests {
         // Verify non-partitioned columns (y, z, etc.) have the same values.
         // Note: Column x is identity-partitioned, so it has different values
         // (100 vs 300) from partition metadata, not the data files.
-        assert_eq!(batch_1[0].column_by_name("y"), batch_2[0].column_by_name("y"));
-        assert_eq!(batch_1[0].column_by_name("z"), batch_2[0].column_by_name("z"));
+        assert_eq!(
+            batch_1[0].column_by_name("y"),
+            batch_2[0].column_by_name("y")
+        );
+        assert_eq!(
+            batch_1[0].column_by_name("z"),
+            batch_2[0].column_by_name("z")
+        );
     }
 
     #[tokio::test]

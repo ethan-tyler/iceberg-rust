@@ -151,7 +151,11 @@ impl FileIO {
         use futures::StreamExt;
         while let Some(entry) = lister.next().await {
             let entry = entry?;
-            let meta = entry.metadata();
+            let meta = if entry.metadata().last_modified().is_none() {
+                op.stat(entry.path()).await?
+            } else {
+                entry.metadata().clone()
+            };
 
             // Skip directories
             if meta.is_dir() {

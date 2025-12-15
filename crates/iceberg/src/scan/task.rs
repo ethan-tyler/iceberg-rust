@@ -195,12 +195,9 @@ mod tests {
         Arc::new(
             Schema::builder()
                 .with_schema_id(0)
-                .with_fields(vec![NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Int),
-                )
-                .into()])
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
                 .build()
                 .unwrap(),
         )
