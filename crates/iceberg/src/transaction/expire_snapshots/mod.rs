@@ -69,21 +69,22 @@
 mod result;
 mod retention;
 
-pub use result::ExpireSnapshotsResult;
-pub use retention::{RetentionPolicy, RetentionResult, compute_retained_snapshots, compute_retention};
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+pub use result::ExpireSnapshotsResult;
+pub use retention::{
+    RetentionPolicy, RetentionResult, compute_retained_snapshots, compute_retention,
+};
 
+use crate::TableUpdate;
 use crate::catalog::TableRequirement;
 use crate::error::{Error, ErrorKind, Result};
 use crate::spec::TableMetadata;
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::TableUpdate;
 
 /// Level of cleanup to perform after expiring snapshots.
 ///
@@ -290,7 +291,9 @@ impl ExpireSnapshotsAction {
             let cutoff_ms = older_than.timestamp_millis();
             metadata
                 .snapshots()
-                .filter(|s| s.timestamp_ms() < cutoff_ms && !retained_ids.contains(&s.snapshot_id()))
+                .filter(|s| {
+                    s.timestamp_ms() < cutoff_ms && !retained_ids.contains(&s.snapshot_id())
+                })
                 .map(|s| s.snapshot_id())
                 .collect()
         } else if self.use_table_properties {
@@ -299,7 +302,9 @@ impl ExpireSnapshotsAction {
             let cutoff_ms = cutoff.timestamp_millis();
             metadata
                 .snapshots()
-                .filter(|s| s.timestamp_ms() < cutoff_ms && !retained_ids.contains(&s.snapshot_id()))
+                .filter(|s| {
+                    s.timestamp_ms() < cutoff_ms && !retained_ids.contains(&s.snapshot_id())
+                })
                 .map(|s| s.snapshot_id())
                 .collect()
         } else {
@@ -309,8 +314,7 @@ impl ExpireSnapshotsAction {
 
         // Apply retain_last if specified (additional protection beyond policy)
         if let Some(retain_count) = self.retain_last {
-            let additional_protected =
-                self.compute_retain_last_protected(metadata, retain_count);
+            let additional_protected = self.compute_retain_last_protected(metadata, retain_count);
             to_expire.retain(|id| !additional_protected.contains(id));
         }
 
@@ -409,7 +413,8 @@ impl TransactionAction for ExpireSnapshotsAction {
         let retention_result = compute_retention(metadata, &policy, now)?;
 
         // Compute snapshots to expire
-        let to_expire = self.compute_snapshots_to_expire(metadata, &retention_result, &policy, now)?;
+        let to_expire =
+            self.compute_snapshots_to_expire(metadata, &retention_result, &policy, now)?;
 
         // Build table updates
         let mut updates = Vec::new();

@@ -68,7 +68,9 @@ impl FileUriNormalizer {
     /// - `s3`, `s3a`, `s3n` -> `s3`
     /// - `abfs`, `abfss` -> `abfs`
     /// - `wasb`, `wasbs` -> `wasb`
-    /// - `gs` -> `gs`
+    /// - `gs`, `gcs` -> `gs`
+    /// - `oss` -> `oss`
+    /// - `memory` -> `memory`
     pub fn with_defaults() -> Self {
         let mut equal_schemes = HashMap::new();
 
@@ -90,6 +92,12 @@ impl FileUriNormalizer {
         // Local file scheme
         equal_schemes.insert("file".into(), "file".into());
 
+        // OSS
+        equal_schemes.insert("oss".into(), "oss".into());
+
+        // In-memory
+        equal_schemes.insert("memory".into(), "memory".into());
+
         Self {
             equal_schemes,
             equal_authorities: HashMap::new(),
@@ -97,14 +105,23 @@ impl FileUriNormalizer {
     }
 
     /// Add additional scheme equivalence.
-    pub fn with_scheme_equivalence(mut self, scheme: impl Into<String>, canonical: impl Into<String>) -> Self {
+    pub fn with_scheme_equivalence(
+        mut self,
+        scheme: impl Into<String>,
+        canonical: impl Into<String>,
+    ) -> Self {
         self.equal_schemes.insert(scheme.into(), canonical.into());
         self
     }
 
     /// Add additional authority equivalence.
-    pub fn with_authority_equivalence(mut self, authority: impl Into<String>, canonical: impl Into<String>) -> Self {
-        self.equal_authorities.insert(authority.into(), canonical.into());
+    pub fn with_authority_equivalence(
+        mut self,
+        authority: impl Into<String>,
+        canonical: impl Into<String>,
+    ) -> Self {
+        self.equal_authorities
+            .insert(authority.into(), canonical.into());
         self
     }
 
@@ -129,7 +146,7 @@ impl FileUriNormalizer {
                     .map(|h| self.equal_authorities.contains_key(h))
                     .unwrap_or(false);
 
-                let normalized = format!("{}://{}{}", scheme, authority, path_part);
+                let normalized = format!("{scheme}://{authority}{path_part}");
 
                 NormalizedUri {
                     original: path.to_string(),
@@ -237,8 +254,10 @@ mod tests {
     fn test_normalize_azure_schemes() {
         let normalizer = FileUriNormalizer::with_defaults();
 
-        let uri1 = normalizer.normalize("abfs://container@account.dfs.core.windows.net/path/file.parquet");
-        let uri2 = normalizer.normalize("abfss://container@account.dfs.core.windows.net/path/file.parquet");
+        let uri1 =
+            normalizer.normalize("abfs://container@account.dfs.core.windows.net/path/file.parquet");
+        let uri2 = normalizer
+            .normalize("abfss://container@account.dfs.core.windows.net/path/file.parquet");
 
         assert_eq!(uri1.scheme, "abfs");
         assert_eq!(uri2.scheme, "abfs");

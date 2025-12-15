@@ -296,7 +296,10 @@ impl RowDeltaAction {
                                 entry.data_file().partition()
                             ),
                         )
-                        .with_context("conflicting_file", entry.data_file().file_path().to_string())
+                        .with_context(
+                            "conflicting_file",
+                            entry.data_file().file_path().to_string(),
+                        )
                         .with_retryable(true));
                     }
                 }

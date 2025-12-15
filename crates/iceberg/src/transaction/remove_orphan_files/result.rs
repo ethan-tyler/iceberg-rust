@@ -17,12 +17,90 @@
 
 //! Result types for the remove orphan files operation.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
+
+/// Progress event emitted during the remove orphan files operation.
+///
+/// These events allow callers to track progress for large tables where the
+/// operation may take significant time.
+#[derive(Debug, Clone)]
+pub enum OrphanFilesProgressEvent {
+    /// Started collecting referenced files from snapshots.
+    CollectingReferences {
+        /// Number of snapshots to process.
+        snapshot_count: usize,
+    },
+    /// Started listing files in storage.
+    ListingFiles {
+        /// Location being scanned.
+        location: String,
+    },
+    /// Finished listing files.
+    FilesListed {
+        /// Total files found in storage.
+        total_files: usize,
+    },
+    /// Identified orphan files eligible for deletion.
+    OrphansIdentified {
+        /// Number of orphan files found.
+        orphan_count: usize,
+        /// Total bytes of orphan files.
+        total_bytes: u64,
+    },
+    /// Started deleting orphan files.
+    DeletingFiles {
+        /// Total files to delete.
+        total: usize,
+    },
+    /// Progress update during deletion.
+    DeletionProgress {
+        /// Files deleted so far.
+        deleted: usize,
+        /// Total files to delete.
+        total: usize,
+    },
+    /// Operation complete.
+    Complete {
+        /// Total files deleted.
+        deleted_count: u64,
+        /// Total bytes reclaimed.
+        bytes_reclaimed: u64,
+    },
+}
+
+/// Callback function for receiving progress events.
+///
+/// The callback is invoked synchronously during the operation. Keep the
+/// callback fast to avoid slowing down the operation.
+///
+/// # Example
+///
+/// ```ignore
+/// use iceberg::transaction::remove_orphan_files::OrphanFilesProgressEvent;
+///
+/// let callback: OrphanFilesProgressCallback = Arc::new(|event| {
+///     match event {
+///         OrphanFilesProgressEvent::OrphansIdentified { orphan_count, .. } => {
+///             println!("Found {} orphan files", orphan_count);
+///         }
+///         OrphanFilesProgressEvent::DeletionProgress { deleted, total } => {
+///             println!("Deleted {}/{} files", deleted, total);
+///         }
+///         _ => {}
+///     }
+/// });
+/// ```
+pub type OrphanFilesProgressCallback =
+    Arc<dyn Fn(OrphanFilesProgressEvent) + Send + Sync + 'static>;
 
 /// Result of the remove orphan files operation.
 #[derive(Debug, Clone)]
 pub struct RemoveOrphanFilesResult {
-    /// List of orphan files that were deleted (or would be deleted in dry-run).
+    /// Orphan files that were identified as eligible for deletion.
+    ///
+    /// In `dry_run` mode, these are the files that would be deleted.
     pub orphan_files: Vec<OrphanFileInfo>,
     /// Number of data files deleted.
     pub deleted_data_files_count: u64,
@@ -177,9 +255,7 @@ mod tests {
     #[test]
     fn test_orphan_file_type_from_path_manifest_list() {
         assert_eq!(
-            OrphanFileType::from_path(
-                "s3://bucket/db/table/metadata/snap-1234567890-1-abc.avro"
-            ),
+            OrphanFileType::from_path("s3://bucket/db/table/metadata/snap-1234567890-1-abc.avro"),
             OrphanFileType::ManifestListFile
         );
     }

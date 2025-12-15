@@ -57,11 +57,13 @@ pub use evolve_partition::EvolvePartitionAction;
 pub use expire_snapshots::{
     CleanupLevel, ExpireSnapshotsAction, ExpireSnapshotsResult, RetentionPolicy,
 };
-pub use remove_orphan_files::{
-    FileUriNormalizer, NormalizedUri, OrphanFileInfo, OrphanFileType, PrefixMismatchMode,
-    ReferenceFileCollector, RemoveOrphanFilesAction, RemoveOrphanFilesResult,
-};
+pub use manage_snapshots::{ManageSnapshotsAction, ManageSnapshotsOperation};
 pub use overwrite::OverwriteAction;
+pub use remove_orphan_files::{
+    FileUriNormalizer, NormalizedUri, OrphanFileInfo, OrphanFileType, OrphanFilesProgressCallback,
+    OrphanFilesProgressEvent, PrefixMismatchMode, ReferenceFileCollector, RemoveOrphanFilesAction,
+    RemoveOrphanFilesResult,
+};
 pub use replace_partitions::ReplacePartitionsAction;
 pub use rewrite_data_files::{
     FileGroup, FileGroupFailure, FileGroupResult, FileGroupRewriteResult, RewriteDataFilesAction,
@@ -73,6 +75,7 @@ mod append;
 mod delete;
 mod evolve_partition;
 pub mod expire_snapshots;
+mod manage_snapshots;
 mod overwrite;
 pub mod remove_orphan_files;
 mod replace_partitions;
@@ -412,6 +415,58 @@ impl Transaction {
     /// - `None`: Only remove snapshots from metadata, no file deletion
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
+    }
+
+    /// Creates a snapshot management action for rollback and snapshot operations.
+    ///
+    /// This action enables changing the current snapshot of a table without
+    /// creating new snapshots. It supports:
+    /// - **Rollback operations**: Revert to a previous snapshot (validates ancestry)
+    /// - **Set current snapshot**: Set any snapshot as current (no ancestry validation)
+    ///
+    /// # Use Cases
+    ///
+    /// - **Disaster Recovery**: Revert to last known good state after data corruption
+    /// - **Pipeline Debugging**: Roll back and re-run pipeline stages
+    /// - **Branch Operations**: Switch between snapshots from different branches
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// // Rollback to a specific snapshot (validates ancestry)
+    /// let tx = Transaction::new(&table);
+    /// let tx = tx.manage_snapshots()
+    ///     .rollback_to_snapshot(previous_snapshot_id)?
+    ///     .apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    ///
+    /// // Rollback to timestamp
+    /// let tx = Transaction::new(&table);
+    /// let yesterday = chrono::Utc::now() - chrono::Duration::days(1);
+    /// let tx = tx.manage_snapshots()
+    ///     .rollback_to_timestamp(yesterday)?
+    ///     .apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    ///
+    /// // Set current snapshot (no ancestry validation)
+    /// let tx = Transaction::new(&table);
+    /// let tx = tx.manage_snapshots()
+    ///     .set_current_snapshot(any_snapshot_id)?
+    ///     .apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    ///
+    /// # Semantic Differences
+    ///
+    /// | Operation | Ancestor Validation | Use Case |
+    /// |-----------|---------------------|----------|
+    /// | `rollback_to_snapshot` | Required | Safe rollback along linear history |
+    /// | `rollback_to_timestamp` | Required | Time-based recovery |
+    /// | `set_current_snapshot` | Not required | Branch operations, cherry-picking |
+    pub fn manage_snapshots(&self) -> ManageSnapshotsAction {
+        ManageSnapshotsAction::new()
     }
 
     /// Commit transaction.

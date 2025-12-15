@@ -214,7 +214,12 @@ pub fn compute_retention(
 
         // Retain snapshots within max_age that are ancestors of this ref
         let cutoff_ms = (now - max_age).timestamp_millis();
-        retain_snapshots_within_age(metadata, ref_snapshot_id, cutoff_ms, &mut result.retained_snapshot_ids);
+        retain_snapshots_within_age(
+            metadata,
+            ref_snapshot_id,
+            cutoff_ms,
+            &mut result.retained_snapshot_ids,
+        );
     }
 
     // Sort expired refs for deterministic behavior
@@ -244,8 +249,8 @@ fn check_ref_expired(
     };
 
     // Use ref-specific setting, fall back to policy, then default to "never expires"
-    let effective_max_age_ms = max_ref_age_ms
-        .or_else(|| policy.max_ref_age.map(|d| d.num_milliseconds()));
+    let effective_max_age_ms =
+        max_ref_age_ms.or_else(|| policy.max_ref_age.map(|d| d.num_milliseconds()));
 
     match effective_max_age_ms {
         Some(max_age_ms) if max_age_ms > 0 => {
@@ -555,17 +560,14 @@ mod integration_tests {
             .unwrap()
             .add_snapshot(snap5)
             .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference {
-                    snapshot_id: 5,
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: Some(3),
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
+            .set_ref("main", SnapshotReference {
+                snapshot_id: 5,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(3),
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
             .build()
             .unwrap()
@@ -606,25 +608,21 @@ mod integration_tests {
             .unwrap()
             .add_snapshot(snap2)
             .unwrap()
-            .set_ref(
-                "release-1.0",
-                SnapshotReference {
-                    snapshot_id: 1,
-                    retention: SnapshotRetention::Tag { max_ref_age_ms: None },
+            .set_ref("release-1.0", SnapshotReference {
+                snapshot_id: 1,
+                retention: SnapshotRetention::Tag {
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference {
-                    snapshot_id: 2,
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: Some(1),
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
+            .set_ref("main", SnapshotReference {
+                snapshot_id: 2,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(1),
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
             .build()
             .unwrap()
@@ -669,17 +667,14 @@ mod integration_tests {
             .unwrap()
             .add_snapshot(snap5)
             .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference {
-                    snapshot_id: 5,
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: Some(1),
-                        max_snapshot_age_ms: Some(5 * DAY_MS), // Keep snapshots from last 5 days
-                        max_ref_age_ms: None,
-                    },
+            .set_ref("main", SnapshotReference {
+                snapshot_id: 5,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(1),
+                    max_snapshot_age_ms: Some(5 * DAY_MS), // Keep snapshots from last 5 days
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
             .build()
             .unwrap()

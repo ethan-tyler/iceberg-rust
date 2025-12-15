@@ -22,11 +22,10 @@
 
 use std::collections::HashSet;
 
+use super::normalizer::FileUriNormalizer;
+use crate::Result;
 use crate::io::FileIO;
 use crate::spec::TableMetadata;
-use crate::Result;
-
-use super::normalizer::FileUriNormalizer;
 
 /// Collects all files referenced by a table's snapshots.
 ///
@@ -68,13 +67,30 @@ impl<'a> ReferenceFileCollector<'a> {
 
         // Also include metadata files from metadata log
         for log_entry in metadata.metadata_log() {
-            let normalized = self.normalizer.normalize(&log_entry.metadata_file).normalized;
+            let normalized = self
+                .normalizer
+                .normalize(&log_entry.metadata_file)
+                .normalized;
             referenced.insert(normalized);
         }
 
-        // Include the current metadata file location if available
-        // The table's metadata location points to the current metadata file
-        // Note: metadata.location() is the table location, not the metadata file
+        // Include statistics files
+        for stats_file in metadata.statistics_iter() {
+            let normalized = self
+                .normalizer
+                .normalize(&stats_file.statistics_path)
+                .normalized;
+            referenced.insert(normalized);
+        }
+
+        // Include partition statistics files
+        for stats_file in metadata.partition_statistics_iter() {
+            let normalized = self
+                .normalizer
+                .normalize(&stats_file.statistics_path)
+                .normalized;
+            referenced.insert(normalized);
+        }
 
         Ok(referenced)
     }
