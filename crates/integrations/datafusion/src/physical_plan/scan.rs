@@ -272,15 +272,24 @@ impl DisplayAs for IcebergTableScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
+        let projection = self
+            .projection
+            .clone()
+            .map_or(String::new(), |v| v.join(","));
+        let predicate = self
+            .predicates
+            .clone()
+            .map_or(String::new(), |p| format!("{p}"));
+        let dynamic_filter = if self.dynamic_filter_handler.dynamic_filter().is_some() {
+            "enabled"
+        } else {
+            "none"
+        };
+
         write!(
             f,
-            "IcebergTableScan projection:[{}] predicate:[{}]",
-            self.projection
-                .clone()
-                .map_or(String::new(), |v| v.join(",")),
-            self.predicates
-                .clone()
-                .map_or(String::from(""), |p| format!("{p}"))
+            "IcebergTableScan projection:[{}] predicate:[{}] dynamic_filter:[{}]",
+            projection, predicate, dynamic_filter
         )
     }
 }
