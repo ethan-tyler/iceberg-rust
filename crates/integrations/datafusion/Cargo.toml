@@ -35,8 +35,10 @@ datafusion = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
 parquet = { workspace = true }
+rust_decimal = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
