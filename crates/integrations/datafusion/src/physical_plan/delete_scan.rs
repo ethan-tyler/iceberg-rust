@@ -47,6 +47,7 @@ use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use super::record_batch::coerce_batch_schema;
 use crate::to_datafusion_error;
 
 /// Column name for file path in delete scan output
@@ -73,6 +74,8 @@ pub struct IcebergDeleteScanExec {
     predicate: Option<Predicate>,
     /// All DataFusion filter expressions (for row-level evaluation)
     filter_exprs: Vec<Expr>,
+    /// Arrow schema of the table (used to coerce reader batches for DataFusion evaluation)
+    table_schema: ArrowSchemaRef,
     /// Output schema: (file_path: Utf8, pos: Int64)
     output_schema: ArrowSchemaRef,
 }
@@ -84,7 +87,12 @@ impl IcebergDeleteScanExec {
     /// * `table` - The Iceberg table to scan
     /// * `snapshot_id` - Optional snapshot to scan (defaults to current)
     /// * `filters` - DELETE WHERE clause filters
-    pub fn new(table: Table, snapshot_id: Option<i64>, filters: &[Expr]) -> Self {
+    pub fn new(
+        table: Table,
+        snapshot_id: Option<i64>,
+        filters: &[Expr],
+        table_schema: ArrowSchemaRef,
+    ) -> Self {
         let output_schema = Self::make_output_schema();
         let plan_properties = Self::compute_properties(output_schema.clone());
         let predicate = convert_filters_to_predicate(filters);
@@ -96,6 +104,7 @@ impl IcebergDeleteScanExec {
             plan_properties,
             predicate,
             filter_exprs,
+            table_schema,
             output_schema,
         }
     }
@@ -202,6 +211,7 @@ impl ExecutionPlan for IcebergDeleteScanExec {
             self.snapshot_id,
             self.predicate.clone(),
             self.filter_exprs.clone(),
+            self.table_schema.clone(),
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -224,6 +234,7 @@ async fn get_delete_positions_stream(
     snapshot_id: Option<i64>,
     predicate: Option<Predicate>,
     filter_exprs: Vec<Expr>,
+    table_schema: ArrowSchemaRef,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     // Build the scan - predicate is used for file-level pruning
     let scan_builder = match snapshot_id {
@@ -254,18 +265,20 @@ async fn get_delete_positions_stream(
     // Process each file and collect (file_path, pos) for matching rows
     let table_clone = table.clone();
     let filter_exprs = Arc::new(filter_exprs);
+    let table_schema = table_schema.clone();
 
     let stream = futures::stream::iter(file_scan_tasks)
         .then(move |task| {
             let table = table_clone.clone();
             let filters = filter_exprs.clone();
+            let table_schema = table_schema.clone();
             async move {
                 // CRITICAL: Clear the predicate from the task to disable row-level filtering.
                 // We need to read ALL rows to track correct file positions.
                 // The filter_exprs will be applied post-read to identify which positions to delete.
                 let mut task_without_predicate = task;
                 task_without_predicate.predicate = None;
-                scan_file_for_deletes(&table, task_without_predicate, filters).await
+                scan_file_for_deletes(&table, task_without_predicate, filters, table_schema).await
             }
         })
         .try_flatten();
@@ -282,6 +295,7 @@ async fn scan_file_for_deletes(
     table: &Table,
     task: FileScanTask,
     filter_exprs: Arc<Vec<Expr>>,
+    table_schema: ArrowSchemaRef,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let file_path = task.data_file_path().to_string();
     let file_io = table.file_io().clone();
@@ -315,9 +329,11 @@ async fn scan_file_for_deletes(
             let filter_exprs = filter_exprs.clone();
             let row_offset = row_offset.clone();
             let cached_filter = cached_filter.clone();
+            let table_schema = table_schema.clone();
 
             match batch_result {
                 Ok(batch) => {
+                    let batch = coerce_batch_schema(batch, &table_schema)?;
                     let batch_size = batch.num_rows();
                     let current_offset = row_offset.fetch_add(batch_size as i64, Ordering::SeqCst);
 
@@ -326,7 +342,7 @@ async fn scan_file_for_deletes(
                         if !has_filters {
                             return Ok(None); // No filter = full table delete
                         }
-                        match build_physical_filter(&filter_exprs, batch.schema()) {
+                        match build_physical_filter(&filter_exprs, table_schema.clone()) {
                             Ok(expr) => Ok(Some(expr)),
                             Err(e) => {
                                 // Filter failed to build (e.g., column doesn't exist in evolved schema).

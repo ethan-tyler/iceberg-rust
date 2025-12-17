@@ -215,7 +215,7 @@ where
         RecordBatch::try_new(delete_schema, vec![file_path_array, positions_array]).map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
-                format!("Failed to create position delete batch: {}", e),
+                format!("Failed to create position delete batch: {e}"),
             )
         })
     }

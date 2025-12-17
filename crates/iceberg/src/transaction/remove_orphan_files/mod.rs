@@ -517,7 +517,7 @@ impl RemoveOrphanFilesAction {
         let deleted_count = std::sync::atomic::AtomicUsize::new(0);
 
         // Determine progress reporting interval (report every ~10% or at least every 100 files)
-        let report_interval = (total / 10).max(1).min(100);
+        let report_interval = (total / 10).clamp(1, 100);
 
         futures::stream::iter(files.iter().enumerate())
             .map(|(idx, file)| {
@@ -531,13 +531,13 @@ impl RemoveOrphanFilesAction {
                 let current = deleted_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
                 // Emit progress at intervals
-                if current % report_interval == 0 || current == total {
-                    if let Some(cb) = progress_callback {
-                        cb(OrphanFilesProgressEvent::DeletionProgress {
-                            deleted: current,
-                            total,
-                        });
-                    }
+                if (current % report_interval == 0 || current == total)
+                    && let Some(cb) = progress_callback
+                {
+                    cb(OrphanFilesProgressEvent::DeletionProgress {
+                        deleted: current,
+                        total,
+                    });
                 }
 
                 futures::future::ready(())

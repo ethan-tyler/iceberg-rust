@@ -526,7 +526,7 @@ mod integration_tests {
             .with_timestamp_ms(timestamp_ms)
             .with_sequence_number(id)
             .with_schema_id(0)
-            .with_manifest_list(format!("/snap-{}", id))
+            .with_manifest_list(format!("/snap-{id}"))
             .with_summary(Summary {
                 operation: Operation::Append,
                 additional_properties: HashMap::new(),
@@ -541,7 +541,7 @@ mod integration_tests {
         let base_time = base.last_updated_ms();
 
         // Create a chain of 5 snapshots, each 1 day apart (in the future from table creation)
-        let snap1 = create_snapshot(1, base_time + 1 * DAY_MS, None);
+        let snap1 = create_snapshot(1, base_time + DAY_MS, None);
         let snap2 = create_snapshot(2, base_time + 2 * DAY_MS, Some(1));
         let snap3 = create_snapshot(3, base_time + 3 * DAY_MS, Some(2));
         let snap4 = create_snapshot(4, base_time + 4 * DAY_MS, Some(3));
@@ -649,7 +649,7 @@ mod integration_tests {
         let base_time = base.last_updated_ms();
 
         // Create snapshots at different times
-        let snap1 = create_snapshot(1, base_time + 1 * DAY_MS, None);
+        let snap1 = create_snapshot(1, base_time + DAY_MS, None);
         let snap2 = create_snapshot(2, base_time + 5 * DAY_MS, Some(1));
         let snap3 = create_snapshot(3, base_time + 8 * DAY_MS, Some(2));
         let snap4 = create_snapshot(4, base_time + 10 * DAY_MS, Some(3));

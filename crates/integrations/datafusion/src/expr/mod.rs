@@ -15,26 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod catalog;
-pub use catalog::*;
+//! Expression conversion utilities for the Iceberg DataFusion integration.
+//!
+//! This module converts DataFusion physical expressions ([`PhysicalExpr`]) into Iceberg
+//! [`Predicate`]s so they can be applied for file / manifest pruning.
 
-pub mod compaction;
-pub mod delete;
-pub mod merge;
-pub mod update;
+use std::sync::Arc;
 
-pub(crate) mod dynamic_filter;
+use datafusion::physical_expr::PhysicalExpr;
+use iceberg::Result;
+use iceberg::expr::Predicate;
+use iceberg::spec::Schema;
 
-mod error;
-pub use error::*;
+mod converter;
+mod literal;
 
-pub mod expr;
-pub(crate) mod partition_utils;
-pub mod physical_plan;
-mod schema;
-pub mod table;
-pub use table::table_provider_factory::IcebergTableProviderFactory;
-pub use table::*;
-
-pub(crate) mod position_delete_task_writer;
-pub(crate) mod task_writer;
+/// Converts a DataFusion physical expression into an Iceberg [`Predicate`].
+///
+/// Returns `Predicate::AlwaysTrue` when the expression cannot be safely converted.
+pub fn convert_physical_expr_to_predicate(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Result<Predicate> {
+    converter::convert_physical_expr_to_predicate(expr, schema)
+}

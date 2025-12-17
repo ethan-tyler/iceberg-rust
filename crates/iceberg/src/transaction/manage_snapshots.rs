@@ -1149,11 +1149,7 @@ mod integration_tests {
 
         // Commit through the catalog
         let result = tx.commit(&mock_catalog).await;
-        assert!(
-            result.is_ok(),
-            "Transaction commit should succeed: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Transaction commit should succeed: {result:?}");
 
         let updated_table = result.unwrap();
         // The mock catalog returns the updated table with snapshot 2 as current
@@ -1176,11 +1172,7 @@ mod integration_tests {
         let tx = action.apply(tx).unwrap();
 
         let result = tx.commit(&mock_catalog).await;
-        assert!(
-            result.is_ok(),
-            "Transaction commit should succeed: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Transaction commit should succeed: {result:?}");
 
         let updated_table = result.unwrap();
         let main_ref = updated_table.metadata().refs().get(MAIN_BRANCH).unwrap();
@@ -1197,11 +1189,7 @@ mod integration_tests {
         let tx = action.apply(tx).unwrap();
 
         let result = tx.commit(&mock_catalog).await;
-        assert!(
-            result.is_ok(),
-            "Transaction commit should succeed: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Transaction commit should succeed: {result:?}");
 
         let updated_table = result.unwrap();
         let main_ref = updated_table.metadata().refs().get(MAIN_BRANCH).unwrap();
@@ -1290,11 +1278,7 @@ mod integration_tests {
         let tx = action.apply(tx).unwrap();
 
         let result = tx.commit(&mock_catalog).await;
-        assert!(
-            result.is_ok(),
-            "Transaction commit should succeed: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Transaction commit should succeed: {result:?}");
 
         let updated_table = result.unwrap();
         let feature_ref = updated_table.metadata().refs().get("feature").unwrap();
@@ -1322,6 +1306,6 @@ mod integration_tests {
         // With no-op optimization, this should return the original table
         // without calling update_table
         let result = tx.commit(&mock_catalog).await;
-        assert!(result.is_ok(), "No-op commit should succeed: {:?}", result);
+        assert!(result.is_ok(), "No-op commit should succeed: {result:?}");
     }
 }

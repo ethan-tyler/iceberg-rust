@@ -59,7 +59,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::delete_scan::{DELETE_FILE_PATH_COL, DELETE_POS_COL};
-use crate::partition_utils::{FilePartitionInfo, build_file_partition_map};
+use crate::partition_utils::{FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map};
 use crate::to_datafusion_error;
 
 /// Column name for serialized delete files in output
@@ -632,8 +632,14 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                         .map_err(to_datafusion_error)?
                         .partition_type(&current_schema)
                         .map_err(to_datafusion_error)?;
-                    serialize_data_file_to_json(data_file, &ptype, format_version)
-                        .map_err(to_datafusion_error)
+                    let file_json = serialize_data_file_to_json(data_file, &ptype, format_version)
+                        .map_err(to_datafusion_error)?;
+                    serde_json::to_string(&SerializedFileWithSpec { spec_id, file_json })
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to serialize delete file payload: {e}"
+                            ))
+                        })
                 })
                 .collect::<DFResult<Vec<String>>>()?;
 
@@ -663,8 +669,16 @@ mod tests {
     #[test]
     fn test_make_result_batch() {
         let batch = IcebergDeleteWriteExec::make_result_batch(vec![
-            r#"{"file_path": "delete1.parquet"}"#.to_string(),
-            r#"{"file_path": "delete2.parquet"}"#.to_string(),
+            serde_json::to_string(&SerializedFileWithSpec {
+                spec_id: 0,
+                file_json: r#"{"file_path": "delete1.parquet"}"#.to_string(),
+            })
+            .unwrap(),
+            serde_json::to_string(&SerializedFileWithSpec {
+                spec_id: 0,
+                file_json: r#"{"file_path": "delete2.parquet"}"#.to_string(),
+            })
+            .unwrap(),
         ])
         .unwrap();
 

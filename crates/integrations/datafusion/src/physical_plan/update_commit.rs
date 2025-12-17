@@ -183,8 +183,8 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
-                "IcebergUpdateCommitExec expects exactly one child, but provided {}",
-                children.len()
+                "IcebergUpdateCommitExec expects exactly one child, but provided {provided}",
+                provided = children.len()
             )));
         }
 
@@ -247,16 +247,14 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     .column_by_name(UPDATE_DATA_FILES_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            UPDATE_DATA_FILES_COL
+                            "Expected '{UPDATE_DATA_FILES_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be StringArray",
-                            UPDATE_DATA_FILES_COL
+                            "Expected '{UPDATE_DATA_FILES_COL}' column to be StringArray"
                         ))
                     })?;
 
@@ -265,16 +263,14 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     .column_by_name(UPDATE_DELETE_FILES_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            UPDATE_DELETE_FILES_COL
+                            "Expected '{UPDATE_DELETE_FILES_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be StringArray",
-                            UPDATE_DELETE_FILES_COL
+                            "Expected '{UPDATE_DELETE_FILES_COL}' column to be StringArray"
                         ))
                     })?;
 
@@ -283,16 +279,14 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                     .column_by_name(UPDATE_COUNT_COL)
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column in input batch",
-                            UPDATE_COUNT_COL
+                            "Expected '{UPDATE_COUNT_COL}' column in input batch"
                         ))
                     })?
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(format!(
-                            "Expected '{}' column to be UInt64Array",
-                            UPDATE_COUNT_COL
+                            "Expected '{UPDATE_COUNT_COL}' column to be UInt64Array"
                         ))
                     })?;
 
@@ -311,13 +305,13 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                             let partition_type = partition_specs
                                 .get(&spec_id)
                                 .ok_or_else(|| {
+                                    let available_specs =
+                                        partition_specs.keys().collect::<Vec<_>>();
                                     DataFusionError::External(Box::new(iceberg::Error::new(
                                         iceberg::ErrorKind::DataInvalid,
                                         format!(
-                                            "Partition spec {} not found for data file during commit. \
-                                             Available specs: {:?}",
-                                            spec_id,
-                                            partition_specs.keys().collect::<Vec<_>>()
+                                            "Partition spec {spec_id} not found for data file during commit. \
+                                             Available specs: {available_specs:?}",
                                         ),
                                     )))
                                 })?
@@ -351,13 +345,13 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                             let partition_type = partition_specs
                                 .get(&spec_id)
                                 .ok_or_else(|| {
+                                    let available_specs =
+                                        partition_specs.keys().collect::<Vec<_>>();
                                     DataFusionError::External(Box::new(iceberg::Error::new(
                                         iceberg::ErrorKind::DataInvalid,
                                         format!(
-                                            "Partition spec {} not found for delete file during commit. \
-                                             Available specs: {:?}",
-                                            spec_id,
-                                            partition_specs.keys().collect::<Vec<_>>()
+                                            "Partition spec {spec_id} not found for delete file during commit. \
+                                             Available specs: {available_specs:?}",
                                         ),
                                     )))
                                 })?
@@ -405,8 +399,7 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
             let table_ident = table.identifier().to_string();
             let tx = action.apply(tx).map_err(|e| {
                 DataFusionError::Execution(format!(
-                    "UPDATE failed on table '{}': failed to apply row delta action: {}",
-                    table_ident, e
+                    "UPDATE failed on table '{table_ident}': failed to apply row delta action: {e}"
                 ))
             })?;
             let _updated_table = tx
@@ -414,8 +407,7 @@ impl ExecutionPlan for IcebergUpdateCommitExec {
                 .await
                 .map_err(|e| {
                     DataFusionError::Execution(format!(
-                        "UPDATE commit failed for table '{}' (baseline snapshot: {:?}): {}",
-                        table_ident, baseline_snapshot_id, e
+                        "UPDATE commit failed for table '{table_ident}' (baseline snapshot: {baseline_snapshot_id:?}): {e}"
                     ))
                 })?;
 

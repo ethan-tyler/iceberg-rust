@@ -258,7 +258,7 @@ impl ExpireSnapshotsAction {
                 if metadata.snapshot_by_id(*id).is_none() {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Snapshot {} does not exist", id),
+                        format!("Snapshot {id} does not exist"),
                     ));
                 }
 
@@ -270,8 +270,7 @@ impl ExpireSnapshotsAction {
                             return Err(Error::new(
                                 ErrorKind::DataInvalid,
                                 format!(
-                                    "Cannot expire snapshot {}: still referenced by '{}'",
-                                    id, ref_name
+                                    "Cannot expire snapshot {id}: still referenced by '{ref_name}'",
                                 ),
                             ));
                         }
@@ -279,8 +278,7 @@ impl ExpireSnapshotsAction {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
-                            "Cannot expire snapshot {}: protected by retention policy",
-                            id
+                            "Cannot expire snapshot {id}: protected by retention policy",
                         ),
                     ));
                 }
@@ -333,7 +331,7 @@ impl ExpireSnapshotsAction {
         let mut protected = HashSet::new();
 
         // For each branch, protect the N most recent ancestors
-        for (_ref_name, snap_ref) in metadata.refs() {
+        for snap_ref in metadata.refs().values() {
             if !snap_ref.is_branch() {
                 continue;
             }
@@ -358,13 +356,13 @@ impl ExpireSnapshotsAction {
     /// Validate the expiration configuration.
     fn validate(&self, metadata: &TableMetadata) -> Result<()> {
         // Check that we're not trying to expire the current snapshot
-        if let Some(current_id) = metadata.current_snapshot_id() {
-            if self.snapshot_ids_to_expire.contains(&current_id) {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Cannot expire current snapshot {}", current_id),
-                ));
-            }
+        if let Some(current_id) = metadata.current_snapshot_id()
+            && self.snapshot_ids_to_expire.contains(&current_id)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Cannot expire current snapshot {current_id}"),
+            ));
         }
 
         Ok(())

@@ -83,6 +83,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use super::record_batch::coerce_batch_schema;
 use crate::position_delete_task_writer::PositionDeleteTaskWriter;
 use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
@@ -215,7 +216,7 @@ impl DisplayAs for IcebergUpdateExec {
         let assignments_display: Vec<String> = self
             .assignments
             .iter()
-            .map(|(col, expr)| format!("{} = {}", col, expr))
+            .map(|(col, expr)| format!("{col} = {expr}"))
             .collect();
 
         match t {
@@ -489,6 +490,7 @@ async fn execute_update(
             None => continue, // Empty file
         };
 
+        let first_batch = coerce_batch_schema(first_batch, &schema)?;
         let batch_schema = first_batch.schema();
         let (physical_filter, physical_assignments) =
             build_physical_expressions(&filter_exprs, &assignments, batch_schema.clone())?;
@@ -538,7 +540,7 @@ async fn execute_update(
 
         // Stream remaining batches from file
         while let Some(batch_result) = batch_stream.next().await {
-            let batch = batch_result?;
+            let batch = coerce_batch_schema(batch_result?, &schema)?;
             let batch_size = batch.num_rows();
 
             // Find matching rows
@@ -650,15 +652,17 @@ async fn execute_update(
     IcebergUpdateExec::make_result_batch(data_files_json, delete_files_json, total_count)
 }
 
+type UpdatePhysicalExpressions = (
+    Option<Arc<dyn PhysicalExpr>>,
+    HashMap<String, Arc<dyn PhysicalExpr>>,
+);
+
 /// Builds physical expressions for filter and SET assignments.
 fn build_physical_expressions(
     filter_exprs: &[Expr],
     assignments: &[(String, Expr)],
     batch_schema: ArrowSchemaRef,
-) -> DFResult<(
-    Option<Arc<dyn PhysicalExpr>>,
-    HashMap<String, Arc<dyn PhysicalExpr>>,
-)> {
+) -> DFResult<UpdatePhysicalExpressions> {
     let df_schema = DFSchema::try_from(batch_schema.as_ref().clone())?;
     let ctx = SessionContext::new();
     let execution_props = ctx.state().execution_props().clone();
@@ -759,8 +763,7 @@ fn transform_batch(
             // Keep original column value
             let original_col = batch.column_by_name(column_name).ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "Column '{}' not found in source batch",
-                    column_name
+                    "Column '{column_name}' not found in source batch"
                 ))
             })?;
             columns.push(original_col.clone());

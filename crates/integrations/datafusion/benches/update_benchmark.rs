@@ -92,7 +92,7 @@ async fn setup_test_table(
 
     // Insert test data
     let values: Vec<String> = (0..row_count)
-        .map(|i| format!("({}, 'value_{}')", i, i))
+        .map(|i| format!("({i}, 'value_{i}')"))
         .collect();
 
     if !values.is_empty() {
@@ -162,7 +162,7 @@ fn bench_update_row_count(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("full_table", row_count), |b| {
             b.to_async(&rt).iter(|| async {
-                let namespace_name = format!("bench_rows_{}", row_count);
+                let namespace_name = format!("bench_rows_{row_count}");
                 let (client, namespace, ctx) =
                     setup_test_table(&namespace_name, "bench_table", row_count).await;
 
@@ -280,7 +280,7 @@ fn bench_update_vs_delete_insert(c: &mut Criterion) {
 
             // Step 2: INSERT new values (simulating update)
             let values: Vec<String> = (0..rows_affected)
-                .map(|i| format!("({}, 'updated_{}')", i, i))
+                .map(|i| format!("({i}, 'updated_{i}')"))
                 .collect();
 
             let insert_sql = format!(

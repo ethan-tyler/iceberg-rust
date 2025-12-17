@@ -1057,19 +1057,13 @@ mod tests {
                 "default-spec-id": 0,
                 "last-partition-id": 999,
                 "properties": {{
-                    "{}": "{}",
-                    "{}": "{}",
-                    "{}": "{}"
+                    "{MANIFEST_CACHE_ENABLED}": "{enabled}",
+                    "{MANIFEST_CACHE_MAX_TOTAL_BYTES}": "{max_bytes}",
+                    "{MANIFEST_CACHE_EXPIRATION_INTERVAL_MS}": "{ttl_ms}"
                 }},
                 "sort-orders": [{{"order-id": 0, "fields": []}}],
                 "default-sort-order-id": 0
-            }}"#,
-            MANIFEST_CACHE_ENABLED,
-            enabled,
-            MANIFEST_CACHE_MAX_TOTAL_BYTES,
-            max_bytes,
-            MANIFEST_CACHE_EXPIRATION_INTERVAL_MS,
-            ttl_ms
+            }}"#
         );
         serde_json::from_str(&json).unwrap()
     }

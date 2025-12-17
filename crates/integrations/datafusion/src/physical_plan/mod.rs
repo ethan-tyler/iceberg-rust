@@ -28,6 +28,7 @@ pub(crate) mod metadata_scan;
 pub(crate) mod overwrite_commit;
 pub(crate) mod project;
 pub(crate) mod repartition;
+pub(crate) mod record_batch;
 pub(crate) mod scan;
 pub(crate) mod sort;
 pub(crate) mod update;

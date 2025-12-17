@@ -23,6 +23,7 @@ use std::vec;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::stats::Precision;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
@@ -32,8 +33,11 @@ use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
     PushedDown,
 };
+use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, ExecutionPlan, Partitioning, PlanProperties, Statistics,
+};
 use datafusion::prelude::Expr;
 use futures::{SinkExt, Stream, StreamExt, TryStreamExt};
 use iceberg::Result;
@@ -42,6 +46,7 @@ use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use super::record_batch::coerce_batch_schema;
 use crate::dynamic_filter::handler::DynamicFilterHandler;
 use crate::to_datafusion_error;
 
@@ -53,7 +58,6 @@ struct CachedTasks {
     tasks: Vec<FileScanTask>,
 }
 
-#[derive(Debug)]
 pub struct IcebergTableScan {
     /// A table in the catalog.
     table: Table,
@@ -70,6 +74,17 @@ pub struct IcebergTableScan {
     iceberg_schema: iceberg::spec::Schema,
     dynamic_filter_handler: Arc<DynamicFilterHandler>,
     cached_tasks: Arc<RwLock<Option<CachedTasks>>>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl std::fmt::Debug for IcebergTableScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergTableScan")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("projection", &self.projection)
+            .field("predicates", &self.predicates)
+            .finish()
+    }
 }
 
 impl IcebergTableScan {
@@ -100,6 +115,7 @@ impl IcebergTableScan {
             iceberg_schema,
             dynamic_filter_handler: Arc::new(DynamicFilterHandler::new(filterable_columns)),
             cached_tasks: Arc::new(RwLock::new(None)),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -165,11 +181,49 @@ impl ExecutionPlan for IcebergTableScan {
                 self.dynamic_filter_handler.filterable_columns().to_vec(),
             )),
             cached_tasks: Arc::new(RwLock::new(None)),
+            metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
 
     fn properties(&self) -> &PlanProperties {
         &self.plan_properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {
+        if partition.is_some() {
+            return Ok(Statistics::new_unknown(self.schema().as_ref()));
+        }
+
+        let mut stats = Statistics::new_unknown(self.schema().as_ref());
+        let snapshot = match self.snapshot_id {
+            Some(snapshot_id) => self.table.metadata().snapshot_by_id(snapshot_id),
+            None => self.table.metadata().current_snapshot(),
+        };
+
+        let Some(snapshot) = snapshot else {
+            return Ok(stats);
+        };
+
+        let summary = snapshot.summary();
+        if let Some(total_records) = summary.additional_properties.get("total-records")
+            && let Ok(total_records) = total_records.parse::<u64>()
+            && let Ok(total_records) = usize::try_from(total_records)
+        {
+            stats.num_rows = Precision::Exact(total_records);
+        }
+
+        if let Some(total_size) = summary.additional_properties.get("total-files-size")
+            && let Ok(total_size) = total_size.parse::<u64>()
+            && let Ok(total_size) = usize::try_from(total_size)
+        {
+            stats.total_byte_size = Precision::Exact(total_size);
+        }
+
+        Ok(stats)
     }
 
     fn gather_filters_for_pushdown(
@@ -235,6 +289,7 @@ impl ExecutionPlan for IcebergTableScan {
                 iceberg_schema: self.iceberg_schema.clone(),
                 dynamic_filter_handler,
                 cached_tasks: Arc::new(RwLock::new(None)),
+                metrics: ExecutionPlanMetricsSet::new(),
             });
             propagation = propagation.with_updated_node(new_node);
         }
@@ -244,19 +299,23 @@ impl ExecutionPlan for IcebergTableScan {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let fut = get_batch_stream(
-            self.table.clone(),
-            self.snapshot_id,
-            self.projection.clone(),
-            self.predicates.clone(),
-            self.iceberg_schema.clone(),
-            Arc::clone(&self.dynamic_filter_handler),
-            Arc::clone(&self.cached_tasks),
-            context.session_config().batch_size(),
-        );
+        let planned_tasks_metric =
+            MetricBuilder::new(&self.metrics).counter("planned_tasks", partition);
+        let fut = get_batch_stream(BatchStreamArgs {
+            table: self.table.clone(),
+            snapshot_id: self.snapshot_id,
+            column_names: self.projection.clone(),
+            predicates: self.predicates.clone(),
+            iceberg_schema: self.iceberg_schema.clone(),
+            dynamic_filter_handler: Arc::clone(&self.dynamic_filter_handler),
+            cached_tasks: Arc::clone(&self.cached_tasks),
+            batch_size: context.session_config().batch_size(),
+            planned_tasks_metric,
+            expected_schema: self.schema(),
+        });
         let stream = futures::stream::once(fut).try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -286,20 +345,11 @@ impl DisplayAs for IcebergTableScan {
             "none"
         };
 
-        write!(
-            f,
-            "IcebergTableScan projection:[{}] predicate:[{}] dynamic_filter:[{}]",
-            projection, predicate, dynamic_filter
-        )
+        write!(f, "IcebergTableScan projection:[{projection}] predicate:[{predicate}] dynamic_filter:[{dynamic_filter}]")
     }
 }
 
-/// Asynchronously retrieves a stream of [`RecordBatch`] instances
-/// from a given table.
-///
-/// This function initializes a [`TableScan`], builds it,
-/// and then converts it into a stream of Arrow [`RecordBatch`]es.
-async fn get_batch_stream(
+struct BatchStreamArgs {
     table: Table,
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
@@ -308,7 +358,31 @@ async fn get_batch_stream(
     dynamic_filter_handler: Arc<DynamicFilterHandler>,
     cached_tasks: Arc<RwLock<Option<CachedTasks>>>,
     batch_size: usize,
+    planned_tasks_metric: Count,
+    expected_schema: ArrowSchemaRef,
+}
+
+/// Asynchronously retrieves a stream of [`RecordBatch`] instances
+/// from a given table.
+///
+/// This function initializes a [`TableScan`], builds it,
+/// and then converts it into a stream of Arrow [`RecordBatch`]es.
+async fn get_batch_stream(
+    args: BatchStreamArgs,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    let BatchStreamArgs {
+        table,
+        snapshot_id,
+        column_names,
+        predicates,
+        iceberg_schema,
+        dynamic_filter_handler,
+        cached_tasks,
+        batch_size,
+        planned_tasks_metric,
+        expected_schema,
+    } = args;
+
     let dynamic_generation = dynamic_filter_handler
         .dynamic_filter()
         .map(|f| f.snapshot_generation())
@@ -321,6 +395,7 @@ async fn get_batch_stream(
         .and_then(|c| (c.generation == dynamic_generation).then(|| c.tasks.clone()));
 
     let tasks: FileScanTaskStream = if let Some(tasks) = cached {
+        planned_tasks_metric.add(tasks.len());
         Box::pin(futures::stream::iter(tasks.into_iter().map(Ok)))
     } else {
         let dynamic_predicate = dynamic_filter_handler
@@ -351,6 +426,7 @@ async fn get_batch_stream(
         let (mut tx, rx) = futures::channel::mpsc::channel::<Result<FileScanTask>>(128);
         let cached_tasks = Arc::clone(&cached_tasks);
         let dynamic_filter_handler = Arc::clone(&dynamic_filter_handler);
+        let planned_tasks_metric = planned_tasks_metric.clone();
 
         tokio::spawn(async move {
             let mut collected = Vec::new();
@@ -359,6 +435,7 @@ async fn get_batch_stream(
 
             while let Some(task) = planned_tasks.next().await {
                 if let Ok(ref t) = task {
+                    planned_tasks_metric.add(1);
                     collected.push(t.clone());
                 } else {
                     ok = false;
@@ -407,7 +484,8 @@ async fn get_batch_stream(
         .build()
         .read(tasks)
         .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
+        .map_err(to_datafusion_error)
+        .map(move |batch| batch.and_then(|batch| coerce_batch_schema(batch, &expected_schema)));
 
     Ok(Box::pin(stream))
 }
