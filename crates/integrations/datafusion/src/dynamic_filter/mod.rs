@@ -33,8 +33,9 @@
 //! - Comparison operators: `=`, `!=`, `<`, `<=`, `>`, `>=`
 //! - IN lists (up to 1000 items to prevent pathological cases)
 //! - IS NULL / IS NOT NULL
-//! - Logical AND/OR (partial conversion supported - unconvertible parts are dropped)
-//! - NOT expressions
+//! - Logical AND (partial conversion: unconvertible terms dropped, safe because more restrictive)
+//! - Logical OR (full conversion only: both sides must convert, partial would be unsound)
+//! - NOT expressions (full conversion only: inner must fully convert to avoid inverted semantics)
 //!
 //! # Supported Data Types
 //!
@@ -49,6 +50,9 @@
 //! - Only filterable columns (partition columns or columns with statistics)
 //! - Single dynamic filter per scan (first valid one is accepted)
 //! - IN-list limited to 1000 items
+//! - **Safe-subset conversion**: dynamic filters that contain non-column expressions (for example
+//!   `CaseExpr`/hash-routing produced by partitioned hash joins) are intentionally not converted;
+//!   the scan falls back to **no additional pruning** rather than risking incorrect results.
 //!
 //! # Thread Safety
 //!

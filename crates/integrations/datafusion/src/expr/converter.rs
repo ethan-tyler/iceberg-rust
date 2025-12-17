@@ -82,7 +82,11 @@ fn convert_predicate(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<Pr
     }
 
     if let Some(not) = expr.as_any().downcast_ref::<NotExpr>() {
-        return convert_predicate(not.arg(), schema).map(|p| !p);
+        // NOT requires full conversion of inner expression to avoid inverted semantics.
+        // If inner is AND with partial conversion, NOT(partial) would be wrong:
+        // e.g., NOT(A AND B) with only A converted becomes NOT(A), but should be NOT(A) OR NOT(B).
+        // Use strict conversion under NOT to ensure correctness.
+        return convert_predicate_strict(not.arg(), schema).map(|p| !p);
     }
 
     if let Some(cast) = expr.as_any().downcast_ref::<CastExpr>() {
@@ -97,24 +101,95 @@ fn convert_predicate(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<Pr
 }
 
 fn convert_binary_expr(binary: &BinaryExpr, schema: &Schema) -> Option<Predicate> {
+    convert_binary_expr_impl(binary, schema, false)
+}
+
+fn convert_binary_expr_strict(binary: &BinaryExpr, schema: &Schema) -> Option<Predicate> {
+    convert_binary_expr_impl(binary, schema, true)
+}
+
+fn convert_binary_expr_impl(
+    binary: &BinaryExpr,
+    schema: &Schema,
+    strict: bool,
+) -> Option<Predicate> {
     match binary.op() {
         Operator::And => {
-            let left = convert_predicate(binary.left(), schema);
-            let right = convert_predicate(binary.right(), schema);
-            match (left, right) {
-                (Some(l), Some(r)) => Some(l.and(r)),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
+            let left = if strict {
+                convert_predicate_strict(binary.left(), schema)
+            } else {
+                convert_predicate(binary.left(), schema)
+            };
+            let right = if strict {
+                convert_predicate_strict(binary.right(), schema)
+            } else {
+                convert_predicate(binary.right(), schema)
+            };
+            match (left, right, strict) {
+                (Some(l), Some(r), _) => Some(l.and(r)),
+                // Partial AND is only allowed in non-strict mode
+                (Some(l), None, false) => Some(l),
+                (None, Some(r), false) => Some(r),
+                _ => None,
             }
         }
         Operator::Or => {
-            let left = convert_predicate(binary.left(), schema)?;
-            let right = convert_predicate(binary.right(), schema)?;
+            // OR always requires full conversion (both in strict and non-strict mode)
+            let left = if strict {
+                convert_predicate_strict(binary.left(), schema)?
+            } else {
+                convert_predicate(binary.left(), schema)?
+            };
+            let right = if strict {
+                convert_predicate_strict(binary.right(), schema)?
+            } else {
+                convert_predicate(binary.right(), schema)?
+            };
             Some(left.or(right))
         }
         op => convert_comparison(binary.left(), op, binary.right(), schema),
     }
+}
+
+/// Strict conversion that doesn't allow partial AND conversion.
+/// Used under NOT to ensure correct semantics.
+fn convert_predicate_strict(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<Predicate> {
+    if let Some(dynamic) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+        return dynamic
+            .current()
+            .ok()
+            .and_then(|e| convert_predicate_strict(&e, schema));
+    }
+
+    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        return convert_binary_expr_strict(binary, schema);
+    }
+
+    if let Some(in_list) = expr.as_any().downcast_ref::<InListExpr>() {
+        return convert_in_list_expr(in_list, schema);
+    }
+
+    if let Some(is_null) = expr.as_any().downcast_ref::<IsNullExpr>() {
+        return convert_is_null_expr(is_null, schema);
+    }
+
+    if let Some(is_not_null) = expr.as_any().downcast_ref::<IsNotNullExpr>() {
+        return convert_is_not_null_expr(is_not_null, schema);
+    }
+
+    if let Some(not) = expr.as_any().downcast_ref::<NotExpr>() {
+        // Nested NOT also uses strict mode
+        return convert_predicate_strict(not.arg(), schema).map(|p| !p);
+    }
+
+    if let Some(cast) = expr.as_any().downcast_ref::<CastExpr>() {
+        if matches!(cast.cast_type(), DataType::Date32 | DataType::Date64) {
+            return None;
+        }
+        return convert_predicate_strict(cast.expr(), schema);
+    }
+
+    None
 }
 
 fn convert_comparison(
@@ -331,5 +406,79 @@ mod tests {
 
         let predicate = convert_physical_expr_to_predicate(&expr, &schema).unwrap();
         assert_eq!(predicate, Reference::new("id").equal_to(Datum::int(1)));
+    }
+
+    #[test]
+    fn test_not_partial_and_returns_always_true() {
+        // Verifies that NOT(A AND B) where B doesn't convert returns AlwaysTrue (safe fallback)
+        // rather than incorrectly returning NOT(A).
+        let schema = iceberg_schema();
+
+        let supported: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 1)),
+            Operator::Eq,
+            Arc::new(Literal::new(datafusion::scalar::ScalarValue::Int32(Some(
+                1,
+            )))),
+        ));
+
+        // Unsupported part: arithmetic expression can't be converted.
+        let unsupported: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            supported.clone(),
+            Operator::Plus,
+            Arc::new(Literal::new(datafusion::scalar::ScalarValue::Int32(Some(
+                1,
+            )))),
+        ));
+
+        let and_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            supported.clone(),
+            Operator::And,
+            unsupported,
+        ));
+
+        // NOT(partial AND) must NOT convert to NOT(partial) - that would be wrong!
+        // Instead it should return AlwaysTrue to avoid incorrect pruning.
+        let not_expr: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(and_expr));
+        let predicate = convert_physical_expr_to_predicate(&not_expr, &schema).unwrap();
+        assert_eq!(
+            predicate,
+            Predicate::AlwaysTrue,
+            "NOT around partial AND should return AlwaysTrue for safety"
+        );
+    }
+
+    #[test]
+    fn test_not_full_and_converts_correctly() {
+        // Verifies that NOT(A AND B) where both convert works correctly.
+        let schema = iceberg_schema();
+
+        let left: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 1)),
+            Operator::Eq,
+            Arc::new(Literal::new(datafusion::scalar::ScalarValue::Int32(Some(
+                1,
+            )))),
+        ));
+
+        let right: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("region", 0)),
+            Operator::Eq,
+            Arc::new(Literal::new(datafusion::scalar::ScalarValue::Utf8(Some(
+                "US".to_string(),
+            )))),
+        ));
+
+        let and_expr: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(left, Operator::And, right));
+
+        let not_expr: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(and_expr));
+        let predicate = convert_physical_expr_to_predicate(&not_expr, &schema).unwrap();
+
+        // NOT(id=1 AND region='US') should convert to the negated AND predicate
+        let expected = !(Reference::new("id")
+            .equal_to(Datum::int(1))
+            .and(Reference::new("region").equal_to(Datum::string("US"))));
+        assert_eq!(predicate, expected);
     }
 }
