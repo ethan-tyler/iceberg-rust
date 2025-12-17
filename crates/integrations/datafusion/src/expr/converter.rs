@@ -409,6 +409,43 @@ mod tests {
     }
 
     #[test]
+    fn test_or_partial_returns_always_true() {
+        // OR must not be partially converted, as dropping a branch can make the predicate
+        // more restrictive and lead to incorrect pruning.
+        let schema = iceberg_schema();
+
+        let supported: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 1)),
+            Operator::Eq,
+            Arc::new(Literal::new(datafusion::scalar::ScalarValue::Int32(Some(
+                1,
+            )))),
+        ));
+
+        // Unsupported part: arithmetic expression can't be converted.
+        let unsupported: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            supported.clone(),
+            Operator::Plus,
+            Arc::new(Literal::new(datafusion::scalar::ScalarValue::Int32(Some(
+                1,
+            )))),
+        ));
+
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            supported,
+            Operator::Or,
+            unsupported,
+        ));
+
+        let predicate = convert_physical_expr_to_predicate(&expr, &schema).unwrap();
+        assert_eq!(
+            predicate,
+            Predicate::AlwaysTrue,
+            "OR with an unconvertible branch must fall back to AlwaysTrue"
+        );
+    }
+
+    #[test]
     fn test_not_partial_and_returns_always_true() {
         // Verifies that NOT(A AND B) where B doesn't convert returns AlwaysTrue (safe fallback)
         // rather than incorrectly returning NOT(A).

@@ -33,7 +33,7 @@
 //! - Comparison operators: `=`, `!=`, `<`, `<=`, `>`, `>=`
 //! - IN lists (up to 1000 items to prevent pathological cases)
 //! - IS NULL / IS NOT NULL
-//! - Logical AND (partial conversion: unconvertible terms dropped, safe because more restrictive)
+//! - Logical AND (partial conversion: unconvertible terms dropped, safe because less restrictive)
 //! - Logical OR (full conversion only: both sides must convert, partial would be unsound)
 //! - NOT expressions (full conversion only: inner must fully convert to avoid inverted semantics)
 //!
