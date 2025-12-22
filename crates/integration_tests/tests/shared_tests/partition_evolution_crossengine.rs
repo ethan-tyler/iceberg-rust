@@ -33,6 +33,9 @@ use datafusion::prelude::*;
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_datafusion::IcebergTableProvider;
+use iceberg_integration_tests::spark_validator::{
+    ValidationType, spark_validate_distinct_with_container, spark_validate_with_container,
+};
 
 use crate::get_shared_containers;
 
@@ -114,13 +117,10 @@ async fn test_crossengine_delete_with_partition_evolution() {
     assert_eq!(deleted_count, 2, "Should delete 2 rows (id 4, 5)");
 
     // Reload table and verify
-    let provider_after = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace,
-        "test_partition_evolution_delete",
-    )
-    .await
-    .unwrap();
+    let provider_after =
+        IcebergTableProvider::try_new(client.clone(), namespace, "test_partition_evolution_delete")
+            .await
+            .unwrap();
 
     let after_df = ctx
         .read_table(Arc::new(provider_after))
@@ -141,6 +141,50 @@ async fn test_crossengine_delete_with_partition_evolution() {
         "+----+-------------+-------+",
     ];
     assert_batches_sorted_eq!(expected_after, &after_batches);
+
+    // Spark validation: count + distinct + metadata sanity
+    let spark_container = fixture.spark_container_name();
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        "test_partition_evolution_delete",
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(3), "Spark count should match");
+
+    let distinct_result = spark_validate_distinct_with_container(
+        &spark_container,
+        "test_partition_evolution_delete",
+        "id",
+    )
+    .await
+    .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(3),
+        "Spark distinct count should match"
+    );
+
+    let metadata_result = spark_validate_with_container(
+        &spark_container,
+        "test_partition_evolution_delete",
+        ValidationType::Metadata,
+    )
+    .await
+    .expect("Spark metadata validation should succeed");
+    assert!(
+        metadata_result.snapshot_count.unwrap_or(0) > 0,
+        "Spark should report snapshots"
+    );
+    assert!(
+        metadata_result.file_count.unwrap_or(0) > 0,
+        "Spark should report files"
+    );
+    assert!(
+        metadata_result.manifest_count.unwrap_or(0) > 0,
+        "Spark should report manifests"
+    );
 }
 
 /// Test UPDATE on a Spark-created table with evolved partition spec.
@@ -199,13 +243,10 @@ async fn test_crossengine_update_with_partition_evolution() {
     assert_eq!(update_result, 3, "Should update 3 rows (id 3, 4, 5)");
 
     // Reload and verify
-    let provider_after = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace,
-        "test_partition_evolution_update",
-    )
-    .await
-    .unwrap();
+    let provider_after =
+        IcebergTableProvider::try_new(client.clone(), namespace, "test_partition_evolution_update")
+            .await
+            .unwrap();
 
     let after_df = ctx
         .read_table(Arc::new(provider_after))
@@ -314,13 +355,10 @@ async fn test_crossengine_merge_with_partition_evolution() {
     assert_eq!(stats.rows_inserted, 1, "Should insert 1 row (id 6)");
 
     // Reload and verify
-    let provider_after = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace,
-        "test_partition_evolution_merge",
-    )
-    .await
-    .unwrap();
+    let provider_after =
+        IcebergTableProvider::try_new(client.clone(), namespace, "test_partition_evolution_merge")
+            .await
+            .unwrap();
 
     let after_df = ctx
         .read_table(Arc::new(provider_after))

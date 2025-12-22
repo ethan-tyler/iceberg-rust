@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod spark_validator;
+
 use std::collections::HashMap;
 
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
@@ -29,6 +31,14 @@ pub struct TestFixture {
     pub catalog_config: HashMap<String, String>,
 }
 
+impl TestFixture {
+    pub fn spark_container_name(&self) -> String {
+        self._docker_compose.container_name("spark-iceberg")
+    }
+}
+
+const MINIO_PORT: u16 = 9000;
+
 pub fn set_test_fixture(func: &str) -> TestFixture {
     set_up();
     let docker_compose = DockerCompose::new(
@@ -40,17 +50,16 @@ pub fn set_test_fixture(func: &str) -> TestFixture {
     docker_compose.down();
     docker_compose.up();
 
-    let rest_catalog_ip = docker_compose.get_container_ip("rest");
-    let minio_ip = docker_compose.get_container_ip("minio");
-
+    // Use localhost with port mappings for macOS compatibility.
+    // Container IPs aren't accessible from host on macOS (Docker runs in VM).
     let catalog_config = HashMap::from([
         (
             REST_CATALOG_PROP_URI.to_string(),
-            format!("http://{rest_catalog_ip}:{REST_CATALOG_PORT}"),
+            format!("http://localhost:{REST_CATALOG_PORT}"),
         ),
         (
             S3_ENDPOINT.to_string(),
-            format!("http://{}:{}", minio_ip, 9000),
+            format!("http://localhost:{MINIO_PORT}"),
         ),
         (S3_ACCESS_KEY_ID.to_string(), "admin".to_string()),
         (S3_SECRET_ACCESS_KEY.to_string(), "password".to_string()),
