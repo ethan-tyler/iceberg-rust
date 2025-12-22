@@ -263,3 +263,102 @@ VALUES
     (4, 'EU', 400),
     (5, 'APAC', 500);
 """)
+
+# =============================================================================
+# WP1 Cross-Engine Interop Tests (Unpartitioned Tables)
+# =============================================================================
+# These tables are unpartitioned to avoid known blockers with partitioned DML.
+
+# Table for testing DELETE with NULL semantics
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_delete_null_semantics (
+    id     integer,
+    name   string,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.delete.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+# Insert data including NULLs
+spark.sql("""
+INSERT INTO rest.default.test_delete_null_semantics
+VALUES
+    (1, 'alpha', 100),
+    (2, 'beta', NULL),
+    (3, NULL, 300),
+    (4, 'delta', 400),
+    (5, NULL, NULL),
+    (6, 'zeta', 600);
+""")
+
+# Table for testing compaction (binpack)
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_compaction (
+    id     integer,
+    data   string
+)
+USING iceberg
+TBLPROPERTIES (
+    'format-version'='2'
+);
+""")
+
+# Insert data in multiple small commits to create multiple small files
+spark.sql("INSERT INTO rest.default.test_compaction VALUES (1, 'row1')")
+spark.sql("INSERT INTO rest.default.test_compaction VALUES (2, 'row2')")
+spark.sql("INSERT INTO rest.default.test_compaction VALUES (3, 'row3')")
+spark.sql("INSERT INTO rest.default.test_compaction VALUES (4, 'row4')")
+spark.sql("INSERT INTO rest.default.test_compaction VALUES (5, 'row5')")
+
+# Table for testing expire snapshots
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_expire_snapshots (
+    id     integer,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'format-version'='2'
+);
+""")
+
+# Create multiple snapshots by doing multiple inserts
+spark.sql("INSERT INTO rest.default.test_expire_snapshots VALUES (1, 100)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots VALUES (2, 200)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots VALUES (3, 300)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots VALUES (4, 400)")
+
+# Table for testing rewrite manifests
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_rewrite_manifests (
+    id     integer,
+    data   string
+)
+USING iceberg
+TBLPROPERTIES (
+    'format-version'='2'
+);
+""")
+
+# Insert data in multiple commits to create multiple manifests
+spark.sql("INSERT INTO rest.default.test_rewrite_manifests VALUES (1, 'one')")
+spark.sql("INSERT INTO rest.default.test_rewrite_manifests VALUES (2, 'two')")
+spark.sql("INSERT INTO rest.default.test_rewrite_manifests VALUES (3, 'three')")
+
+# Table for testing remove orphan files
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_remove_orphan_files (
+    id     integer,
+    data   string
+)
+USING iceberg
+TBLPROPERTIES (
+    'format-version'='2'
+);
+""")
+
+spark.sql("INSERT INTO rest.default.test_remove_orphan_files VALUES (1, 'alpha')")
