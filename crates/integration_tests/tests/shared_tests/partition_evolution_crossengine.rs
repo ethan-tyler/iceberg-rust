@@ -28,14 +28,20 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+use chrono::{Duration, Utc};
 use datafusion::assert_batches_sorted_eq;
 use datafusion::prelude::*;
+use iceberg::spec::Operation;
+use iceberg::transaction::{ApplyTransactionAction, RewriteDataFilesOptions, RewriteStrategy, Transaction};
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
+use iceberg_datafusion::compaction::{CompactionOptions, compact_table};
 use iceberg_datafusion::IcebergTableProvider;
 use iceberg_integration_tests::spark_validator::{
     ValidationType, spark_validate_distinct_with_container, spark_validate_with_container,
 };
+use uuid::Uuid;
 
 use crate::get_shared_containers;
 
@@ -269,6 +275,50 @@ async fn test_crossengine_update_with_partition_evolution() {
         "+----+--------+-----------+",
     ];
     assert_batches_sorted_eq!(expected_after, &after_batches);
+
+    // Spark validation: count + distinct + metadata sanity
+    let spark_container = fixture.spark_container_name();
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        "test_partition_evolution_update",
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(5), "Spark count should match");
+
+    let distinct_result = spark_validate_distinct_with_container(
+        &spark_container,
+        "test_partition_evolution_update",
+        "id",
+    )
+    .await
+    .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(5),
+        "Spark distinct count should match"
+    );
+
+    let metadata_result = spark_validate_with_container(
+        &spark_container,
+        "test_partition_evolution_update",
+        ValidationType::Metadata,
+    )
+    .await
+    .expect("Spark metadata validation should succeed");
+    assert!(
+        metadata_result.snapshot_count.unwrap_or(0) > 0,
+        "Spark should report snapshots"
+    );
+    assert!(
+        metadata_result.file_count.unwrap_or(0) > 0,
+        "Spark should report files"
+    );
+    assert!(
+        metadata_result.manifest_count.unwrap_or(0) > 0,
+        "Spark should report manifests"
+    );
 }
 
 /// Test MERGE on a Spark-created table with evolved partition spec.
@@ -382,4 +432,540 @@ async fn test_crossengine_merge_with_partition_evolution() {
         "+----+--------+--------+",
     ];
     assert_batches_sorted_eq!(expected_after, &after_batches);
+
+    // Spark validation: count + distinct + metadata sanity
+    let spark_container = fixture.spark_container_name();
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        "test_partition_evolution_merge",
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(6), "Spark count should match (5 original + 1 inserted)");
+
+    let distinct_result = spark_validate_distinct_with_container(
+        &spark_container,
+        "test_partition_evolution_merge",
+        "id",
+    )
+    .await
+    .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(6),
+        "Spark distinct count should match"
+    );
+
+    let metadata_result = spark_validate_with_container(
+        &spark_container,
+        "test_partition_evolution_merge",
+        ValidationType::Metadata,
+    )
+    .await
+    .expect("Spark metadata validation should succeed");
+    assert!(
+        metadata_result.snapshot_count.unwrap_or(0) > 0,
+        "Spark should report snapshots"
+    );
+    assert!(
+        metadata_result.file_count.unwrap_or(0) > 0,
+        "Spark should report files"
+    );
+    assert!(
+        metadata_result.manifest_count.unwrap_or(0) > 0,
+        "Spark should report manifests"
+    );
+}
+
+// =============================================================================
+// WP1 Rust -> Spark Interop Tests (Unpartitioned Tables)
+// =============================================================================
+
+/// Test DELETE with NULL semantics.
+///
+/// Setup (by Spark provision.py):
+/// - Table `test_delete_null_semantics` with 6 rows including NULLs:
+///   - (1, 'alpha', 100), (2, 'beta', NULL), (3, NULL, 300),
+///   - (4, 'delta', 400), (5, NULL, NULL), (6, 'zeta', 600)
+///
+/// Test: DELETE rows where name IS NULL (should delete rows 3, 5)
+#[tokio::test]
+async fn test_crossengine_delete_with_null_semantics() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let ctx = SessionContext::new();
+    let namespace = iceberg::NamespaceIdent::new("default".to_string());
+
+    // Create provider for DML operations
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "test_delete_null_semantics",
+    )
+    .await
+    .unwrap();
+
+    // Verify initial data (6 rows)
+    let initial_df = ctx
+        .read_table(Arc::new(provider.clone()))
+        .unwrap()
+        .select_columns(&["id", "name", "value"])
+        .unwrap()
+        .sort(vec![col("id").sort(true, true)])
+        .unwrap();
+
+    let initial_batches = initial_df.collect().await.unwrap();
+    let initial_count: usize = initial_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(initial_count, 6, "Should start with 6 rows");
+
+    // Delete rows where name IS NULL (spans rows 3, 5)
+    let deleted_count = provider
+        .delete(&ctx.state(), Some(col("name").is_null()))
+        .await
+        .expect("DELETE with IS NULL should succeed");
+
+    assert_eq!(deleted_count, 2, "Should delete 2 rows where name IS NULL");
+
+    // Reload and verify
+    let provider_after = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace,
+        "test_delete_null_semantics",
+    )
+    .await
+    .unwrap();
+
+    let after_df = ctx
+        .read_table(Arc::new(provider_after))
+        .unwrap()
+        .select_columns(&["id", "name", "value"])
+        .unwrap()
+        .sort(vec![col("id").sort(true, true)])
+        .unwrap();
+
+    let after_batches = after_df.collect().await.unwrap();
+    let expected_after = [
+        "+----+-------+-------+",
+        "| id | name  | value |",
+        "+----+-------+-------+",
+        "| 1  | alpha | 100   |",
+        "| 2  | beta  |       |",
+        "| 4  | delta | 400   |",
+        "| 6  | zeta  | 600   |",
+        "+----+-------+-------+",
+    ];
+    assert_batches_sorted_eq!(expected_after, &after_batches);
+
+    // Spark validation: count + distinct + metadata sanity
+    let spark_container = fixture.spark_container_name();
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        "test_delete_null_semantics",
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(4), "Spark count should match");
+
+    let distinct_result = spark_validate_distinct_with_container(
+        &spark_container,
+        "test_delete_null_semantics",
+        "id",
+    )
+    .await
+    .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(4),
+        "Spark distinct count should match"
+    );
+
+    let metadata_result = spark_validate_with_container(
+        &spark_container,
+        "test_delete_null_semantics",
+        ValidationType::Metadata,
+    )
+    .await
+    .expect("Spark metadata validation should succeed");
+    assert!(
+        metadata_result.snapshot_count.unwrap_or(0) > 0,
+        "Spark should report snapshots"
+    );
+}
+
+// =============================================================================
+// WP1 Rust -> Spark Interop Tests (Maintenance Operations)
+// =============================================================================
+
+/// Test compaction (binpack) on a Spark-created table.
+///
+/// Setup (by Spark provision.py):
+/// - Table `test_compaction` with 5 rows written in separate commits
+///
+/// Test: Run binpack compaction via iceberg-datafusion and validate Spark reads.
+#[tokio::test]
+async fn test_crossengine_compaction_binpack() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table_ident = TableIdent::from_strs(["default", "test_compaction"]).unwrap();
+    let table = client.load_table(&table_ident).await.unwrap();
+    let pre_snapshot_count = table.metadata().snapshots().count();
+
+    let mut rewrite_options = RewriteDataFilesOptions::default();
+    rewrite_options.min_input_files = 2;
+
+    let options = CompactionOptions::default()
+        .with_rewrite_options(rewrite_options)
+        .with_strategy(RewriteStrategy::BinPack);
+
+    let result = compact_table(&table, client.clone(), Some(options))
+        .await
+        .expect("Compaction should succeed");
+
+    assert!(result.has_changes(), "Compaction should rewrite data files");
+
+    let table_after = client.load_table(&table_ident).await.unwrap();
+    let post_snapshot_count = table_after.metadata().snapshots().count();
+    assert!(
+        post_snapshot_count > pre_snapshot_count,
+        "Compaction should create a new snapshot"
+    );
+
+    let current_snapshot = table_after
+        .metadata()
+        .current_snapshot()
+        .expect("Compaction should leave a current snapshot");
+    assert_eq!(
+        current_snapshot.summary().operation,
+        Operation::Replace,
+        "Compaction snapshot should be a replace operation"
+    );
+
+    // Spark validation: count + distinct + metadata sanity
+    let spark_container = fixture.spark_container_name();
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        "test_compaction",
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(5), "Spark count should match");
+
+    let distinct_result = spark_validate_distinct_with_container(
+        &spark_container,
+        "test_compaction",
+        "id",
+    )
+    .await
+    .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(5),
+        "Spark distinct count should match"
+    );
+
+    let metadata_result = spark_validate_with_container(
+        &spark_container,
+        "test_compaction",
+        ValidationType::Metadata,
+    )
+    .await
+    .expect("Spark metadata validation should succeed");
+    assert!(
+        metadata_result.snapshot_count.unwrap_or(0) > 0,
+        "Spark should report snapshots"
+    );
+    assert!(
+        metadata_result.file_count.unwrap_or(0) > 0,
+        "Spark should report files"
+    );
+    assert!(
+        metadata_result.manifest_count.unwrap_or(0) > 0,
+        "Spark should report manifests"
+    );
+}
+
+/// Test rewrite manifests on a Spark-created table.
+///
+/// Setup (by Spark provision.py):
+/// - Table `test_rewrite_manifests` with 3 rows across multiple commits
+///
+/// Test: Run rewrite_manifests and validate Spark reads.
+#[tokio::test]
+async fn test_crossengine_rewrite_manifests() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table_ident = TableIdent::from_strs(["default", "test_rewrite_manifests"]).unwrap();
+    let table = client.load_table(&table_ident).await.unwrap();
+    let pre_snapshot_count = table.metadata().snapshots().count();
+
+    let tx = Transaction::new(&table);
+    let action = tx.rewrite_manifests().rewrite_if_smaller_than(1024 * 1024 * 1024);
+    let tx = action.apply(tx).unwrap();
+    let table_after = tx
+        .commit(client.as_ref())
+        .await
+        .expect("Rewrite manifests should succeed");
+
+    let post_snapshot_count = table_after.metadata().snapshots().count();
+    assert!(
+        post_snapshot_count > pre_snapshot_count,
+        "Rewrite manifests should create a new snapshot"
+    );
+
+    let current_snapshot = table_after
+        .metadata()
+        .current_snapshot()
+        .expect("Rewrite manifests should leave a current snapshot");
+    assert_eq!(
+        current_snapshot.summary().operation,
+        Operation::Replace,
+        "Rewrite manifests snapshot should be a replace operation"
+    );
+
+    // Spark validation: count + distinct + metadata sanity
+    let spark_container = fixture.spark_container_name();
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        "test_rewrite_manifests",
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(3), "Spark count should match");
+
+    let distinct_result = spark_validate_distinct_with_container(
+        &spark_container,
+        "test_rewrite_manifests",
+        "id",
+    )
+    .await
+    .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(3),
+        "Spark distinct count should match"
+    );
+
+    let metadata_result = spark_validate_with_container(
+        &spark_container,
+        "test_rewrite_manifests",
+        ValidationType::Metadata,
+    )
+    .await
+    .expect("Spark metadata validation should succeed");
+    assert!(
+        metadata_result.snapshot_count.unwrap_or(0) > 0,
+        "Spark should report snapshots"
+    );
+    assert!(
+        metadata_result.file_count.unwrap_or(0) > 0,
+        "Spark should report files"
+    );
+    assert!(
+        metadata_result.manifest_count.unwrap_or(0) > 0,
+        "Spark should report manifests"
+    );
+}
+
+/// Test expire snapshots on a Spark-created table.
+///
+/// Setup (by Spark provision.py):
+/// - Table `test_expire_snapshots` with 4 snapshots
+///
+/// Test: Expire snapshots using table properties and validate Spark reads.
+#[tokio::test]
+async fn test_crossengine_expire_snapshots() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table_ident = TableIdent::from_strs(["default", "test_expire_snapshots"]).unwrap();
+    let table = client.load_table(&table_ident).await.unwrap();
+
+    let table = table
+        .update_properties()
+        .set("history.expire.max-snapshot-age-ms", "1")
+        .set("history.expire.min-snapshots-to-keep", "1")
+        .commit(client.as_ref())
+        .await
+        .expect("Updating snapshot retention properties should succeed");
+
+    let pre_snapshot_count = table.metadata().snapshots().count();
+
+    let tx = Transaction::new(&table);
+    let action = tx.expire_snapshots().use_table_properties(true);
+    let tx = action.apply(tx).unwrap();
+    let table_after = tx
+        .commit(client.as_ref())
+        .await
+        .expect("Expire snapshots should succeed");
+
+    let post_snapshot_count = table_after.metadata().snapshots().count();
+    assert!(
+        post_snapshot_count < pre_snapshot_count,
+        "Expire snapshots should remove older snapshots"
+    );
+
+    // Spark validation: count + distinct + metadata sanity
+    let spark_container = fixture.spark_container_name();
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        "test_expire_snapshots",
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(4), "Spark count should match");
+
+    let distinct_result = spark_validate_distinct_with_container(
+        &spark_container,
+        "test_expire_snapshots",
+        "id",
+    )
+    .await
+    .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(4),
+        "Spark distinct count should match"
+    );
+
+    let metadata_result = spark_validate_with_container(
+        &spark_container,
+        "test_expire_snapshots",
+        ValidationType::Metadata,
+    )
+    .await
+    .expect("Spark metadata validation should succeed");
+    assert!(
+        metadata_result.snapshot_count.unwrap_or(0) > 0,
+        "Spark should report snapshots"
+    );
+    assert!(
+        metadata_result.file_count.unwrap_or(0) > 0,
+        "Spark should report files"
+    );
+    assert!(
+        metadata_result.manifest_count.unwrap_or(0) > 0,
+        "Spark should report manifests"
+    );
+}
+
+/// Test remove orphan files on a Spark-created table.
+///
+/// Setup (by Spark provision.py):
+/// - Table `test_remove_orphan_files` with 1 row
+///
+/// Test: Create an orphan file, delete it with Rust, and validate Spark reads.
+#[tokio::test]
+async fn test_crossengine_remove_orphan_files() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table_ident = TableIdent::from_strs(["default", "test_remove_orphan_files"]).unwrap();
+    let table = client.load_table(&table_ident).await.unwrap();
+
+    let table_location = table.metadata().location().trim_end_matches('/').to_string();
+    let orphan_path = format!(
+        "{}/data/orphan-{}.parquet",
+        table_location,
+        Uuid::new_v4()
+    );
+
+    let orphan_file = table.file_io().new_output(&orphan_path).unwrap();
+    orphan_file
+        .write(Bytes::from_static(b"orphan-data"))
+        .await
+        .expect("Writing orphan file should succeed");
+
+    let exists_before = table.file_io().exists(&orphan_path).await.unwrap();
+    assert!(exists_before, "Orphan file should exist before cleanup");
+
+    let result = table
+        .remove_orphan_files()
+        .older_than(Utc::now() + Duration::days(1))
+        .execute()
+        .await
+        .expect("Remove orphan files should succeed");
+
+    assert!(
+        result.orphan_files.iter().any(|f| f.path == orphan_path),
+        "Orphan file should be detected"
+    );
+    assert!(
+        result.total_deleted_files() > 0,
+        "Remove orphan files should delete at least one file"
+    );
+
+    let exists_after = table.file_io().exists(&orphan_path).await.unwrap();
+    assert!(!exists_after, "Orphan file should be removed");
+
+    // Spark validation: count + distinct + metadata sanity
+    let spark_container = fixture.spark_container_name();
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        "test_remove_orphan_files",
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(1), "Spark count should match");
+
+    let distinct_result = spark_validate_distinct_with_container(
+        &spark_container,
+        "test_remove_orphan_files",
+        "id",
+    )
+    .await
+    .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(1),
+        "Spark distinct count should match"
+    );
+
+    let metadata_result = spark_validate_with_container(
+        &spark_container,
+        "test_remove_orphan_files",
+        ValidationType::Metadata,
+    )
+    .await
+    .expect("Spark metadata validation should succeed");
+    assert!(
+        metadata_result.snapshot_count.unwrap_or(0) > 0,
+        "Spark should report snapshots"
+    );
+    assert!(
+        metadata_result.file_count.unwrap_or(0) > 0,
+        "Spark should report files"
+    );
+    assert!(
+        metadata_result.manifest_count.unwrap_or(0) > 0,
+        "Spark should report manifests"
+    );
 }
