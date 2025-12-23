@@ -675,7 +675,7 @@ impl SnapshotProduceOperation for OverwriteOperation {
         &self,
         snapshot_producer: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestEntry>> {
-        let Some(snapshot) = snapshot_producer.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_producer.current_snapshot()? else {
             return Ok(vec![]);
         };
 
@@ -738,7 +738,7 @@ impl SnapshotProduceOperation for OverwriteOperation {
         &self,
         snapshot_producer: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_producer.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_producer.current_snapshot()? else {
             return Ok(vec![]);
         };
 

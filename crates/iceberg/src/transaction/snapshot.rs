@@ -176,6 +176,7 @@ pub(crate) trait ManifestProcess: Send + Sync {
 
 pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
+    target_ref: Option<String>,
     snapshot_id: i64,
     commit_uuid: Uuid,
     key_metadata: Option<Vec<u8>>,
@@ -199,6 +200,7 @@ impl<'a> SnapshotProducer<'a> {
     ) -> Self {
         Self {
             table,
+            target_ref: None,
             snapshot_id: Self::generate_unique_snapshot_id(table),
             commit_uuid,
             key_metadata,
@@ -207,6 +209,22 @@ impl<'a> SnapshotProducer<'a> {
             added_delete_files,
             manifest_counter: (0..),
         }
+    }
+
+    pub(crate) fn with_target_ref(mut self, target_ref: impl Into<String>) -> Self {
+        self.target_ref = Some(target_ref.into());
+        self
+    }
+
+    pub(crate) fn current_snapshot_id(&self) -> Result<Option<i64>> {
+        Ok(self.resolve_target_ref()?.base_snapshot_id)
+    }
+
+    pub(crate) fn current_snapshot(&self) -> Result<Option<&Snapshot>> {
+        Ok(self
+            .current_snapshot_id()?
+            .and_then(|id| self.table.metadata().snapshot_by_id(id))
+            .map(|arc| arc.as_ref()))
     }
 
     /// Validates added data files.
@@ -353,7 +371,7 @@ impl<'a> SnapshotProducer<'a> {
         let mut duplicate_data_files = Vec::new();
         let mut duplicate_delete_files = Vec::new();
 
-        if let Some(current_snapshot) = self.table.metadata().current_snapshot() {
+        if let Some(current_snapshot) = self.current_snapshot()? {
             let manifest_list = current_snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
                 .await?;
@@ -949,6 +967,18 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
+        // Clone target_ref early to avoid borrow conflicts with mutable self borrows later
+        let target_ref = self
+            .target_ref
+            .clone()
+            .unwrap_or_else(|| MAIN_BRANCH.to_string());
+        let TargetRefInfo {
+            base_snapshot_id,
+            expected_snapshot_id,
+            retention,
+            ..
+        } = self.resolve_target_ref()?;
+
         let manifest_list_path = self.generate_manifest_list_file_path(0);
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
@@ -958,14 +988,14 @@ impl<'a> SnapshotProducer<'a> {
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                base_snapshot_id,
             ),
             FormatVersion::V2 => ManifestListWriter::v2(
                 self.table
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                base_snapshot_id,
                 next_seq_num,
             ),
             FormatVersion::V3 => ManifestListWriter::v3(
@@ -973,7 +1003,7 @@ impl<'a> SnapshotProducer<'a> {
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                base_snapshot_id,
                 next_seq_num,
                 Some(first_row_id),
             ),
@@ -998,7 +1028,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
-            .with_parent_snapshot_id(self.table.metadata().current_snapshot_id())
+            .with_parent_snapshot_id(base_snapshot_id)
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
             .with_schema_id(self.table.metadata().current_schema_id())
@@ -1018,11 +1048,8 @@ impl<'a> SnapshotProducer<'a> {
                 snapshot: new_snapshot,
             },
             TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(
-                    self.snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
+                ref_name: target_ref.to_string(),
+                reference: SnapshotReference::new(self.snapshot_id, retention),
             },
         ];
 
@@ -1031,13 +1058,75 @@ impl<'a> SnapshotProducer<'a> {
                 uuid: self.table.metadata().uuid(),
             },
             TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: self.table.metadata().current_snapshot_id(),
+                r#ref: target_ref.to_string(),
+                snapshot_id: expected_snapshot_id,
             },
         ];
 
         Ok(ActionCommit::new(updates, requirements))
     }
+
+    fn resolve_target_ref(&self) -> Result<TargetRefInfo> {
+        let metadata = self.table.metadata();
+        let target_ref = self.target_ref.as_deref().unwrap_or(MAIN_BRANCH);
+
+        if target_ref == MAIN_BRANCH {
+            let retention = metadata
+                .refs()
+                .get(MAIN_BRANCH)
+                .map(|r| {
+                    if !r.is_branch() {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Cannot write to reference '{MAIN_BRANCH}': reference is not a branch",
+                            ),
+                        ));
+                    }
+                    Ok(r.retention.clone())
+                })
+                .transpose()?
+                .unwrap_or_else(|| SnapshotRetention::branch(None, None, None));
+
+            let ref_snapshot_id = metadata.refs().get(MAIN_BRANCH).map(|r| r.snapshot_id);
+            let expected_snapshot_id = ref_snapshot_id.or_else(|| metadata.current_snapshot_id());
+
+            return Ok(TargetRefInfo {
+                base_snapshot_id: expected_snapshot_id,
+                expected_snapshot_id,
+                retention,
+            });
+        }
+
+        if let Some(snapshot_ref) = metadata.refs().get(target_ref) {
+            if !snapshot_ref.is_branch() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot write to reference '{target_ref}': reference is not a branch",
+                    ),
+                ));
+            }
+
+            return Ok(TargetRefInfo {
+                base_snapshot_id: Some(snapshot_ref.snapshot_id),
+                expected_snapshot_id: Some(snapshot_ref.snapshot_id),
+                retention: snapshot_ref.retention.clone(),
+            });
+        }
+
+        Ok(TargetRefInfo {
+            base_snapshot_id: metadata.current_snapshot_id(),
+            expected_snapshot_id: None,
+            retention: SnapshotRetention::branch(None, None, None),
+        })
+    }
+}
+
+struct TargetRefInfo {
+    base_snapshot_id: Option<i64>,
+    expected_snapshot_id: Option<i64>,
+    retention: SnapshotRetention,
 }
 
 #[cfg(test)]

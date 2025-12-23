@@ -562,6 +562,8 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::collections::HashMap;
 
     use minijinja::value::Value;
     use minijinja::{AutoEscape, Environment, context};
@@ -574,7 +576,8 @@ mod tests {
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
         ManifestListWriter, ManifestStatus, ManifestWriterBuilder, PartitionStatisticsFile,
-        StatisticsFile, Struct, TableMetadata,
+        StatisticsFile, Struct, TableMetadata, Snapshot, SnapshotReference, SnapshotRetention,
+        Summary, Operation,
     };
     use crate::table::Table;
 
@@ -816,6 +819,72 @@ mod tests {
         // Critical: current metadata must still exist.
         let current_metadata_path = Path::new(&table_location).join("metadata/v2.json");
         assert!(current_metadata_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_remove_orphan_files_protects_branch_snapshot_files() {
+        let tmp_dir = TempDir::new().unwrap();
+        let (table, table_location) = setup_table_with_current_metadata_and_stats(&tmp_dir).await;
+
+        let mut metadata = (*table.metadata()).clone();
+        let branch_snapshot_id = 9001;
+        let manifest_list_path = format!(
+            "{}/metadata/branch-{}.avro",
+            table_location, branch_snapshot_id
+        );
+
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(branch_snapshot_id)
+            .with_parent_snapshot_id(None)
+            .with_timestamp_ms(metadata.last_updated_ms() + 1)
+            .with_sequence_number(metadata.next_sequence_number())
+            .with_schema_id(metadata.current_schema_id())
+            .with_manifest_list(manifest_list_path)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        metadata
+            .snapshots
+            .insert(branch_snapshot_id, Arc::new(snapshot.clone()));
+        metadata.refs.insert(
+            "branch-1".to_string(),
+            SnapshotReference::new(branch_snapshot_id, SnapshotRetention::branch(None, None, None)),
+        );
+
+        let table = table.with_metadata(Arc::new(metadata));
+        let file_io = table.file_io().clone();
+
+        write_manifest_list_and_manifest(
+            &file_io,
+            &table_location,
+            table.metadata(),
+            &snapshot,
+        )
+        .await;
+
+        let protected_path = format!("{}/data/data-{}.parquet", table_location, branch_snapshot_id);
+
+        let result = table
+            .remove_orphan_files()
+            .dry_run(true)
+            .older_than(Utc::now() + Duration::days(365))
+            .execute()
+            .await
+            .unwrap();
+
+        let orphan_paths: Vec<&str> = result
+            .orphan_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+
+        assert!(
+            !orphan_paths.contains(&protected_path.as_str()),
+            "branch snapshot data files must not be considered orphan"
+        );
     }
 
     #[tokio::test]

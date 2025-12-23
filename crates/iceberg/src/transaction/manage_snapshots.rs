@@ -478,6 +478,473 @@ impl TransactionAction for ManageSnapshotsAction {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CreateBranchAction
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Action for creating a new branch reference.
+///
+/// A branch is a mutable named reference that points to a snapshot. Unlike tags,
+/// branches can be updated to point to new snapshots as data is written.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+///
+/// // Create a branch from the current snapshot
+/// let tx = Transaction::new(&table);
+/// let tx = tx.create_branch()
+///     .name("audit-branch")
+///     .apply(tx)?;
+/// let table = tx.commit(&catalog).await?;
+///
+/// // Create a branch from a specific snapshot
+/// let tx = Transaction::new(&table);
+/// let tx = tx.create_branch()
+///     .name("audit-branch")
+///     .from_snapshot(snapshot_id)
+///     .apply(tx)?;
+/// let table = tx.commit(&catalog).await?;
+/// ```
+#[derive(Debug)]
+pub struct CreateBranchAction {
+    branch_name: Option<String>,
+    snapshot_id: Option<i64>,
+    min_snapshots_to_keep: Option<i32>,
+    max_snapshot_age_ms: Option<i64>,
+    max_ref_age_ms: Option<i64>,
+}
+
+impl CreateBranchAction {
+    /// Create a new CreateBranchAction.
+    pub fn new() -> Self {
+        Self {
+            branch_name: None,
+            snapshot_id: None,
+            min_snapshots_to_keep: None,
+            max_snapshot_age_ms: None,
+            max_ref_age_ms: None,
+        }
+    }
+
+    /// Set the name of the branch to create.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The branch name. Cannot be "main" (use fast-forward instead).
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.branch_name = Some(name.into());
+        self
+    }
+
+    /// Set the snapshot ID the branch should point to.
+    ///
+    /// If not specified, defaults to the current snapshot.
+    #[must_use]
+    pub fn from_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Set the minimum number of snapshots to keep for this branch.
+    #[must_use]
+    pub fn min_snapshots_to_keep(mut self, count: i32) -> Self {
+        self.min_snapshots_to_keep = Some(count);
+        self
+    }
+
+    /// Set the maximum snapshot age for this branch.
+    #[must_use]
+    pub fn max_snapshot_age_ms(mut self, age_ms: i64) -> Self {
+        self.max_snapshot_age_ms = Some(age_ms);
+        self
+    }
+
+    /// Set the maximum ref age for this branch.
+    #[must_use]
+    pub fn max_ref_age_ms(mut self, age_ms: i64) -> Self {
+        self.max_ref_age_ms = Some(age_ms);
+        self
+    }
+}
+
+impl Default for CreateBranchAction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl TransactionAction for CreateBranchAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        let branch_name = self.branch_name.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Branch name is required. Call .name() before applying.",
+            )
+        })?;
+
+        // Cannot create a branch named "main" - it's special
+        if branch_name == MAIN_BRANCH {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot create a branch named 'main'. The main branch is managed automatically.",
+            ));
+        }
+
+        let metadata = table.metadata();
+
+        // Check if ref already exists
+        if metadata.refs().contains_key(branch_name) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Reference '{branch_name}' already exists"),
+            ));
+        }
+
+        // Resolve snapshot ID (default to current snapshot)
+        let snapshot_id = match self.snapshot_id {
+            Some(id) => {
+                // Validate snapshot exists
+                if metadata.snapshot_by_id(id).is_none() {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Snapshot {id} does not exist"),
+                    ));
+                }
+                id
+            }
+            None => metadata.current_snapshot_id().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "No current snapshot. Specify a snapshot ID with .from_snapshot().",
+                )
+            })?,
+        };
+
+        let retention = SnapshotRetention::branch(
+            self.min_snapshots_to_keep,
+            self.max_snapshot_age_ms,
+            self.max_ref_age_ms,
+        );
+
+        let update = TableUpdate::SetSnapshotRef {
+            ref_name: branch_name.clone(),
+            reference: SnapshotReference::new(snapshot_id, retention),
+        };
+
+        let requirements = vec![
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+            // Ensure ref doesn't exist (will fail if created concurrently)
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: branch_name.clone(),
+                snapshot_id: None,
+            },
+        ];
+
+        Ok(ActionCommit::new(vec![update], requirements))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CreateTagAction
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Action for creating a new tag reference.
+///
+/// A tag is an immutable named reference that points to a specific snapshot.
+/// Once created, tags cannot be updated to point to different snapshots.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+///
+/// // Create a tag from the current snapshot
+/// let tx = Transaction::new(&table);
+/// let tx = tx.create_tag()
+///     .name("release-v1.0")
+///     .apply(tx)?;
+/// let table = tx.commit(&catalog).await?;
+///
+/// // Create a tag from a specific snapshot
+/// let tx = Transaction::new(&table);
+/// let tx = tx.create_tag()
+///     .name("release-v1.0")
+///     .from_snapshot(snapshot_id)
+///     .apply(tx)?;
+/// let table = tx.commit(&catalog).await?;
+/// ```
+#[derive(Debug)]
+pub struct CreateTagAction {
+    tag_name: Option<String>,
+    snapshot_id: Option<i64>,
+    max_ref_age_ms: Option<i64>,
+}
+
+impl CreateTagAction {
+    /// Create a new CreateTagAction.
+    pub fn new() -> Self {
+        Self {
+            tag_name: None,
+            snapshot_id: None,
+            max_ref_age_ms: None,
+        }
+    }
+
+    /// Set the name of the tag to create.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.tag_name = Some(name.into());
+        self
+    }
+
+    /// Set the snapshot ID the tag should point to.
+    ///
+    /// If not specified, defaults to the current snapshot.
+    #[must_use]
+    pub fn from_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Set the maximum ref age for this tag.
+    #[must_use]
+    pub fn max_ref_age_ms(mut self, age_ms: i64) -> Self {
+        self.max_ref_age_ms = Some(age_ms);
+        self
+    }
+}
+
+impl Default for CreateTagAction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl TransactionAction for CreateTagAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        let tag_name = self.tag_name.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Tag name is required. Call .name() before applying.",
+            )
+        })?;
+
+        // Cannot create a tag named "main"
+        if tag_name == MAIN_BRANCH {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot create a tag named 'main'. The main branch is a branch, not a tag.",
+            ));
+        }
+
+        let metadata = table.metadata();
+
+        // Check if ref already exists
+        if metadata.refs().contains_key(tag_name) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Reference '{tag_name}' already exists"),
+            ));
+        }
+
+        // Resolve snapshot ID (default to current snapshot)
+        let snapshot_id = match self.snapshot_id {
+            Some(id) => {
+                // Validate snapshot exists
+                if metadata.snapshot_by_id(id).is_none() {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Snapshot {id} does not exist"),
+                    ));
+                }
+                id
+            }
+            None => metadata.current_snapshot_id().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "No current snapshot. Specify a snapshot ID with .from_snapshot().",
+                )
+            })?,
+        };
+
+        let retention = SnapshotRetention::Tag {
+            max_ref_age_ms: self.max_ref_age_ms,
+        };
+
+        let update = TableUpdate::SetSnapshotRef {
+            ref_name: tag_name.clone(),
+            reference: SnapshotReference::new(snapshot_id, retention),
+        };
+
+        let requirements = vec![
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+            // Ensure ref doesn't exist (will fail if created concurrently)
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: tag_name.clone(),
+                snapshot_id: None,
+            },
+        ];
+
+        Ok(ActionCommit::new(vec![update], requirements))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FastForwardAction
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Action for fast-forwarding a branch to match another reference's snapshot.
+///
+/// This is the core operation for Write-Audit-Publish (WAP) workflows:
+/// 1. Create a branch for staging changes
+/// 2. Write and audit data on the branch
+/// 3. Fast-forward main to the branch's snapshot
+///
+/// # Semantics
+///
+/// Fast-forward updates the target branch to point to the same snapshot as
+/// the source reference. Both branches and tags can be used as the source.
+/// The target must be an existing branch (tags are immutable).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+///
+/// // Fast-forward main to match a staging branch
+/// let tx = Transaction::new(&table);
+/// let tx = tx.fast_forward()
+///     .target("main")
+///     .source("staging")
+///     .apply(tx)?;
+/// let table = tx.commit(&catalog).await?;
+/// ```
+#[derive(Debug)]
+pub struct FastForwardAction {
+    target_ref: Option<String>,
+    source_ref: Option<String>,
+}
+
+impl FastForwardAction {
+    /// Create a new FastForwardAction.
+    pub fn new() -> Self {
+        Self {
+            target_ref: None,
+            source_ref: None,
+        }
+    }
+
+    /// Set the target branch to update.
+    ///
+    /// The target must be an existing branch.
+    #[must_use]
+    pub fn target(mut self, ref_name: impl Into<String>) -> Self {
+        self.target_ref = Some(ref_name.into());
+        self
+    }
+
+    /// Set the source reference to fast-forward to.
+    ///
+    /// Can be a branch or tag. The target branch will be updated to point
+    /// to the same snapshot as this reference.
+    #[must_use]
+    pub fn source(mut self, ref_name: impl Into<String>) -> Self {
+        self.source_ref = Some(ref_name.into());
+        self
+    }
+}
+
+impl Default for FastForwardAction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl TransactionAction for FastForwardAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        let target_ref = self.target_ref.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Target ref is required. Call .target() before applying.",
+            )
+        })?;
+
+        let source_ref = self.source_ref.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Source ref is required. Call .source() before applying.",
+            )
+        })?;
+
+        let metadata = table.metadata();
+
+        // Get source reference
+        let source = metadata.refs().get(source_ref).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Source reference '{source_ref}' does not exist"),
+            )
+        })?;
+
+        // Get target reference
+        let target = metadata.refs().get(target_ref).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Target reference '{target_ref}' does not exist"),
+            )
+        })?;
+
+        // Target must be a branch (tags are immutable)
+        if !target.is_branch() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot fast-forward '{target_ref}': target is a tag (tags are immutable)",
+                ),
+            ));
+        }
+
+        // No-op if already pointing to the same snapshot
+        if target.snapshot_id == source.snapshot_id {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+
+        // Preserve target's retention settings
+        let update = TableUpdate::SetSnapshotRef {
+            ref_name: target_ref.clone(),
+            reference: SnapshotReference::new(source.snapshot_id, target.retention.clone()),
+        };
+
+        let requirements = vec![
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+            // Ensure target hasn't changed (optimistic locking)
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: target_ref.clone(),
+                snapshot_id: Some(target.snapshot_id),
+            },
+            // Ensure source hasn't changed
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: source_ref.clone(),
+                snapshot_id: Some(source.snapshot_id),
+            },
+        ];
+
+        Ok(ActionCommit::new(vec![update], requirements))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -733,7 +1200,7 @@ mod tests {
         );
 
         let result = action.commit(&table).await;
-        let err = result.err().expect("Expected error");
+        let err = result.expect_err("Expected error");
         assert!(err.message().contains("not an ancestor"));
     }
 
@@ -854,7 +1321,7 @@ mod tests {
         );
 
         let result = action.commit(&table).await;
-        let err = result.err().expect("Expected error");
+        let err = result.expect_err("Expected error");
         assert!(err.message().contains("No snapshot found before timestamp"));
     }
 
@@ -868,7 +1335,7 @@ mod tests {
         );
 
         let result = action.commit(&table).await;
-        let err = result.err().expect("Expected error");
+        let err = result.expect_err("Expected error");
         assert!(err.message().contains("Snapshot 999 not found"));
     }
 
@@ -878,7 +1345,7 @@ mod tests {
         let action = Arc::new(ManageSnapshotsAction::new());
 
         let result = action.commit(&table).await;
-        let err = result.err().expect("Expected error");
+        let err = result.expect_err("Expected error");
         assert!(err.message().contains("No operation specified"));
     }
 
@@ -987,7 +1454,7 @@ mod tests {
                 .on_branch("tag-1"),
         );
 
-        let err = action.commit(&table).await.err().expect("Expected error");
+        let err = action.commit(&table).await.expect_err("Expected error");
         assert!(err.message().contains("not a branch"));
     }
 }
@@ -998,6 +1465,7 @@ mod integration_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use as_any::Downcast;
     use chrono::DateTime;
 
     use super::*;
@@ -1101,6 +1569,30 @@ mod integration_tests {
             .unwrap()
     }
 
+    /// Create test table with branch: s1 -> s2 -> s3 (main) and s1 -> s4 (not on main)
+    fn create_test_table_with_branch() -> Table {
+        let table = create_test_table_with_chain();
+
+        // Add s4 as a branch from s1
+        let s4 = Snapshot::builder()
+            .with_snapshot_id(4)
+            .with_parent_snapshot_id(Some(1))
+            .with_sequence_number(4)
+            .with_timestamp_ms(2500)
+            .with_manifest_list("s3://bucket/metadata/snap-4.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        // Get mutable access to metadata and add the snapshot
+        let mut metadata = (*table.metadata()).clone();
+        metadata.snapshots.insert(4, Arc::new(s4));
+
+        table.with_metadata(Arc::new(metadata))
+    }
+
     /// Create a table with the ref updated to the new snapshot ID (simulating catalog commit).
     fn create_updated_table(original: &Table, new_snapshot_id: i64) -> Table {
         let mut metadata = (*original.metadata()).clone();
@@ -1149,7 +1641,10 @@ mod integration_tests {
 
         // Commit through the catalog
         let result = tx.commit(&mock_catalog).await;
-        assert!(result.is_ok(), "Transaction commit should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Transaction commit should succeed: {result:?}"
+        );
 
         let updated_table = result.unwrap();
         // The mock catalog returns the updated table with snapshot 2 as current
@@ -1172,7 +1667,10 @@ mod integration_tests {
         let tx = action.apply(tx).unwrap();
 
         let result = tx.commit(&mock_catalog).await;
-        assert!(result.is_ok(), "Transaction commit should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Transaction commit should succeed: {result:?}"
+        );
 
         let updated_table = result.unwrap();
         let main_ref = updated_table.metadata().refs().get(MAIN_BRANCH).unwrap();
@@ -1189,7 +1687,10 @@ mod integration_tests {
         let tx = action.apply(tx).unwrap();
 
         let result = tx.commit(&mock_catalog).await;
-        assert!(result.is_ok(), "Transaction commit should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Transaction commit should succeed: {result:?}"
+        );
 
         let updated_table = result.unwrap();
         let main_ref = updated_table.metadata().refs().get(MAIN_BRANCH).unwrap();
@@ -1278,7 +1779,10 @@ mod integration_tests {
         let tx = action.apply(tx).unwrap();
 
         let result = tx.commit(&mock_catalog).await;
-        assert!(result.is_ok(), "Transaction commit should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Transaction commit should succeed: {result:?}"
+        );
 
         let updated_table = result.unwrap();
         let feature_ref = updated_table.metadata().refs().get("feature").unwrap();
@@ -1307,5 +1811,438 @@ mod integration_tests {
         // without calling update_table
         let result = tx.commit(&mock_catalog).await;
         assert!(result.is_ok(), "No-op commit should succeed: {result:?}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CreateBranchAction Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_create_branch_action_builder() {
+        let action = CreateBranchAction::new()
+            .name("staging")
+            .from_snapshot(1)
+            .min_snapshots_to_keep(10)
+            .max_snapshot_age_ms(86400000)
+            .max_ref_age_ms(604800000);
+
+        assert_eq!(action.branch_name, Some("staging".to_string()));
+        assert_eq!(action.snapshot_id, Some(1));
+        assert_eq!(action.min_snapshots_to_keep, Some(10));
+        assert_eq!(action.max_snapshot_age_ms, Some(86400000));
+        assert_eq!(action.max_ref_age_ms, Some(604800000));
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_from_current_snapshot() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateBranchAction::new().name("staging"));
+
+        let result = action.commit(&table).await;
+        assert!(result.is_ok());
+
+        let mut commit = result.unwrap();
+        let updates = commit.take_updates();
+        let requirements = commit.take_requirements();
+
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            TableUpdate::SetSnapshotRef {
+                ref_name,
+                reference,
+            } => {
+                assert_eq!(ref_name, "staging");
+                assert_eq!(reference.snapshot_id, 3); // Current snapshot
+                assert!(reference.is_branch());
+            }
+            _ => panic!("Expected SetSnapshotRef update"),
+        }
+
+        assert_eq!(requirements.len(), 2);
+        assert!(matches!(
+            requirements[0],
+            TableRequirement::UuidMatch { .. }
+        ));
+        assert_eq!(requirements[1], TableRequirement::RefSnapshotIdMatch {
+            r#ref: "staging".to_string(),
+            snapshot_id: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_from_specific_snapshot() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateBranchAction::new().name("staging").from_snapshot(2));
+
+        let result = action.commit(&table).await;
+        assert!(result.is_ok());
+
+        let mut commit = result.unwrap();
+        let updates = commit.take_updates();
+
+        match &updates[0] {
+            TableUpdate::SetSnapshotRef { reference, .. } => {
+                assert_eq!(reference.snapshot_id, 2);
+            }
+            _ => panic!("Expected SetSnapshotRef update"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_name_required() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateBranchAction::new().from_snapshot(1));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("Branch name is required"));
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_cannot_use_main() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateBranchAction::new().name("main"));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("Cannot create a branch named 'main'"));
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_already_exists() {
+        let table = create_test_table_with_chain();
+
+        // Add an existing branch
+        let mut metadata = (*table.metadata()).clone();
+        metadata.refs.insert(
+            "staging".to_string(),
+            SnapshotReference::new(2, SnapshotRetention::branch(None, None, None)),
+        );
+        let table = table.with_metadata(Arc::new(metadata));
+
+        let action = Arc::new(CreateBranchAction::new().name("staging"));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_snapshot_not_found() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateBranchAction::new().name("staging").from_snapshot(999));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("Snapshot 999 does not exist"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CreateTagAction Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_create_tag_action_builder() {
+        let action = CreateTagAction::new()
+            .name("release-v1.0")
+            .from_snapshot(1)
+            .max_ref_age_ms(604800000);
+
+        assert_eq!(action.tag_name, Some("release-v1.0".to_string()));
+        assert_eq!(action.snapshot_id, Some(1));
+        assert_eq!(action.max_ref_age_ms, Some(604800000));
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_from_current_snapshot() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateTagAction::new().name("release-v1.0"));
+
+        let result = action.commit(&table).await;
+        assert!(result.is_ok());
+
+        let mut commit = result.unwrap();
+        let updates = commit.take_updates();
+
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            TableUpdate::SetSnapshotRef {
+                ref_name,
+                reference,
+            } => {
+                assert_eq!(ref_name, "release-v1.0");
+                assert_eq!(reference.snapshot_id, 3); // Current snapshot
+                assert!(!reference.is_branch()); // Tags are not branches
+            }
+            _ => panic!("Expected SetSnapshotRef update"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_from_specific_snapshot() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateTagAction::new().name("release-v1.0").from_snapshot(1));
+
+        let result = action.commit(&table).await;
+        assert!(result.is_ok());
+
+        let mut commit = result.unwrap();
+        let updates = commit.take_updates();
+
+        match &updates[0] {
+            TableUpdate::SetSnapshotRef { reference, .. } => {
+                assert_eq!(reference.snapshot_id, 1);
+            }
+            _ => panic!("Expected SetSnapshotRef update"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_name_required() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateTagAction::new().from_snapshot(1));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("Tag name is required"));
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_cannot_use_main() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(CreateTagAction::new().name("main"));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("Cannot create a tag named 'main'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // FastForwardAction Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fast_forward_action_builder() {
+        let action = FastForwardAction::new().target("main").source("staging");
+
+        assert_eq!(action.target_ref, Some("main".to_string()));
+        assert_eq!(action.source_ref, Some("staging".to_string()));
+    }
+
+    /// Create a table with main at s3 and staging at s4
+    fn create_test_table_with_staging_branch() -> Table {
+        let table = create_test_table_with_branch();
+
+        // Add staging branch pointing to s4
+        let mut metadata = (*table.metadata()).clone();
+        metadata.refs.insert(
+            "staging".to_string(),
+            SnapshotReference::new(4, SnapshotRetention::branch(None, None, None)),
+        );
+        table.with_metadata(Arc::new(metadata))
+    }
+
+    #[tokio::test]
+    async fn test_fast_forward_main_to_staging() {
+        let table = create_test_table_with_staging_branch();
+        let action = Arc::new(FastForwardAction::new().target("main").source("staging"));
+
+        let result = action.commit(&table).await;
+        assert!(result.is_ok());
+
+        let mut commit = result.unwrap();
+        let updates = commit.take_updates();
+        let requirements = commit.take_requirements();
+
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            TableUpdate::SetSnapshotRef {
+                ref_name,
+                reference,
+            } => {
+                assert_eq!(ref_name, "main");
+                assert_eq!(reference.snapshot_id, 4); // Now points to staging's snapshot
+                assert!(reference.is_branch());
+            }
+            _ => panic!("Expected SetSnapshotRef update"),
+        }
+
+        // Should have optimistic locking requirements
+        assert_eq!(requirements.len(), 3);
+        assert!(matches!(
+            requirements[0],
+            TableRequirement::UuidMatch { .. }
+        ));
+        // Target ref should match original snapshot
+        assert_eq!(requirements[1], TableRequirement::RefSnapshotIdMatch {
+            r#ref: "main".to_string(),
+            snapshot_id: Some(3),
+        });
+        // Source ref should match current snapshot
+        assert_eq!(requirements[2], TableRequirement::RefSnapshotIdMatch {
+            r#ref: "staging".to_string(),
+            snapshot_id: Some(4),
+        });
+    }
+
+    #[tokio::test]
+    async fn test_fast_forward_noop_when_same_snapshot() {
+        let table = create_test_table_with_chain();
+
+        // Add staging branch pointing to same snapshot as main (3)
+        let mut metadata = (*table.metadata()).clone();
+        metadata.refs.insert(
+            "staging".to_string(),
+            SnapshotReference::new(3, SnapshotRetention::branch(None, None, None)),
+        );
+        let table = table.with_metadata(Arc::new(metadata));
+
+        let action = Arc::new(FastForwardAction::new().target("main").source("staging"));
+
+        let result = action.commit(&table).await;
+        assert!(result.is_ok());
+
+        let mut commit = result.unwrap();
+        // Should be a no-op
+        assert!(commit.take_updates().is_empty());
+        assert!(commit.take_requirements().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fast_forward_target_required() {
+        let table = create_test_table_with_staging_branch();
+        let action = Arc::new(FastForwardAction::new().source("staging"));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("Target ref is required"));
+    }
+
+    #[tokio::test]
+    async fn test_fast_forward_source_required() {
+        let table = create_test_table_with_staging_branch();
+        let action = Arc::new(FastForwardAction::new().target("main"));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("Source ref is required"));
+    }
+
+    #[tokio::test]
+    async fn test_fast_forward_target_not_found() {
+        let table = create_test_table_with_staging_branch();
+        let action = Arc::new(FastForwardAction::new().target("nonexistent").source("staging"));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_fast_forward_source_not_found() {
+        let table = create_test_table_with_chain();
+        let action = Arc::new(FastForwardAction::new().target("main").source("nonexistent"));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_fast_forward_cannot_update_tag() {
+        let table = create_test_table_with_chain();
+
+        // Add a tag
+        let mut metadata = (*table.metadata()).clone();
+        metadata.refs.insert(
+            "release-v1.0".to_string(),
+            SnapshotReference::new(2, SnapshotRetention::Tag { max_ref_age_ms: None }),
+        );
+        metadata.refs.insert(
+            "staging".to_string(),
+            SnapshotReference::new(3, SnapshotRetention::branch(None, None, None)),
+        );
+        let table = table.with_metadata(Arc::new(metadata));
+
+        let action = Arc::new(FastForwardAction::new().target("release-v1.0").source("staging"));
+
+        let result = action.commit(&table).await;
+        let err = result.expect_err("Expected error");
+        assert!(err.message().contains("tags are immutable"));
+    }
+
+    #[tokio::test]
+    async fn test_fast_forward_from_tag_to_branch() {
+        let table = create_test_table_with_chain();
+
+        // Add a tag and an additional branch
+        let mut metadata = (*table.metadata()).clone();
+        metadata.refs.insert(
+            "release-v1.0".to_string(),
+            SnapshotReference::new(2, SnapshotRetention::Tag { max_ref_age_ms: None }),
+        );
+        metadata.refs.insert(
+            "target-branch".to_string(),
+            SnapshotReference::new(3, SnapshotRetention::branch(None, None, None)),
+        );
+        let table = table.with_metadata(Arc::new(metadata));
+
+        // Fast-forward branch to tag's snapshot (should work - tags can be source)
+        let action = Arc::new(FastForwardAction::new().target("target-branch").source("release-v1.0"));
+
+        let result = action.commit(&table).await;
+        assert!(result.is_ok());
+
+        let mut commit = result.unwrap();
+        let updates = commit.take_updates();
+
+        match &updates[0] {
+            TableUpdate::SetSnapshotRef { reference, .. } => {
+                assert_eq!(reference.snapshot_id, 2); // Tag's snapshot
+            }
+            _ => panic!("Expected SetSnapshotRef update"),
+        }
+    }
+
+    #[test]
+    fn test_apply_create_branch_to_transaction() {
+        let table = create_test_table_with_chain();
+        let tx = Transaction::new(&table);
+
+        let action = tx.create_branch().name("staging");
+        let tx = action.apply(tx).unwrap();
+
+        assert_eq!(tx.actions.len(), 1);
+        (*tx.actions[0])
+            .downcast_ref::<CreateBranchAction>()
+            .expect("Action should be CreateBranchAction");
+    }
+
+    #[test]
+    fn test_apply_create_tag_to_transaction() {
+        let table = create_test_table_with_chain();
+        let tx = Transaction::new(&table);
+
+        let action = tx.create_tag().name("release-v1.0");
+        let tx = action.apply(tx).unwrap();
+
+        assert_eq!(tx.actions.len(), 1);
+        (*tx.actions[0])
+            .downcast_ref::<CreateTagAction>()
+            .expect("Action should be CreateTagAction");
+    }
+
+    #[test]
+    fn test_apply_fast_forward_to_transaction() {
+        let table = create_test_table_with_chain();
+        let tx = Transaction::new(&table);
+
+        let action = tx.fast_forward().target("main").source("staging");
+        let tx = action.apply(tx).unwrap();
+
+        assert_eq!(tx.actions.len(), 1);
+        (*tx.actions[0])
+            .downcast_ref::<FastForwardAction>()
+            .expect("Action should be FastForwardAction");
     }
 }

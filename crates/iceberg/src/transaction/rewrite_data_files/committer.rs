@@ -679,7 +679,7 @@ impl SnapshotProduceOperation for ReplaceDataFilesOperation {
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
         // Get all manifests from current snapshot
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.current_snapshot()? else {
             return Ok(vec![]);
         };
 
