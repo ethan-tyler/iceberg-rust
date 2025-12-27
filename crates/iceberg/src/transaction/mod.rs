@@ -78,14 +78,17 @@ pub use rewrite_data_files::{
 };
 pub use rewrite_manifests::{
     DEFAULT_MAX_ENTRIES_IN_MEMORY, DEFAULT_TARGET_MANIFEST_SIZE_BYTES, ManifestPredicate,
-    RewriteManifestsAction,
-    RewriteManifestsOptions, RewriteManifestsPlanner, RewriteManifestsResult,
+    RewriteManifestsAction, RewriteManifestsOptions, RewriteManifestsPlanner,
+    RewriteManifestsResult,
 };
 // Internal-only exports for rewrite_manifests implementation (used by action commit)
 #[allow(unused_imports)]
 pub(crate) use rewrite_manifests::{ManifestRewriter, generate_manifest_path};
 pub use row_delta::RowDeltaAction;
+pub use update_schema::UpdateSchemaAction;
 mod append;
+#[cfg(test)]
+mod concurrent;
 mod delete;
 mod evolve_partition;
 pub mod expire_snapshots;
@@ -99,10 +102,9 @@ pub mod rewrite_manifests;
 mod row_delta;
 mod snapshot;
 mod sort_order;
-#[cfg(test)]
-mod concurrent;
 mod update_location;
 mod update_properties;
+mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
 
@@ -180,6 +182,11 @@ impl Transaction {
     /// Update table's property.
     pub fn update_table_properties(&self) -> UpdatePropertiesAction {
         UpdatePropertiesAction::new()
+    }
+
+    /// Update table schema.
+    pub fn update_schema(&self) -> UpdateSchemaAction {
+        UpdateSchemaAction::new()
     }
 
     /// Creates a fast append action.

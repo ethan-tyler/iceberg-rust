@@ -166,7 +166,8 @@ impl IcebergTableProvider {
         }
 
         let current_schema = Arc::new(
-            schema_to_arrow_schema(table.metadata().current_schema()).map_err(to_datafusion_error)?,
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(to_datafusion_error)?,
         );
 
         // Capture baseline snapshot ID for concurrency validation
@@ -462,7 +463,8 @@ impl TableProvider for IcebergTableProvider {
         let baseline_snapshot_id = table.metadata().current_snapshot_id();
 
         let current_schema = Arc::new(
-            schema_to_arrow_schema(table.metadata().current_schema()).map_err(to_datafusion_error)?,
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(to_datafusion_error)?,
         );
 
         // Step 1: Scan for rows to delete

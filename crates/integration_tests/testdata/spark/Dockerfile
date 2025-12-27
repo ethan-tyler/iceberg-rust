@@ -48,6 +48,9 @@ ENV PATH="/opt/spark/sbin:/opt/spark/bin:${PATH}"
 RUN chmod u+x /opt/spark/sbin/* && \
     chmod u+x /opt/spark/bin/*
 
+# Install PyArrow for equality delete file creation
+RUN pip install pyarrow
+
 WORKDIR '/home/'
 
 COPY entrypoint.sh .

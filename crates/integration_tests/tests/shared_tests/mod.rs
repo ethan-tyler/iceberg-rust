@@ -32,6 +32,8 @@ mod partition_evolution_crossengine;
 mod read_evolved_schema;
 mod read_positional_deletes;
 mod scan_all_type;
+mod schema_evolution_crossengine;
+mod semantic_parity_test;
 
 pub async fn random_ns() -> Namespace {
     let fixture = get_shared_containers();

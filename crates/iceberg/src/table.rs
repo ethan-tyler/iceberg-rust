@@ -27,7 +27,7 @@ use crate::arrow::ArrowReaderBuilder;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::{CacheStats, ObjectCache, ObjectCacheConfig};
-use crate::scan::TableScanBuilder;
+use crate::scan::{IncrementalScanBuilder, TableScanBuilder};
 use crate::spec::{DataFile, SchemaRef, TableMetadata, TableMetadataRef};
 use crate::transaction::{
     ApplyTransactionAction, CreateBranchAction, CreateTagAction, FastForwardAction,
@@ -308,6 +308,36 @@ impl Table {
     /// Creates a table scan.
     pub fn scan(&self) -> TableScanBuilder<'_> {
         TableScanBuilder::new(self)
+    }
+
+    /// Creates an incremental scan to get changes between two snapshots.
+    ///
+    /// This is useful for Change Data Capture (CDC) use cases where you need to
+    /// identify which files were added or removed between snapshots.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_snapshot_id` - The starting snapshot (exclusive)
+    /// * `to_snapshot_id` - The ending snapshot (inclusive)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let changes = table.incremental_scan(from_snapshot_id, to_snapshot_id)
+    ///     .build()?
+    ///     .changes()
+    ///     .await?;
+    ///
+    /// for file in changes.added_data_files() {
+    ///     println!("Added: {}", file.file_path());
+    /// }
+    /// ```
+    pub fn incremental_scan(
+        &self,
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+    ) -> IncrementalScanBuilder<'_> {
+        IncrementalScanBuilder::new(self, from_snapshot_id, to_snapshot_id)
     }
 
     /// Creates a metadata table which provides table-like APIs for inspecting metadata.
@@ -1276,10 +1306,13 @@ mod tests {
         });
 
         let update_table = table.clone();
-        mock_catalog.expect_update_table().times(1).returning_st(move |commit| {
-            let t = update_table.clone();
-            Box::pin(async move { commit.apply(t) })
-        });
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(move |commit| {
+                let t = update_table.clone();
+                Box::pin(async move { commit.apply(t) })
+            });
 
         let updated = table
             .create_branch("audit")
@@ -1322,10 +1355,13 @@ mod tests {
         });
 
         let update_table = table.clone();
-        mock_catalog.expect_update_table().times(1).returning_st(move |commit| {
-            let t = update_table.clone();
-            Box::pin(async move { commit.apply(t) })
-        });
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(move |commit| {
+                let t = update_table.clone();
+                Box::pin(async move { commit.apply(t) })
+            });
 
         let updated = table
             .write_to_branch("staging")
@@ -1335,10 +1371,12 @@ mod tests {
             .unwrap();
 
         let branch_ref = updated.metadata().refs().get("staging").unwrap();
-        assert!(updated
-            .metadata()
-            .snapshot_by_id(branch_ref.snapshot_id)
-            .is_some());
+        assert!(
+            updated
+                .metadata()
+                .snapshot_by_id(branch_ref.snapshot_id)
+                .is_some()
+        );
         assert!(updated.metadata().current_snapshot_id().is_none());
     }
 

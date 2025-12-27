@@ -558,12 +558,12 @@ fn ensure_trailing_slash(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
     use std::sync::Arc;
-    use std::collections::HashMap;
 
     use minijinja::value::Value;
     use minijinja::{AutoEscape, Environment, context};
@@ -575,9 +575,9 @@ mod tests {
     use crate::io::FileIO;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
-        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, PartitionStatisticsFile,
-        StatisticsFile, Struct, TableMetadata, Snapshot, SnapshotReference, SnapshotRetention,
-        Summary, Operation,
+        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Operation,
+        PartitionStatisticsFile, Snapshot, SnapshotReference, SnapshotRetention, StatisticsFile,
+        Struct, Summary, TableMetadata,
     };
     use crate::table::Table;
 
@@ -851,21 +851,22 @@ mod tests {
             .insert(branch_snapshot_id, Arc::new(snapshot.clone()));
         metadata.refs.insert(
             "branch-1".to_string(),
-            SnapshotReference::new(branch_snapshot_id, SnapshotRetention::branch(None, None, None)),
+            SnapshotReference::new(
+                branch_snapshot_id,
+                SnapshotRetention::branch(None, None, None),
+            ),
         );
 
         let table = table.with_metadata(Arc::new(metadata));
         let file_io = table.file_io().clone();
 
-        write_manifest_list_and_manifest(
-            &file_io,
-            &table_location,
-            table.metadata(),
-            &snapshot,
-        )
-        .await;
+        write_manifest_list_and_manifest(&file_io, &table_location, table.metadata(), &snapshot)
+            .await;
 
-        let protected_path = format!("{}/data/data-{}.parquet", table_location, branch_snapshot_id);
+        let protected_path = format!(
+            "{}/data/data-{}.parquet",
+            table_location, branch_snapshot_id
+        );
 
         let result = table
             .remove_orphan_files()

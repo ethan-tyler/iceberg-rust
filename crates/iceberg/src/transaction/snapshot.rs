@@ -1102,9 +1102,7 @@ impl<'a> SnapshotProducer<'a> {
             if !snapshot_ref.is_branch() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot write to reference '{target_ref}': reference is not a branch",
-                    ),
+                    format!("Cannot write to reference '{target_ref}': reference is not a branch",),
                 ));
             }
 

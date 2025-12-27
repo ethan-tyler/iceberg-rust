@@ -43,6 +43,10 @@ impl DockerCompose {
         self.project_name.as_str()
     }
 
+    pub fn container_name(&self, service_name: impl AsRef<str>) -> String {
+        format!("{}-{}-1", self.project_name, service_name.as_ref())
+    }
+
     fn get_os_arch() -> String {
         let mut cmd = Command::new("docker");
         cmd.arg("info")
@@ -137,7 +141,7 @@ impl DockerCompose {
     }
 
     pub fn get_container_ip(&self, service_name: impl AsRef<str>) -> IpAddr {
-        let container_name = format!("{}-{}-1", self.project_name, service_name.as_ref());
+        let container_name = self.container_name(service_name);
         let mut cmd = Command::new("docker");
         cmd.arg("inspect")
             .arg("-f")

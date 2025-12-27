@@ -47,9 +47,10 @@
 //! # Limitations
 //!
 //! - Only primitive column types (nested types not supported)
-//! - Only filterable columns (partition columns or columns with statistics)
+//! - Only partition columns today; stats-based columns are not yet wired for pushdown
 //! - Single dynamic filter per scan (first valid one is accepted)
 //! - IN-list limited to 1000 items
+//! - Dynamic filters are assumed to monotonically tighten; widening filters are not supported for pruning
 //! - **Safe-subset conversion**: dynamic filters that contain non-column expressions (for example
 //!   `CaseExpr`/hash-routing produced by partitioned hash joins) are intentionally not converted;
 //!   the scan falls back to **no additional pruning** rather than risking incorrect results.

@@ -94,6 +94,119 @@ pub struct SnapshotInfo {
     pub operation: Option<String>,
 }
 
+/// Detailed snapshot summary fields for semantic parity comparison.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotSummaryResult {
+    /// Error message if extraction failed
+    pub error: Option<String>,
+
+    /// Snapshot ID
+    pub snapshot_id: Option<i64>,
+
+    /// Parent snapshot ID
+    pub parent_id: Option<i64>,
+
+    /// Operation type (append, overwrite, delete, etc.)
+    pub operation: Option<String>,
+
+    /// Commit timestamp
+    pub committed_at: Option<String>,
+
+    /// Summary fields
+    pub summary: Option<SnapshotSummaryFields>,
+}
+
+/// Snapshot summary fields for parity comparison.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SnapshotSummaryFields {
+    // Core counts
+    #[serde(rename = "added-data-files")]
+    pub added_data_files: Option<String>,
+    #[serde(rename = "deleted-data-files")]
+    pub deleted_data_files: Option<String>,
+    #[serde(rename = "added-records")]
+    pub added_records: Option<String>,
+    #[serde(rename = "deleted-records")]
+    pub deleted_records: Option<String>,
+    #[serde(rename = "added-files-size")]
+    pub added_files_size: Option<String>,
+    #[serde(rename = "removed-files-size")]
+    pub removed_files_size: Option<String>,
+
+    // Delete file counts
+    #[serde(rename = "added-delete-files")]
+    pub added_delete_files: Option<String>,
+    #[serde(rename = "removed-delete-files")]
+    pub removed_delete_files: Option<String>,
+    #[serde(rename = "added-position-deletes")]
+    pub added_position_deletes: Option<String>,
+    #[serde(rename = "removed-position-deletes")]
+    pub removed_position_deletes: Option<String>,
+    #[serde(rename = "added-equality-deletes")]
+    pub added_equality_deletes: Option<String>,
+    #[serde(rename = "removed-equality-deletes")]
+    pub removed_equality_deletes: Option<String>,
+
+    // Totals
+    #[serde(rename = "total-data-files")]
+    pub total_data_files: Option<String>,
+    #[serde(rename = "total-delete-files")]
+    pub total_delete_files: Option<String>,
+    #[serde(rename = "total-records")]
+    pub total_records: Option<String>,
+    #[serde(rename = "total-files-size")]
+    pub total_files_size: Option<String>,
+    #[serde(rename = "total-position-deletes")]
+    pub total_position_deletes: Option<String>,
+    #[serde(rename = "total-equality-deletes")]
+    pub total_equality_deletes: Option<String>,
+
+    // Partition info
+    #[serde(rename = "changed-partition-count")]
+    pub changed_partition_count: Option<String>,
+
+    // Raw summary for additional fields
+    pub raw: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Manifest entries result for structure comparison.
+#[derive(Debug, Deserialize)]
+pub struct ManifestEntriesResult {
+    /// Error message if extraction failed
+    pub error: Option<String>,
+
+    /// Total entry count
+    pub entry_count: Option<i64>,
+
+    /// Sample of entries
+    pub entries: Option<Vec<ManifestEntryInfo>>,
+}
+
+/// Individual manifest entry info.
+#[derive(Debug, Deserialize)]
+pub struct ManifestEntryInfo {
+    pub status: Option<i32>,
+    pub snapshot_id: Option<i64>,
+    pub sequence_number: Option<i64>,
+    pub file_sequence_number: Option<i64>,
+    pub manifest_path: Option<String>,
+    pub manifest_pos: Option<i64>,
+    pub partition_spec_id: Option<i32>,
+    pub spec_id: Option<i32>,
+    pub data_file: Option<DataFileInfo>,
+}
+
+/// Data file info from manifest entry.
+#[derive(Debug, Deserialize)]
+pub struct DataFileInfo {
+    pub content: Option<i32>,
+    pub file_path: Option<String>,
+    pub file_format: Option<String>,
+    pub partition: Option<serde_json::Value>,
+    pub record_count: Option<i64>,
+    pub file_size_in_bytes: Option<i64>,
+}
+
 /// Type of validation to perform.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationType {
@@ -393,4 +506,215 @@ pub async fn spark_validate_distinct_with_container(
     let output = run_spark_submit(container_name, args).await?;
 
     parse_validation_result(output, "Spark distinct validation failed")
+}
+
+/// Extract detailed snapshot summary for semantic parity comparison.
+///
+/// # Arguments
+///
+/// * `table_name` - Name of the table in the default namespace
+/// * `snapshot_id` - Optional specific snapshot ID to query (defaults to current)
+pub async fn spark_snapshot_summary(
+    table_name: &str,
+    snapshot_id: Option<i64>,
+) -> Result<SnapshotSummaryResult, SparkValidationError> {
+    let container_name = get_spark_container_name()?;
+    spark_snapshot_summary_with_container(&container_name, table_name, snapshot_id).await
+}
+
+/// Extract detailed snapshot summary using an explicit container name.
+pub async fn spark_snapshot_summary_with_container(
+    container_name: &str,
+    table_name: &str,
+    snapshot_id: Option<i64>,
+) -> Result<SnapshotSummaryResult, SparkValidationError> {
+    let extra_args = match snapshot_id {
+        Some(id) => vec![id.to_string()],
+        None => vec![],
+    };
+    let args = spark_submit_args(container_name, table_name, "snapshot_summary", &extra_args);
+    let output = run_spark_submit(container_name, args).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(SparkValidationError {
+            message: format!("spark-submit failed.\nstdout: {stdout}\nstderr: {stderr}"),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_snapshot_summary_output(&stdout)
+}
+
+fn parse_snapshot_summary_output(stdout: &str) -> Result<SnapshotSummaryResult, SparkValidationError> {
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+
+        if let Ok(result) = serde_json::from_str::<SnapshotSummaryResult>(trimmed) {
+            if let Some(ref error) = result.error {
+                return Err(SparkValidationError {
+                    message: format!("Spark snapshot summary failed: {error}"),
+                });
+            }
+            return Ok(result);
+        }
+    }
+
+    Err(SparkValidationError {
+        message: format!("No JSON output found in Spark output: {stdout}"),
+    })
+}
+
+/// Extract manifest entries for structure comparison.
+///
+/// # Arguments
+///
+/// * `table_name` - Name of the table in the default namespace
+/// * `limit` - Maximum number of entries to return
+pub async fn spark_manifest_entries(
+    table_name: &str,
+    limit: Option<i64>,
+) -> Result<ManifestEntriesResult, SparkValidationError> {
+    let container_name = get_spark_container_name()?;
+    spark_manifest_entries_with_container(&container_name, table_name, limit).await
+}
+
+/// Extract manifest entries using an explicit container name.
+pub async fn spark_manifest_entries_with_container(
+    container_name: &str,
+    table_name: &str,
+    limit: Option<i64>,
+) -> Result<ManifestEntriesResult, SparkValidationError> {
+    let extra_args = match limit {
+        Some(l) => vec![l.to_string()],
+        None => vec![],
+    };
+    let args = spark_submit_args(container_name, table_name, "manifest_entries", &extra_args);
+    let output = run_spark_submit(container_name, args).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(SparkValidationError {
+            message: format!("spark-submit failed.\nstdout: {stdout}\nstderr: {stderr}"),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_manifest_entries_output(&stdout)
+}
+
+fn parse_manifest_entries_output(stdout: &str) -> Result<ManifestEntriesResult, SparkValidationError> {
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+
+        if let Ok(result) = serde_json::from_str::<ManifestEntriesResult>(trimmed) {
+            if let Some(ref error) = result.error {
+                return Err(SparkValidationError {
+                    message: format!("Spark manifest entries failed: {error}"),
+                });
+            }
+            return Ok(result);
+        }
+    }
+
+    Err(SparkValidationError {
+        message: format!("No JSON output found in Spark output: {stdout}"),
+    })
+}
+
+/// Execute a DML operation via Spark and return the resulting snapshot summary.
+///
+/// This enables semantic parity testing by running the same DML operation
+/// via both Rust and Spark, then comparing the resulting metadata.
+///
+/// # Arguments
+///
+/// * `table_name` - Name of the table in the default namespace
+/// * `dml_type` - Type of DML operation ("delete" or "update")
+/// * `predicate` - Optional WHERE clause predicate
+/// * `update_values` - Optional SET clause for updates (e.g., "status='done'")
+pub async fn spark_execute_dml(
+    table_name: &str,
+    dml_type: &str,
+    predicate: Option<&str>,
+    update_values: Option<&str>,
+) -> Result<SnapshotSummaryResult, SparkValidationError> {
+    let container_name = get_spark_container_name()?;
+    spark_execute_dml_with_container(&container_name, table_name, dml_type, predicate, update_values).await
+}
+
+/// Execute a DML operation via Spark using an explicit container name.
+pub async fn spark_execute_dml_with_container(
+    container_name: &str,
+    table_name: &str,
+    dml_type: &str,
+    predicate: Option<&str>,
+    update_values: Option<&str>,
+) -> Result<SnapshotSummaryResult, SparkValidationError> {
+    let mut extra_args = vec![dml_type.to_string()];
+    if let Some(pred) = predicate {
+        extra_args.push(pred.to_string());
+    }
+    if let Some(vals) = update_values {
+        // Ensure predicate is present (even if empty) when update_values is provided
+        if predicate.is_none() {
+            extra_args.push(String::new());
+        }
+        extra_args.push(vals.to_string());
+    }
+
+    let args = spark_submit_args(container_name, table_name, "spark_dml", &extra_args);
+    let output = run_spark_submit(container_name, args).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(SparkValidationError {
+            message: format!("spark-submit failed.\nstdout: {stdout}\nstderr: {stderr}"),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_snapshot_summary_output(&stdout)
+}
+
+/// Execute one or more SQL statements via Spark and return the resulting snapshot summary.
+///
+/// This supports multi-statement SQL separated by ';' and allows `{table}` placeholders.
+pub async fn spark_execute_sql(
+    table_name: &str,
+    sql_template: &str,
+) -> Result<SnapshotSummaryResult, SparkValidationError> {
+    let container_name = get_spark_container_name()?;
+    spark_execute_sql_with_container(&container_name, table_name, sql_template).await
+}
+
+/// Execute SQL via Spark using an explicit container name.
+pub async fn spark_execute_sql_with_container(
+    container_name: &str,
+    table_name: &str,
+    sql_template: &str,
+) -> Result<SnapshotSummaryResult, SparkValidationError> {
+    let extra_args = vec![sql_template.to_string()];
+    let args = spark_submit_args(container_name, table_name, "execute_sql", &extra_args);
+    let output = run_spark_submit(container_name, args).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(SparkValidationError {
+            message: format!("spark-submit failed.\nstdout: {stdout}\nstderr: {stderr}"),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_snapshot_summary_output(&stdout)
 }

@@ -1078,6 +1078,7 @@ mod tests {
     #[tokio::test]
     async fn test_equality_delete_memory_bounds_100k_rows() {
         use std::time::Instant;
+
         use futures::TryStreamExt;
 
         use crate::arrow::ArrowReaderBuilder;
@@ -1174,7 +1175,10 @@ mod tests {
         let total_rows = reader
             .read(tasks)
             .unwrap()
-            .try_fold(0usize, |acc, batch| async move { Ok(acc + batch.num_rows()) })
+            .try_fold(
+                0usize,
+                |acc, batch| async move { Ok(acc + batch.num_rows()) },
+            )
             .await
             .unwrap();
 
@@ -1187,14 +1191,10 @@ mod tests {
              - Data rows scanned: {}\n\
              - Scan time: {:?}\n\
              - Rows remaining: {}",
-            delete_rows,
-            data_rows,
-            elapsed,
-            total_rows
+            delete_rows, data_rows, elapsed, total_rows
         );
 
-        if let (Some(before_kb), Some(after_kb)) =
-            (baseline_hwm_kb, read_proc_status_kb("VmHWM:"))
+        if let (Some(before_kb), Some(after_kb)) = (baseline_hwm_kb, read_proc_status_kb("VmHWM:"))
         {
             let delta_kb = after_kb.saturating_sub(before_kb);
             let max_delta_kb = 512 * 1024;
@@ -1241,23 +1241,20 @@ mod tests {
             .collect();
         let col_c = Arc::new(Int64Array::from(col_c_vals)) as ArrayRef;
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("a", arrow_schema::DataType::Int64, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-            Field::new("b", arrow_schema::DataType::Int64, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "2".to_string(),
-            )])),
-            Field::new("c", arrow_schema::DataType::Int64, true).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "3".to_string(),
-            )])),
-        ]));
+        let schema =
+            Arc::new(arrow_schema::Schema::new(vec![
+                Field::new("a", arrow_schema::DataType::Int64, false).with_metadata(HashMap::from(
+                    [(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())],
+                )),
+                Field::new("b", arrow_schema::DataType::Int64, false).with_metadata(HashMap::from(
+                    [(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())],
+                )),
+                Field::new("c", arrow_schema::DataType::Int64, true).with_metadata(HashMap::from(
+                    [(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())],
+                )),
+            ]));
 
-        let record_batch =
-            RecordBatch::try_new(schema.clone(), vec![col_a, col_b, col_c]).unwrap();
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![col_a, col_b, col_c]).unwrap();
 
         let path = format!("{}/stress-eq-deletes-multicolumn.parquet", &table_location);
         let file = File::create(&path).unwrap();
@@ -1311,10 +1308,9 @@ mod tests {
         let col = Arc::new(StringArray::from(col_vals)) as ArrayRef;
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("key", arrow_schema::DataType::Utf8, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
+            Field::new("key", arrow_schema::DataType::Utf8, false).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+            ])),
         ]));
 
         let record_batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
@@ -1396,12 +1392,13 @@ mod tests {
         let eq_ids = HashSet::from_iter(vec![2]);
 
         // Set a low limit (100 rows) to trigger the guard
-        let result = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream_with_limit(
-            record_batch_stream,
-            eq_ids,
-            Some(100), // Low limit to trigger guard
-        )
-        .await;
+        let result =
+            CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream_with_limit(
+                record_batch_stream,
+                eq_ids,
+                Some(100), // Low limit to trigger guard
+            )
+            .await;
 
         // Verify the guard triggers correctly
         assert!(result.is_err(), "Expected error when exceeding row limit");
@@ -1470,12 +1467,13 @@ mod tests {
 
         let eq_ids = HashSet::from_iter(vec![2]);
 
-        let result = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream_with_limit(
-            record_batch_stream,
-            eq_ids.clone(),
-            None, // No limit
-        )
-        .await;
+        let result =
+            CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream_with_limit(
+                record_batch_stream,
+                eq_ids.clone(),
+                None, // No limit
+            )
+            .await;
 
         assert!(
             result.is_ok(),

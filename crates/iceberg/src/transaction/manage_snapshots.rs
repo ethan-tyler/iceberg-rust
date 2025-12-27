@@ -908,9 +908,7 @@ impl TransactionAction for FastForwardAction {
         if !target.is_branch() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!(
-                    "Cannot fast-forward '{target_ref}': target is a tag (tags are immutable)",
-                ),
+                format!("Cannot fast-forward '{target_ref}': target is a tag (tags are immutable)",),
             ));
         }
 
@@ -1905,7 +1903,10 @@ mod integration_tests {
 
         let result = action.commit(&table).await;
         let err = result.expect_err("Expected error");
-        assert!(err.message().contains("Cannot create a branch named 'main'"));
+        assert!(
+            err.message()
+                .contains("Cannot create a branch named 'main'")
+        );
     }
 
     #[tokio::test]
@@ -2131,7 +2132,11 @@ mod integration_tests {
     #[tokio::test]
     async fn test_fast_forward_target_not_found() {
         let table = create_test_table_with_staging_branch();
-        let action = Arc::new(FastForwardAction::new().target("nonexistent").source("staging"));
+        let action = Arc::new(
+            FastForwardAction::new()
+                .target("nonexistent")
+                .source("staging"),
+        );
 
         let result = action.commit(&table).await;
         let err = result.expect_err("Expected error");
@@ -2141,7 +2146,11 @@ mod integration_tests {
     #[tokio::test]
     async fn test_fast_forward_source_not_found() {
         let table = create_test_table_with_chain();
-        let action = Arc::new(FastForwardAction::new().target("main").source("nonexistent"));
+        let action = Arc::new(
+            FastForwardAction::new()
+                .target("main")
+                .source("nonexistent"),
+        );
 
         let result = action.commit(&table).await;
         let err = result.expect_err("Expected error");
@@ -2156,7 +2165,9 @@ mod integration_tests {
         let mut metadata = (*table.metadata()).clone();
         metadata.refs.insert(
             "release-v1.0".to_string(),
-            SnapshotReference::new(2, SnapshotRetention::Tag { max_ref_age_ms: None }),
+            SnapshotReference::new(2, SnapshotRetention::Tag {
+                max_ref_age_ms: None,
+            }),
         );
         metadata.refs.insert(
             "staging".to_string(),
@@ -2164,7 +2175,11 @@ mod integration_tests {
         );
         let table = table.with_metadata(Arc::new(metadata));
 
-        let action = Arc::new(FastForwardAction::new().target("release-v1.0").source("staging"));
+        let action = Arc::new(
+            FastForwardAction::new()
+                .target("release-v1.0")
+                .source("staging"),
+        );
 
         let result = action.commit(&table).await;
         let err = result.expect_err("Expected error");
@@ -2179,7 +2194,9 @@ mod integration_tests {
         let mut metadata = (*table.metadata()).clone();
         metadata.refs.insert(
             "release-v1.0".to_string(),
-            SnapshotReference::new(2, SnapshotRetention::Tag { max_ref_age_ms: None }),
+            SnapshotReference::new(2, SnapshotRetention::Tag {
+                max_ref_age_ms: None,
+            }),
         );
         metadata.refs.insert(
             "target-branch".to_string(),
@@ -2188,7 +2205,11 @@ mod integration_tests {
         let table = table.with_metadata(Arc::new(metadata));
 
         // Fast-forward branch to tag's snapshot (should work - tags can be source)
-        let action = Arc::new(FastForwardAction::new().target("target-branch").source("release-v1.0"));
+        let action = Arc::new(
+            FastForwardAction::new()
+                .target("target-branch")
+                .source("release-v1.0"),
+        );
 
         let result = action.commit(&table).await;
         assert!(result.is_ok());

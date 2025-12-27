@@ -18,7 +18,7 @@
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::vec;
+use std::{env, vec};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -33,14 +33,15 @@ use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
     PushedDown,
 };
-use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, Partitioning, PlanProperties, Statistics,
 };
 use datafusion::prelude::Expr;
-use futures::{SinkExt, Stream, StreamExt, TryStreamExt};
-use iceberg::Result;
+use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::table::Table;
@@ -56,6 +57,16 @@ use crate::to_datafusion_error;
 struct CachedTasks {
     generation: u64,
     tasks: Vec<FileScanTask>,
+}
+
+const TASK_CACHE_LIMIT_ENV: &str = "ICEBERG_DATAFUSION_TASK_CACHE_MAX_ENTRIES";
+const DEFAULT_TASK_CACHE_LIMIT: usize = 2000;
+
+fn task_cache_limit() -> usize {
+    env::var(TASK_CACHE_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TASK_CACHE_LIMIT)
 }
 
 pub struct IcebergTableScan {
@@ -345,7 +356,10 @@ impl DisplayAs for IcebergTableScan {
             "none"
         };
 
-        write!(f, "IcebergTableScan projection:[{projection}] predicate:[{predicate}] dynamic_filter:[{dynamic_filter}]")
+        write!(
+            f,
+            "IcebergTableScan projection:[{projection}] predicate:[{predicate}] dynamic_filter:[{dynamic_filter}]"
+        )
     }
 }
 
@@ -383,26 +397,35 @@ async fn get_batch_stream(
         expected_schema,
     } = args;
 
+    let cache_limit = task_cache_limit();
+    let cache_enabled = dynamic_filter_handler.dynamic_filter().is_some() && cache_limit > 0;
+
+    // Dynamic filters are expected to monotonically tighten; we plan with the
+    // current snapshot and may scan extra files if the filter tightens later.
+    let dynamic_predicate = dynamic_filter_handler
+        .iceberg_predicate(&iceberg_schema)
+        .map_err(to_datafusion_error)?
+        .filter(|p| !matches!(p, Predicate::AlwaysTrue));
+
     let dynamic_generation = dynamic_filter_handler
         .dynamic_filter()
         .map(|f| f.snapshot_generation())
         .unwrap_or(0);
 
-    let cached = cached_tasks
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|c| (c.generation == dynamic_generation).then(|| c.tasks.clone()));
+    let cached = if cache_enabled {
+        cached_tasks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|c| (c.generation == dynamic_generation).then(|| c.tasks.clone()))
+    } else {
+        None
+    };
 
     let tasks: FileScanTaskStream = if let Some(tasks) = cached {
         planned_tasks_metric.add(tasks.len());
         Box::pin(futures::stream::iter(tasks.into_iter().map(Ok)))
     } else {
-        let dynamic_predicate = dynamic_filter_handler
-            .iceberg_predicate(&iceberg_schema)
-            .map_err(to_datafusion_error)?
-            .filter(|p| !matches!(p, Predicate::AlwaysTrue));
-
         let effective_predicate = combine_predicates(predicates, dynamic_predicate);
 
         let scan_builder = match snapshot_id {
@@ -422,60 +445,75 @@ async fn get_batch_stream(
         let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
         let planned_tasks = table_scan.plan_files().await.map_err(to_datafusion_error)?;
 
-        // Tee the planned task stream so we can both feed the reader and cache tasks for reuse.
-        let (mut tx, rx) = futures::channel::mpsc::channel::<Result<FileScanTask>>(128);
-        let cached_tasks = Arc::clone(&cached_tasks);
-        let dynamic_filter_handler = Arc::clone(&dynamic_filter_handler);
-        let planned_tasks_metric = planned_tasks_metric.clone();
+        if !cache_enabled {
+            let planned_tasks_metric = planned_tasks_metric.clone();
+            Box::pin(planned_tasks.inspect_ok(move |_| {
+                planned_tasks_metric.add(1);
+            }))
+        } else {
+            let cached_tasks = Arc::clone(&cached_tasks);
+            let dynamic_filter_handler = Arc::clone(&dynamic_filter_handler);
+            let planned_tasks_metric = planned_tasks_metric.clone();
 
-        tokio::spawn(async move {
-            let mut collected = Vec::new();
-            let mut ok = true;
-            let mut planned_tasks = planned_tasks;
+            let stream = futures::stream::try_unfold(
+                (planned_tasks, Vec::new(), true),
+                move |(mut planned_tasks, mut collected, mut cache_ok)| {
+                    let planned_tasks_metric = planned_tasks_metric.clone();
+                    let dynamic_filter_handler = Arc::clone(&dynamic_filter_handler);
+                    let cached_tasks = Arc::clone(&cached_tasks);
 
-            while let Some(task) = planned_tasks.next().await {
-                if let Ok(ref t) = task {
-                    planned_tasks_metric.add(1);
-                    collected.push(t.clone());
-                } else {
-                    ok = false;
-                }
+                    async move {
+                        match planned_tasks.next().await {
+                            Some(task_result) => {
+                                match &task_result {
+                                    Ok(task) => {
+                                        planned_tasks_metric.add(1);
+                                        if cache_ok {
+                                            if collected.len() < cache_limit {
+                                                collected.push(task.clone());
+                                            } else {
+                                                cache_ok = false;
+                                                collected.clear();
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        cache_ok = false;
+                                        collected.clear();
+                                    }
+                                }
 
-                if tx.send(task).await.is_err() {
-                    return;
-                }
-            }
+                                match task_result {
+                                    Ok(task) => {
+                                        Ok(Some((task, (planned_tasks, collected, cache_ok))))
+                                    }
+                                    Err(err) => Err(err),
+                                }
+                            }
+                            None => {
+                                if cache_ok {
+                                    let current_generation = dynamic_filter_handler
+                                        .dynamic_filter()
+                                        .map(|f| f.snapshot_generation())
+                                        .unwrap_or(0);
+                                    if current_generation == dynamic_generation {
+                                        let mut cached =
+                                            cached_tasks.write().unwrap_or_else(|e| e.into_inner());
+                                        *cached = Some(CachedTasks {
+                                            generation: dynamic_generation,
+                                            tasks: collected,
+                                        });
+                                    }
+                                }
+                                Ok(None)
+                            }
+                        }
+                    }
+                },
+            );
 
-            if !ok {
-                return;
-            }
-
-            // Check if the dynamic filter's generation changed during task collection.
-            // If it changed, the collected tasks were planned with a stale predicate,
-            // so we discard them rather than caching stale results.
-            //
-            // This check at the END of collection is correct because:
-            // 1. `dynamic_generation` was captured at the start of `get_batch_stream()`
-            // 2. `iceberg_predicate()` always returns the current predicate state
-            // 3. If generation changed between capture and now, tasks may be stale
-            // 4. DataFusion's generation is monotonically increasing, so we can't
-            //    accidentally match a future generation with a past capture
-            let current_generation = dynamic_filter_handler
-                .dynamic_filter()
-                .map(|f| f.snapshot_generation())
-                .unwrap_or(0);
-            if current_generation != dynamic_generation {
-                return;
-            }
-
-            let mut cached = cached_tasks.write().unwrap_or_else(|e| e.into_inner());
-            *cached = Some(CachedTasks {
-                generation: dynamic_generation,
-                tasks: collected,
-            });
-        });
-
-        Box::pin(rx)
+            Box::pin(stream)
+        }
     };
 
     let stream = table

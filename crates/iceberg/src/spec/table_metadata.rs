@@ -334,6 +334,27 @@ impl TableMetadata {
         })
     }
 
+    /// Get the snapshot that was current at a given timestamp.
+    ///
+    /// Returns the most recent snapshot log entry with `timestamp_ms <= target_timestamp_ms`,
+    /// which represents the snapshot that was current on the main branch at that time.
+    /// This is useful for time travel queries to find the table state at a specific point in time.
+    ///
+    /// # Arguments
+    /// * `target_timestamp_ms` - The target timestamp in milliseconds since epoch
+    ///
+    /// # Returns
+    /// * `Some(&SnapshotRef)` - The snapshot that was current at the given timestamp
+    /// * `None` - If no snapshot exists at or before the given timestamp
+    #[inline]
+    pub fn snapshot_at_timestamp(&self, target_timestamp_ms: i64) -> Option<&SnapshotRef> {
+        self.snapshot_log
+            .iter()
+            .filter(|log| log.timestamp_ms <= target_timestamp_ms)
+            .max_by_key(|log| log.timestamp_ms)
+            .and_then(|log| self.snapshot_by_id(log.snapshot_id))
+    }
+
     /// Return all sort orders.
     #[inline]
     pub fn sort_orders_iter(&self) -> impl ExactSizeIterator<Item = &SortOrderRef> {
@@ -3800,5 +3821,153 @@ mod tests {
         assert!(final_metadata.name_exists_in_any_schema("deprecated_field")); // exists in both schemas
         assert!(final_metadata.name_exists_in_any_schema("new_field")); // only in current schema
         assert!(!final_metadata.name_exists_in_any_schema("never_existed"));
+    }
+
+    #[test]
+    fn test_snapshot_at_timestamp() {
+        // Create test metadata with multiple snapshots at different timestamps
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+
+        // Snapshot 1: timestamp 1000
+        let snapshot1 = Snapshot::builder()
+            .with_snapshot_id(1001)
+            .with_parent_snapshot_id(None)
+            .with_timestamp_ms(1000)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("s3://a/b/1.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        // Snapshot 2: timestamp 2000
+        let snapshot2 = Snapshot::builder()
+            .with_snapshot_id(1002)
+            .with_parent_snapshot_id(Some(1001))
+            .with_timestamp_ms(2000)
+            .with_sequence_number(2)
+            .with_schema_id(0)
+            .with_manifest_list("s3://a/b/2.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        // Snapshot 3: timestamp 3000
+        let snapshot3 = Snapshot::builder()
+            .with_snapshot_id(1003)
+            .with_parent_snapshot_id(Some(1002))
+            .with_timestamp_ms(3000)
+            .with_sequence_number(3)
+            .with_schema_id(0)
+            .with_manifest_list("s3://a/b/3.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        // Snapshot 4 (branch): timestamp 2500
+        let snapshot4 = Snapshot::builder()
+            .with_snapshot_id(2001)
+            .with_parent_snapshot_id(Some(1001))
+            .with_timestamp_ms(2500)
+            .with_sequence_number(4)
+            .with_schema_id(0)
+            .with_manifest_list("s3://a/b/4.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        let default_partition_type = partition_spec.partition_type(&schema).unwrap();
+        let metadata = TableMetadata {
+            format_version: FormatVersion::V2,
+            table_uuid: Uuid::new_v4(),
+            location: "s3://bucket/test".to_string(),
+            last_updated_ms: 3000,
+            last_column_id: 1,
+            schemas: HashMap::from_iter(vec![(0, Arc::new(schema))]),
+            current_schema_id: 0,
+            partition_specs: HashMap::from_iter(vec![(0, partition_spec.clone().into())]),
+            default_spec: Arc::new(partition_spec),
+            default_partition_type,
+            last_partition_id: 0,
+            default_sort_order_id: 0,
+            sort_orders: HashMap::from_iter(vec![(0, SortOrder::unsorted_order().into())]),
+            snapshots: HashMap::from_iter(vec![
+                (1001, Arc::new(snapshot1)),
+                (1002, Arc::new(snapshot2)),
+                (1003, Arc::new(snapshot3)),
+                (2001, Arc::new(snapshot4)),
+            ]),
+            current_snapshot_id: Some(1003),
+            last_sequence_number: 4,
+            properties: HashMap::new(),
+            snapshot_log: vec![
+                SnapshotLog {
+                    snapshot_id: 1001,
+                    timestamp_ms: 1000,
+                },
+                SnapshotLog {
+                    snapshot_id: 1002,
+                    timestamp_ms: 2000,
+                },
+                SnapshotLog {
+                    snapshot_id: 1003,
+                    timestamp_ms: 3000,
+                },
+            ],
+            metadata_log: Vec::new(),
+            refs: HashMap::new(),
+            statistics: HashMap::new(),
+            partition_statistics: HashMap::new(),
+            encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
+        };
+
+        // Test: exact match on timestamp
+        let result = metadata.snapshot_at_timestamp(1000);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().snapshot_id(), 1001);
+
+        // Test: exact match on latest timestamp
+        let result = metadata.snapshot_at_timestamp(3000);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().snapshot_id(), 1003);
+
+        // Test: timestamp between snapshots returns earlier snapshot
+        let result = metadata.snapshot_at_timestamp(1500);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().snapshot_id(), 1001);
+
+        // Branch snapshot at 2500 should be ignored for main-branch time travel.
+        let result = metadata.snapshot_at_timestamp(2500);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().snapshot_id(), 1002);
+
+        // Test: timestamp after all snapshots returns latest
+        let result = metadata.snapshot_at_timestamp(5000);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().snapshot_id(), 1003);
+
+        // Test: timestamp before all snapshots returns None
+        let result = metadata.snapshot_at_timestamp(500);
+        assert!(result.is_none());
     }
 }

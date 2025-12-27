@@ -431,11 +431,8 @@ mod tests {
             )))),
         ));
 
-        let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            supported,
-            Operator::Or,
-            unsupported,
-        ));
+        let expr: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(supported, Operator::Or, unsupported));
 
         let predicate = convert_physical_expr_to_predicate(&expr, &schema).unwrap();
         assert_eq!(
@@ -506,8 +503,7 @@ mod tests {
             )))),
         ));
 
-        let and_expr: Arc<dyn PhysicalExpr> =
-            Arc::new(BinaryExpr::new(left, Operator::And, right));
+        let and_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(left, Operator::And, right));
 
         let not_expr: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(and_expr));
         let predicate = convert_physical_expr_to_predicate(&not_expr, &schema).unwrap();

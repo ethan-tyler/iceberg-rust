@@ -18,9 +18,13 @@
 pub mod spark_validator;
 
 use std::collections::HashMap;
+use std::process::Command;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
-use iceberg_catalog_rest::REST_CATALOG_PROP_URI;
+use iceberg::{Catalog, CatalogBuilder, TableIdent};
+use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_test_utils::docker::DockerCompose;
 use iceberg_test_utils::{normalize_test_name, set_up};
 
@@ -66,8 +70,82 @@ pub fn set_test_fixture(func: &str) -> TestFixture {
         (S3_REGION.to_string(), "us-east-1".to_string()),
     ]);
 
+    wait_for_spark_ready(&docker_compose);
+    wait_for_provisioned_tables(&catalog_config);
+
     TestFixture {
         _docker_compose: docker_compose,
         catalog_config,
+    }
+}
+
+fn wait_for_spark_ready(docker_compose: &DockerCompose) {
+    let container = docker_compose.container_name("spark-iceberg");
+    let deadline = Instant::now() + Duration::from_secs(180);
+
+    loop {
+        let status = Command::new("docker")
+            .args(["exec", &container, "test", "-f", "/tmp/ready"])
+            .status();
+
+        if matches!(status, Ok(exit) if exit.success()) {
+            return;
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "Spark provisioning did not complete within 180s (container: {container})"
+            );
+        }
+
+        sleep(Duration::from_secs(1));
+    }
+}
+
+fn wait_for_provisioned_tables(catalog_config: &HashMap<String, String>) {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let config = catalog_config.clone();
+    let required_tables = [
+        TableIdent::from_strs(["default", "test_expire_snapshots_file_deletion"]).unwrap(),
+        TableIdent::from_strs(["default", "parity_expire_rust"]).unwrap(),
+        TableIdent::from_strs(["default", "parity_expire_spark"]).unwrap(),
+    ];
+
+    let join = std::thread::spawn(move || {
+        let runtime =
+            tokio::runtime::Runtime::new().expect("Failed to create runtime for provisioning wait");
+        runtime.block_on(async move {
+            loop {
+                if Instant::now() >= deadline {
+                    panic!("Spark tables were not provisioned within 180s");
+                }
+
+                if let Ok(catalog) = RestCatalogBuilder::default()
+                    .load("rest", config.clone())
+                    .await
+                {
+                    let mut all_ready = true;
+                    for table in &required_tables {
+                        match catalog.table_exists(table).await {
+                            Ok(true) => {}
+                            _ => {
+                                all_ready = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if all_ready {
+                        return;
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    });
+
+    if join.join().is_err() {
+        panic!("Provisioning wait thread panicked");
     }
 }
