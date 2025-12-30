@@ -26,7 +26,7 @@ mod tests {
     use bytes::Bytes;
     use ctor::{ctor, dtor};
     use iceberg::io::{FileIO, FileIOBuilder, GCS_NO_AUTH, GCS_SERVICE_PATH};
-    use iceberg_test_utils::docker::DockerCompose;
+    use iceberg_test_utils::docker::{DockerCompose, docker_available};
     use iceberg_test_utils::{normalize_test_name, set_up};
 
     static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
@@ -35,6 +35,10 @@ mod tests {
 
     #[ctor]
     fn before_all() {
+        if !docker_available() {
+            eprintln!("Skipping docker setup for file_io_gcs_test: docker unavailable.");
+            return;
+        }
         let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
         let docker_compose = DockerCompose::new(
             normalize_test_name(module_path!()),
@@ -50,15 +54,17 @@ mod tests {
         guard.take();
     }
 
-    async fn get_file_io_gcs() -> FileIO {
+    async fn get_file_io_gcs() -> Option<FileIO> {
+        if !docker_available() {
+            return None;
+        }
         set_up();
 
         let ip = DOCKER_COMPOSE_ENV
             .read()
             .unwrap()
             .as_ref()
-            .unwrap()
-            .get_container_ip("gcs-server");
+            .map(|docker_compose| docker_compose.get_container_ip("gcs-server"))?;
         let addr = SocketAddr::new(ip, FAKE_GCS_PORT);
 
         // A bucket must exist for FileIO
@@ -66,13 +72,15 @@ mod tests {
             .await
             .unwrap();
 
-        FileIOBuilder::new("gcs")
-            .with_props(vec![
-                (GCS_SERVICE_PATH, format!("http://{addr}")),
-                (GCS_NO_AUTH, "true".to_string()),
-            ])
-            .build()
-            .unwrap()
+        Some(
+            FileIOBuilder::new("gcs")
+                .with_props(vec![
+                    (GCS_SERVICE_PATH, format!("http://{addr}")),
+                    (GCS_NO_AUTH, "true".to_string()),
+                ])
+                .build()
+                .unwrap(),
+        )
     }
 
     // Create a bucket against the emulated GCS storage server.
@@ -92,14 +100,18 @@ mod tests {
 
     #[tokio::test]
     async fn gcs_exists() {
-        let file_io = get_file_io_gcs().await;
+        let Some(file_io) = get_file_io_gcs().await else {
+            return;
+        };
         assert!(file_io.exists(format!("{}/", get_gs_path())).await.unwrap());
     }
 
     #[tokio::test]
     async fn gcs_write() {
         let gs_file = format!("{}/write-file", get_gs_path());
-        let file_io = get_file_io_gcs().await;
+        let Some(file_io) = get_file_io_gcs().await else {
+            return;
+        };
         let output = file_io.new_output(&gs_file).unwrap();
         output
             .write(bytes::Bytes::from_static(b"iceberg-gcs!"))
@@ -111,7 +123,9 @@ mod tests {
     #[tokio::test]
     async fn gcs_read() {
         let gs_file = format!("{}/read-gcs", get_gs_path());
-        let file_io = get_file_io_gcs().await;
+        let Some(file_io) = get_file_io_gcs().await else {
+            return;
+        };
         let output = file_io.new_output(&gs_file).unwrap();
         output
             .write(bytes::Bytes::from_static(b"iceberg!"))

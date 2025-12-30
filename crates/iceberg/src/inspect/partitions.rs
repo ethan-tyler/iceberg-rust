@@ -618,7 +618,10 @@ mod tests {
                             DataFileBuilder::default()
                                 .partition_spec_id(0)
                                 .content(DataContentType::Data)
-                                .file_path(format!("{}/x100_{}.parquet", &fixture.table_location, i))
+                                .file_path(format!(
+                                    "{}/x100_{}.parquet",
+                                    &fixture.table_location, i
+                                ))
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(1000)
                                 .record_count(100)

@@ -329,9 +329,7 @@ fn parse_validation_result(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(SparkValidationError {
-            message: format!(
-                "spark-submit failed.\nstdout: {stdout}\nstderr: {stderr}"
-            ),
+            message: format!("spark-submit failed.\nstdout: {stdout}\nstderr: {stderr}"),
         });
     }
 
@@ -547,7 +545,9 @@ pub async fn spark_snapshot_summary_with_container(
     parse_snapshot_summary_output(&stdout)
 }
 
-fn parse_snapshot_summary_output(stdout: &str) -> Result<SnapshotSummaryResult, SparkValidationError> {
+fn parse_snapshot_summary_output(
+    stdout: &str,
+) -> Result<SnapshotSummaryResult, SparkValidationError> {
     for line in stdout.lines().rev() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('{') {
@@ -608,7 +608,9 @@ pub async fn spark_manifest_entries_with_container(
     parse_manifest_entries_output(&stdout)
 }
 
-fn parse_manifest_entries_output(stdout: &str) -> Result<ManifestEntriesResult, SparkValidationError> {
+fn parse_manifest_entries_output(
+    stdout: &str,
+) -> Result<ManifestEntriesResult, SparkValidationError> {
     for line in stdout.lines().rev() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('{') {
@@ -648,7 +650,14 @@ pub async fn spark_execute_dml(
     update_values: Option<&str>,
 ) -> Result<SnapshotSummaryResult, SparkValidationError> {
     let container_name = get_spark_container_name()?;
-    spark_execute_dml_with_container(&container_name, table_name, dml_type, predicate, update_values).await
+    spark_execute_dml_with_container(
+        &container_name,
+        table_name,
+        dml_type,
+        predicate,
+        update_values,
+    )
+    .await
 }
 
 /// Execute a DML operation via Spark using an explicit container name.

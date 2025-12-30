@@ -32,7 +32,7 @@ use iceberg_catalog_glue::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, GLUE_CATALOG_PROP_URI,
     GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalog, GlueCatalogBuilder,
 };
-use iceberg_test_utils::docker::DockerCompose;
+use iceberg_test_utils::docker::{DockerCompose, skip_if_docker_unavailable};
 use iceberg_test_utils::{normalize_test_name, set_up};
 use port_scanner::scan_port_addr;
 use tokio::time::sleep;
@@ -44,6 +44,7 @@ static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 
 #[ctor]
 fn before_all() {
+    skip_if_docker_unavailable("glue catalog integration tests");
     let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
     let docker_compose = DockerCompose::new(
         normalize_test_name(module_path!()),

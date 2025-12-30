@@ -170,8 +170,11 @@ impl IncrementalScan {
         }
 
         // Get all snapshot IDs between from and to (exclusive of from, inclusive of to)
-        let snapshot_ids =
-            SnapshotUtil::ancestor_ids_between(&self.metadata, self.from_snapshot_id, self.to_snapshot_id);
+        let snapshot_ids = SnapshotUtil::ancestor_ids_between(
+            &self.metadata,
+            self.from_snapshot_id,
+            self.to_snapshot_id,
+        );
 
         if snapshot_ids.is_empty() {
             return Ok(IncrementalChanges::empty());
@@ -187,15 +190,12 @@ impl IncrementalScan {
         let mut seen_manifest_paths = HashSet::new();
 
         for snapshot_id in &snapshot_ids {
-            let snapshot = self
-                .metadata
-                .snapshot_by_id(*snapshot_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Snapshot {} not found", snapshot_id),
-                    )
-                })?;
+            let snapshot = self.metadata.snapshot_by_id(*snapshot_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot {snapshot_id} not found"),
+                )
+            })?;
 
             // Load the manifest list for this snapshot.
             let manifest_list = self
@@ -325,6 +325,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
 
+    use tempfile::TempDir;
+
     use super::*;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{
@@ -333,7 +335,6 @@ mod tests {
         Operation, PartitionSpec, PrimitiveType, Schema, Snapshot, Struct, Summary, TableMetadata,
         Type,
     };
-    use tempfile::TempDir;
 
     #[test]
     fn test_incremental_changes_empty() {
@@ -434,11 +435,7 @@ mod tests {
             last_partition_id: -1,
             properties: HashMap::new(),
             current_snapshot_id: Some(3),
-            snapshots: HashMap::from([
-                (1, Arc::new(s1)),
-                (2, Arc::new(s2)),
-                (3, Arc::new(s3)),
-            ]),
+            snapshots: HashMap::from([(1, Arc::new(s1)), (2, Arc::new(s2)), (3, Arc::new(s3))]),
             snapshot_log: vec![],
             sort_orders: HashMap::new(),
             metadata_log: vec![],
@@ -573,7 +570,9 @@ mod tests {
         // Snapshot 2: append commit (adds data_file1)
         let manifest2_path = metadata_dir.join("manifest-2.avro");
         let mut writer2 = ManifestWriterBuilder::new(
-            file_io.new_output(manifest2_path.to_str().unwrap()).unwrap(),
+            file_io
+                .new_output(manifest2_path.to_str().unwrap())
+                .unwrap(),
             Some(2),
             None,
             schema.clone(),
@@ -653,14 +652,20 @@ mod tests {
             3,
             Some(2),
             3,
-            vec![manifest2.clone(), manifest3_data.clone(), manifest3_delete.clone()],
+            vec![
+                manifest2.clone(),
+                manifest3_data.clone(),
+                manifest3_delete.clone(),
+            ],
         )
         .await;
 
         // Snapshot 4: rewrite/compaction (adds data_file3, removes data_file1)
         let manifest4_path = metadata_dir.join("manifest-4.avro");
         let mut writer4 = ManifestWriterBuilder::new(
-            file_io.new_output(manifest4_path.to_str().unwrap()).unwrap(),
+            file_io
+                .new_output(manifest4_path.to_str().unwrap())
+                .unwrap(),
             Some(4),
             None,
             schema.clone(),

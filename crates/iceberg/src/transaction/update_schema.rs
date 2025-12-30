@@ -27,6 +27,7 @@ use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 
 #[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
 enum SchemaUpdateOperation {
     AddColumn { name: String, field_type: Type },
     RenameColumn { name: String, new_name: String },

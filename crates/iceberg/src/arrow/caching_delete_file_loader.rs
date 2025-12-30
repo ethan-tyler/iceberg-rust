@@ -350,7 +350,7 @@ impl CachingDeleteFileLoader {
     /// * `stream` - The record batch stream from the equality delete file
     /// * `equality_ids` - The field IDs that form the equality delete key
     /// * `max_rows` - Optional maximum rows to process. If None, uses DEFAULT_MAX_EQUALITY_DELETE_ROWS.
-    ///                Pass Some(0) to disable the limit entirely (use with caution).
+    ///   Pass Some(0) to disable the limit entirely (use with caution).
     ///
     /// # Returns
     /// A predicate that filters out rows matching any of the deleted row keys.
@@ -416,14 +416,13 @@ impl CachingDeleteFileLoader {
                     return Err(Error::new(
                         ErrorKind::PreconditionFailed,
                         format!(
-                            "Equality delete file exceeds maximum allowed rows ({}). \
+                            "Equality delete file exceeds maximum allowed rows ({row_limit}). \
                              This limit exists to prevent unbounded memory growth. \
                              To resolve this issue, consider: \
                              (1) Compacting the table to merge equality deletes with data files, \
                              (2) Using position deletes instead of equality deletes for large-scale deletions, \
                              (3) Partitioning the table to limit per-partition delete file sizes. \
                              See DEFAULT_MAX_EQUALITY_DELETE_ROWS documentation for details.",
-                            row_limit
                         ),
                     )
                     .with_context("rows_processed", total_rows.to_string())

@@ -64,10 +64,10 @@ fn parse_time_travel(name: &str) -> (&str, Option<TimeTravelSpec>) {
             if let Ok(snapshot_id) = version_str.parse::<i64>() {
                 return (table_name, Some(TimeTravelSpec::SnapshotId(snapshot_id)));
             }
-        } else if let Some(ts_str) = suffix.strip_prefix("ts") {
-            if let Ok(timestamp_ms) = ts_str.parse::<i64>() {
-                return (table_name, Some(TimeTravelSpec::Timestamp(timestamp_ms)));
-            }
+        } else if let Some(ts_str) = suffix.strip_prefix("ts")
+            && let Ok(timestamp_ms) = ts_str.parse::<i64>()
+        {
+            return (table_name, Some(TimeTravelSpec::Timestamp(timestamp_ms)));
         }
     }
     (name, None)

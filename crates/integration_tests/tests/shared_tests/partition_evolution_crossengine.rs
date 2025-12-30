@@ -33,11 +33,13 @@ use chrono::{Duration, Utc};
 use datafusion::assert_batches_sorted_eq;
 use datafusion::prelude::*;
 use iceberg::spec::Operation;
-use iceberg::transaction::{ApplyTransactionAction, RewriteDataFilesOptions, RewriteStrategy, Transaction};
+use iceberg::transaction::{
+    ApplyTransactionAction, RewriteDataFilesOptions, RewriteStrategy, Transaction,
+};
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
-use iceberg_datafusion::compaction::{CompactionOptions, compact_table};
 use iceberg_datafusion::IcebergTableProvider;
+use iceberg_datafusion::compaction::{CompactionOptions, compact_table};
 use iceberg_integration_tests::spark_validator::{
     ValidationType, spark_validate_distinct_with_container, spark_validate_query_with_container,
     spark_validate_with_container,
@@ -443,7 +445,11 @@ async fn test_crossengine_merge_with_partition_evolution() {
     )
     .await
     .expect("Spark count validation should succeed");
-    assert_eq!(count_result.count, Some(6), "Spark count should match (5 original + 1 inserted)");
+    assert_eq!(
+        count_result.count,
+        Some(6),
+        "Spark count should match (5 original + 1 inserted)"
+    );
 
     let distinct_result = spark_validate_distinct_with_container(
         &spark_container,
@@ -534,13 +540,10 @@ async fn test_crossengine_delete_with_null_semantics() {
     assert_eq!(deleted_count, 2, "Should delete 2 rows where name IS NULL");
 
     // Reload and verify
-    let provider_after = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace,
-        "test_delete_null_semantics",
-    )
-    .await
-    .unwrap();
+    let provider_after =
+        IcebergTableProvider::try_new(client.clone(), namespace, "test_delete_null_semantics")
+            .await
+            .unwrap();
 
     let after_df = ctx
         .read_table(Arc::new(provider_after))
@@ -655,22 +658,16 @@ async fn test_crossengine_compaction_binpack() {
 
     // Spark validation: count + distinct + metadata sanity
     let spark_container = fixture.spark_container_name();
-    let count_result = spark_validate_with_container(
-        &spark_container,
-        "test_compaction",
-        ValidationType::Count,
-    )
-    .await
-    .expect("Spark count validation should succeed");
+    let count_result =
+        spark_validate_with_container(&spark_container, "test_compaction", ValidationType::Count)
+            .await
+            .expect("Spark count validation should succeed");
     assert_eq!(count_result.count, Some(5), "Spark count should match");
 
-    let distinct_result = spark_validate_distinct_with_container(
-        &spark_container,
-        "test_compaction",
-        "id",
-    )
-    .await
-    .expect("Spark distinct validation should succeed");
+    let distinct_result =
+        spark_validate_distinct_with_container(&spark_container, "test_compaction", "id")
+            .await
+            .expect("Spark distinct validation should succeed");
     assert_eq!(
         distinct_result.distinct_count,
         Some(5),
@@ -718,7 +715,9 @@ async fn test_crossengine_rewrite_manifests() {
     let pre_snapshot_count = table.metadata().snapshots().count();
 
     let tx = Transaction::new(&table);
-    let action = tx.rewrite_manifests().rewrite_if_smaller_than(1024 * 1024 * 1024);
+    let action = tx
+        .rewrite_manifests()
+        .rewrite_if_smaller_than(1024 * 1024 * 1024);
     let tx = action.apply(tx).unwrap();
     let table_after = tx
         .commit(client.as_ref())
@@ -752,13 +751,10 @@ async fn test_crossengine_rewrite_manifests() {
     .expect("Spark count validation should succeed");
     assert_eq!(count_result.count, Some(3), "Spark count should match");
 
-    let distinct_result = spark_validate_distinct_with_container(
-        &spark_container,
-        "test_rewrite_manifests",
-        "id",
-    )
-    .await
-    .expect("Spark distinct validation should succeed");
+    let distinct_result =
+        spark_validate_distinct_with_container(&spark_container, "test_rewrite_manifests", "id")
+            .await
+            .expect("Spark distinct validation should succeed");
     assert_eq!(
         distinct_result.distinct_count,
         Some(3),
@@ -839,13 +835,10 @@ async fn test_crossengine_expire_snapshots() {
     .expect("Spark count validation should succeed");
     assert_eq!(count_result.count, Some(4), "Spark count should match");
 
-    let distinct_result = spark_validate_distinct_with_container(
-        &spark_container,
-        "test_expire_snapshots",
-        "id",
-    )
-    .await
-    .expect("Spark distinct validation should succeed");
+    let distinct_result =
+        spark_validate_distinct_with_container(&spark_container, "test_expire_snapshots", "id")
+            .await
+            .expect("Spark distinct validation should succeed");
     assert_eq!(
         distinct_result.distinct_count,
         Some(4),
@@ -893,7 +886,8 @@ async fn test_crossengine_expire_snapshots_with_file_deletion() {
         .unwrap();
 
     let client = Arc::new(rest_catalog);
-    let table_ident = TableIdent::from_strs(["default", "test_expire_snapshots_file_deletion"]).unwrap();
+    let table_ident =
+        TableIdent::from_strs(["default", "test_expire_snapshots_file_deletion"]).unwrap();
     let table = client.load_table(&table_ident).await.unwrap();
 
     // Configure aggressive expiration (keep only 1 snapshot)
@@ -1048,12 +1042,12 @@ async fn test_crossengine_remove_orphan_files() {
     let table_ident = TableIdent::from_strs(["default", "test_remove_orphan_files"]).unwrap();
     let table = client.load_table(&table_ident).await.unwrap();
 
-    let table_location = table.metadata().location().trim_end_matches('/').to_string();
-    let orphan_path = format!(
-        "{}/data/orphan-{}.parquet",
-        table_location,
-        Uuid::new_v4()
-    );
+    let table_location = table
+        .metadata()
+        .location()
+        .trim_end_matches('/')
+        .to_string();
+    let orphan_path = format!("{}/data/orphan-{}.parquet", table_location, Uuid::new_v4());
 
     let orphan_file = table.file_io().new_output(&orphan_path).unwrap();
     orphan_file
@@ -1094,13 +1088,10 @@ async fn test_crossengine_remove_orphan_files() {
     .expect("Spark count validation should succeed");
     assert_eq!(count_result.count, Some(1), "Spark count should match");
 
-    let distinct_result = spark_validate_distinct_with_container(
-        &spark_container,
-        "test_remove_orphan_files",
-        "id",
-    )
-    .await
-    .expect("Spark distinct validation should succeed");
+    let distinct_result =
+        spark_validate_distinct_with_container(&spark_container, "test_remove_orphan_files", "id")
+            .await
+            .expect("Spark distinct validation should succeed");
     assert_eq!(
         distinct_result.distinct_count,
         Some(1),
@@ -1218,13 +1209,10 @@ async fn test_crossengine_equality_delete_int_key() {
     );
 
     // Cross-validate with Spark: distinct count should match
-    let distinct_result = spark_validate_distinct_with_container(
-        &spark_container,
-        "test_equality_delete_int",
-        "id",
-    )
-    .await
-    .expect("Spark distinct validation should succeed");
+    let distinct_result =
+        spark_validate_distinct_with_container(&spark_container, "test_equality_delete_int", "id")
+            .await
+            .expect("Spark distinct validation should succeed");
     assert_eq!(
         distinct_result.distinct_count,
         Some(7),
@@ -1415,13 +1403,10 @@ async fn test_crossengine_equality_delete_null_handling() {
     );
 
     // Cross-validate with Spark: distinct count should match
-    let distinct_result = spark_validate_distinct_with_container(
-        &spark_container,
-        "test_equality_delete_null",
-        "id",
-    )
-    .await
-    .expect("Spark distinct validation should succeed");
+    let distinct_result =
+        spark_validate_distinct_with_container(&spark_container, "test_equality_delete_null", "id")
+            .await
+            .expect("Spark distinct validation should succeed");
     assert_eq!(
         distinct_result.distinct_count,
         Some(3),
@@ -1538,7 +1523,10 @@ async fn test_crossengine_equality_delete_multi_column_key() {
     .expect("Spark checksum validation should succeed");
     // Expected sum: 200 + 300 + 600 + 700 + 800 = 2600
     let rows = checksum_result.rows.expect("Should have rows");
-    let total = rows[0].get("total").and_then(|v| v.as_i64()).expect("Should have total");
+    let total = rows[0]
+        .get("total")
+        .and_then(|v| v.as_i64())
+        .expect("Should have total");
     assert_eq!(total, 2600, "Value sum should match expected total");
 }
 
@@ -1566,13 +1554,12 @@ async fn test_crossengine_dynamic_overwrite_partitioned() {
     use iceberg::spec::DataFileFormat;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
-    use iceberg::writer::IcebergWriter;
-    use iceberg::writer::IcebergWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
     use parquet::file::properties::WriterProperties;
 
     let fixture = get_shared_containers();
@@ -1588,18 +1575,17 @@ async fn test_crossengine_dynamic_overwrite_partitioned() {
     // Verify initial state: 6 rows across 3 partitions
     let ctx = SessionContext::new();
     let namespace = iceberg::NamespaceIdent::new("default".to_string());
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "test_dynamic_overwrite",
-    )
-    .await
-    .unwrap();
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "test_dynamic_overwrite")
+            .await
+            .unwrap();
 
     let initial_df = ctx
         .read_table(Arc::new(provider))
         .unwrap()
-        .aggregate(vec![], vec![datafusion::functions_aggregate::count::count(col("id"))])
+        .aggregate(vec![], vec![datafusion::functions_aggregate::count::count(
+            col("id"),
+        )])
         .unwrap();
     let initial_count: i64 = initial_df
         .collect()
@@ -1640,14 +1626,11 @@ async fn test_crossengine_dynamic_overwrite_partitioned() {
     ]));
 
     // New data for electronics partition (replacing ids 1, 2 with new values)
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![10, 20])), // new ids
-            Arc::new(StringArray::from(vec!["electronics", "electronics"])),
-            Arc::new(Int32Array::from(vec![1000, 2000])), // new values
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![10, 20])), // new ids
+        Arc::new(StringArray::from(vec!["electronics", "electronics"])),
+        Arc::new(Int32Array::from(vec![1000, 2000])), // new values
+    ])
     .unwrap();
 
     writer.write(batch).await.unwrap();
@@ -1664,13 +1647,10 @@ async fn test_crossengine_dynamic_overwrite_partitioned() {
         .expect("Dynamic overwrite should succeed");
 
     // Verify with Rust: only electronics partition replaced
-    let provider_after = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "test_dynamic_overwrite",
-    )
-    .await
-    .unwrap();
+    let provider_after =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "test_dynamic_overwrite")
+            .await
+            .unwrap();
 
     let after_df = ctx
         .read_table(Arc::new(provider_after))
@@ -1743,13 +1723,12 @@ async fn test_crossengine_static_overwrite_with_filter() {
     use iceberg::spec::{DataFileFormat, Datum};
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
-    use iceberg::writer::IcebergWriter;
-    use iceberg::writer::IcebergWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
     use parquet::file::properties::WriterProperties;
 
     let fixture = get_shared_containers();
@@ -1764,8 +1743,11 @@ async fn test_crossengine_static_overwrite_with_filter() {
 
     // Write new data files for 'US' partition
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-    let file_name_generator =
-        DefaultFileNameGenerator::new("static-overwrite".to_string(), None, DataFileFormat::Parquet);
+    let file_name_generator = DefaultFileNameGenerator::new(
+        "static-overwrite".to_string(),
+        None,
+        DataFileFormat::Parquet,
+    );
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
         WriterProperties::builder().build(),
@@ -1788,14 +1770,11 @@ async fn test_crossengine_static_overwrite_with_filter() {
     ]));
 
     // New data for US partition (replacing ids 1, 2 with new single row)
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![100])), // new id
-            Arc::new(StringArray::from(vec!["US"])),
-            Arc::new(Int32Array::from(vec![9999])), // new amount
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![100])), // new id
+        Arc::new(StringArray::from(vec!["US"])),
+        Arc::new(Int32Array::from(vec![9999])), // new amount
+    ])
     .unwrap();
 
     writer.write(batch).await.unwrap();
@@ -1817,13 +1796,10 @@ async fn test_crossengine_static_overwrite_with_filter() {
     // Verify with Rust: only US partition replaced
     let ctx = SessionContext::new();
     let namespace = iceberg::NamespaceIdent::new("default".to_string());
-    let provider_after = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "test_static_overwrite",
-    )
-    .await
-    .unwrap();
+    let provider_after =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "test_static_overwrite")
+            .await
+            .unwrap();
 
     let after_df = ctx
         .read_table(Arc::new(provider_after))
@@ -1904,9 +1880,7 @@ async fn test_crossengine_static_overwrite_delete_partition() {
     // Execute Static Overwrite with filter but NO new files
     let filter = Reference::new("category").equal_to(Datum::string("delete"));
     let tx = Transaction::new(&table);
-    let action = tx
-        .overwrite()
-        .overwrite_filter(filter);
+    let action = tx.overwrite().overwrite_filter(filter);
     // Note: No add_data_files() - this effectively deletes the partition
     let tx = action.apply(tx).unwrap();
     let _table_after = tx
@@ -1990,13 +1964,12 @@ async fn test_crossengine_dynamic_overwrite_unpartitioned() {
     use iceberg::spec::DataFileFormat;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
-    use iceberg::writer::IcebergWriter;
-    use iceberg::writer::IcebergWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
     use parquet::file::properties::WriterProperties;
 
     let fixture = get_shared_containers();
@@ -2039,14 +2012,11 @@ async fn test_crossengine_dynamic_overwrite_unpartitioned() {
     ]));
 
     // Completely new data (replacing original alpha, beta, gamma)
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![100, 200])), // new ids
-            Arc::new(StringArray::from(vec!["new_a", "new_b"])),
-            Arc::new(Int32Array::from(vec![5000, 6000])), // new values
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![100, 200])), // new ids
+        Arc::new(StringArray::from(vec!["new_a", "new_b"])),
+        Arc::new(Int32Array::from(vec![5000, 6000])), // new values
+    ])
     .unwrap();
 
     writer.write(batch).await.unwrap();

@@ -35,15 +35,15 @@ use datafusion::assert_batches_sorted_eq;
 use datafusion::prelude::*;
 use futures::TryStreamExt;
 use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, TableCreation, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_datafusion::IcebergTableProvider;
@@ -548,10 +548,15 @@ async fn test_spark_nested_struct_evolution_rust_reads() {
 
     // Verify schema has evolved struct
     let schema = table.metadata().current_schema();
-    let info_field = schema.field_by_name("info").expect("info field should exist");
+    let info_field = schema
+        .field_by_name("info")
+        .expect("info field should exist");
     if let iceberg::spec::Type::Struct(struct_type) = info_field.field_type.as_ref() {
-        let struct_field_names: Vec<&str> =
-            struct_type.fields().iter().map(|f| f.name.as_str()).collect();
+        let struct_field_names: Vec<&str> = struct_type
+            .fields()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
         assert!(
             struct_field_names.contains(&"country"),
             "Struct should have 'country' field after evolution"
@@ -754,9 +759,7 @@ async fn test_spark_add_column_with_default_rust_reads() {
         .unwrap();
 
     let table = rest_catalog
-        .load_table(
-            &TableIdent::from_strs(["default", "test_schema_add_column_default"]).unwrap(),
-        )
+        .load_table(&TableIdent::from_strs(["default", "test_schema_add_column_default"]).unwrap())
         .await
         .unwrap();
 
@@ -948,13 +951,10 @@ async fn test_rust_add_column_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
 
@@ -975,18 +975,15 @@ async fn test_rust_add_column_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Diana", "Eve"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![Some(25), Some(30)])) as ArrayRef,
-            Arc::new(StringArray::from(vec![
-                "diana@example.com",
-                "eve@example.com",
-            ])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Diana", "Eve"])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![Some(25), Some(30)])) as ArrayRef,
+        Arc::new(StringArray::from(vec![
+            "diana@example.com",
+            "eve@example.com",
+        ])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
 
@@ -1060,13 +1057,10 @@ async fn test_rust_rename_column_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Alpha", "Beta"])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Alpha", "Beta"])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
 
@@ -1093,13 +1087,10 @@ async fn test_rust_rename_column_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Gamma", "Delta"])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Gamma", "Delta"])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
 
@@ -1171,15 +1162,12 @@ async fn test_rust_drop_column_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["x", "y", "z"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![100, 200, 300])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["x", "y", "z"])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![100, 200, 300])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
 
@@ -1195,14 +1183,11 @@ async fn test_rust_drop_column_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Diana", "Eve"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![400, 500])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Diana", "Eve"])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![400, 500])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
 
@@ -1272,20 +1257,13 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["First"])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["First"])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
-    let snapshot_1 = table
-        .metadata()
-        .current_snapshot()
-        .unwrap()
-        .snapshot_id();
+    let snapshot_1 = table.metadata().current_snapshot().unwrap().snapshot_id();
 
     let tx = Transaction::new(&table);
     let tx = tx
@@ -1303,21 +1281,14 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![2])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Second"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![Some(2)])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Second"])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![Some(2)])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
-    let snapshot_2 = table
-        .metadata()
-        .current_snapshot()
-        .unwrap()
-        .snapshot_id();
+    let snapshot_2 = table.metadata().current_snapshot().unwrap().snapshot_id();
 
     let tx = Transaction::new(&table);
     let tx = tx
@@ -1335,21 +1306,14 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
             .try_into()
             .unwrap(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![3])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["Third"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![Some(3)])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Third"])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![Some(3)])) as ArrayRef,
+    ])
     .unwrap();
     table = append_batch(&rest_catalog, &table, batch).await;
-    let snapshot_3 = table
-        .metadata()
-        .current_snapshot()
-        .unwrap()
-        .snapshot_id();
+    let snapshot_3 = table.metadata().current_snapshot().unwrap().snapshot_id();
 
     let table_ref = format!("{}.{}", ns.name(), table_name);
     let container = fixture.spark_container_name();
@@ -1358,10 +1322,9 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
         "SELECT id, name FROM {{table}} VERSION AS OF {} ORDER BY id",
         snapshot_1
     );
-    let result_1 =
-        spark_validate_query_with_container(&container, &table_ref, &query_1)
-            .await
-            .unwrap();
+    let result_1 = spark_validate_query_with_container(&container, &table_ref, &query_1)
+        .await
+        .unwrap();
     let rows_1 = result_1.rows.unwrap();
     assert_eq!(rows_1.len(), 1);
     assert_eq!(rows_1[0]["id"], 1);
@@ -1371,10 +1334,9 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
         "SELECT id, name, version FROM {{table}} VERSION AS OF {} ORDER BY id",
         snapshot_2
     );
-    let result_2 =
-        spark_validate_query_with_container(&container, &table_ref, &query_2)
-            .await
-            .unwrap();
+    let result_2 = spark_validate_query_with_container(&container, &table_ref, &query_2)
+        .await
+        .unwrap();
     let rows_2 = result_2.rows.unwrap();
     assert_eq!(rows_2.len(), 2);
     assert!(rows_2[0]["version"].is_null());
@@ -1384,10 +1346,9 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
         "SELECT id, label, version FROM {{table}} VERSION AS OF {} ORDER BY id",
         snapshot_3
     );
-    let result_3 =
-        spark_validate_query_with_container(&container, &table_ref, &query_3)
-            .await
-            .unwrap();
+    let result_3 = spark_validate_query_with_container(&container, &table_ref, &query_3)
+        .await
+        .unwrap();
     let rows_3 = result_3.rows.unwrap();
     assert_eq!(rows_3.len(), 3);
     assert_eq!(rows_3[0]["label"], "First");
@@ -1445,7 +1406,11 @@ async fn test_schema_evolution_checksum_consistency() {
 async fn append_batch(catalog: &dyn Catalog, table: &Table, batch: RecordBatch) -> Table {
     let data_files = write_parquet_data_files(table, batch).await;
     let tx = Transaction::new(table);
-    let tx = tx.fast_append().add_data_files(data_files).apply(tx).unwrap();
+    let tx = tx
+        .fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap();
     tx.commit(catalog)
         .await
         .expect("append commit should succeed")

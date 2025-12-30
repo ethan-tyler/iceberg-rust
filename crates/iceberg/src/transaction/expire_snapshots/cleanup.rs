@@ -171,11 +171,11 @@ pub async fn compute_cleanup_plan(
             let manifest_path = &manifest_file.manifest_path;
 
             // If manifest is not in live set, it can be deleted.
-            if !live_manifests.contains(manifest_path) {
-                if manifest_files.insert(manifest_path.clone()) && manifest_file.manifest_length > 0
-                {
-                    total_bytes = total_bytes.saturating_add(manifest_file.manifest_length as u64);
-                }
+            if !live_manifests.contains(manifest_path)
+                && manifest_files.insert(manifest_path.clone())
+                && manifest_file.manifest_length > 0
+            {
+                total_bytes = total_bytes.saturating_add(manifest_file.manifest_length as u64);
             }
 
             if !scanned_manifests.insert(manifest_path.clone()) {

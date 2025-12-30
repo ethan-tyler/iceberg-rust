@@ -17,6 +17,7 @@
 
 use std::net::IpAddr;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use tracing::error;
 
@@ -29,6 +30,44 @@ use crate::cmd::{get_cmd_output, get_cmd_output_result, run_command};
 pub struct DockerCompose {
     project_name: String,
     docker_compose_dir: String,
+}
+
+static DOCKER_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+pub fn docker_available() -> bool {
+    *DOCKER_AVAILABLE.get_or_init(|| {
+        let mut cmd = Command::new("docker");
+        cmd.arg("info").arg("--format").arg("{{.ServerVersion}}");
+        match cmd.output() {
+            Ok(output) => {
+                if output.status.success() {
+                    true
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if stderr.trim().is_empty() {
+                        error!(
+                            "Docker unavailable: docker info returned {:?}",
+                            output.status
+                        );
+                    } else {
+                        error!("Docker unavailable: {}", stderr.trim());
+                    }
+                    false
+                }
+            }
+            Err(err) => {
+                error!("Docker unavailable: {}", err);
+                false
+            }
+        }
+    })
+}
+
+pub fn skip_if_docker_unavailable(context: &str) {
+    if !docker_available() {
+        eprintln!("Skipping {context}: docker daemon not available.");
+        std::process::exit(0);
+    }
 }
 
 impl DockerCompose {

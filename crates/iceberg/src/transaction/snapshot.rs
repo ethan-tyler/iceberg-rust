@@ -152,6 +152,10 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     fn data_sequence_number(&self) -> Option<i64> {
         None
     }
+
+    fn delete_sequence_number(&self) -> Option<i64> {
+        None
+    }
 }
 
 pub(crate) struct DefaultManifestProcess;
@@ -648,7 +652,10 @@ impl<'a> SnapshotProducer<'a> {
     /// For tables with partition evolution, position delete files inherit the partition
     /// spec of the data file they reference. Each spec's delete files are written to
     /// a separate manifest to comply with the Iceberg specification.
-    async fn write_delete_manifests(&mut self) -> Result<Vec<ManifestFile>> {
+    async fn write_delete_manifests(
+        &mut self,
+        delete_sequence_number: Option<i64>,
+    ) -> Result<Vec<ManifestFile>> {
         let added_delete_files = std::mem::take(&mut self.added_delete_files);
         if added_delete_files.is_empty() {
             return Err(Error::new(
@@ -682,6 +689,8 @@ impl<'a> SnapshotProducer<'a> {
                     .data_file(delete_file);
                 if format_version == FormatVersion::V1 {
                     builder.snapshot_id(snapshot_id).build()
+                } else if let Some(seq_num) = delete_sequence_number {
+                    builder.sequence_number(seq_num).build()
                 } else {
                     builder.build()
                 }
@@ -716,30 +725,56 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        // Group entries by partition spec for per-spec manifest writing
-        let entry_groups = group_entries_by_spec(deleted_entries);
+        let (data_entries, delete_entries): (Vec<_>, Vec<_>) = deleted_entries
+            .into_iter()
+            .partition(|entry| entry.content_type() == DataContentType::Data);
 
-        let mut manifests = Vec::with_capacity(entry_groups.len());
-        for (spec_id, entries) in entry_groups {
-            let partition_spec = self
-                .table
-                .metadata()
-                .partition_spec_by_id(spec_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Deleted entry references unknown partition spec: {spec_id}"),
-                    )
-                })?;
+        let mut manifests = Vec::new();
 
-            let mut writer =
-                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
-            for entry in entries {
-                // Use add_delete_entry to properly set status=Deleted
-                // (add_entry would override status to Added)
-                writer.add_delete_entry(entry)?;
+        if !data_entries.is_empty() {
+            let entry_groups = group_entries_by_spec(data_entries);
+            for (spec_id, entries) in entry_groups {
+                let partition_spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Deleted entry references unknown partition spec: {spec_id}"),
+                        )
+                    })?;
+
+                let mut writer =
+                    self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
+                for entry in entries {
+                    writer.add_delete_entry(entry)?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
             }
-            manifests.push(writer.write_manifest_file().await?);
+        }
+
+        if !delete_entries.is_empty() {
+            let entry_groups = group_entries_by_spec(delete_entries);
+            for (spec_id, entries) in entry_groups {
+                let partition_spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Deleted entry references unknown partition spec: {spec_id}"),
+                        )
+                    })?;
+
+                let mut writer = self
+                    .new_manifest_writer_for_spec(partition_spec, ManifestContentType::Deletes)?;
+                for entry in entries {
+                    writer.add_delete_entry(entry)?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
+            }
         }
 
         Ok(manifests)
@@ -763,28 +798,56 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        // Group entries by partition spec for per-spec manifest writing
-        let entry_groups = group_entries_by_spec(existing_entries);
+        let (data_entries, delete_entries): (Vec<_>, Vec<_>) = existing_entries
+            .into_iter()
+            .partition(|entry| entry.content_type() == DataContentType::Data);
 
-        let mut manifests = Vec::with_capacity(entry_groups.len());
-        for (spec_id, entries) in entry_groups {
-            let partition_spec = self
-                .table
-                .metadata()
-                .partition_spec_by_id(spec_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Existing entry references unknown partition spec: {spec_id}"),
-                    )
-                })?;
+        let mut manifests = Vec::new();
 
-            let mut writer =
-                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
-            for entry in entries {
-                writer.add_existing_entry(entry)?;
+        if !data_entries.is_empty() {
+            let entry_groups = group_entries_by_spec(data_entries);
+            for (spec_id, entries) in entry_groups {
+                let partition_spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Existing entry references unknown partition spec: {spec_id}"),
+                        )
+                    })?;
+
+                let mut writer =
+                    self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
+                for entry in entries {
+                    writer.add_existing_entry(entry)?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
             }
-            manifests.push(writer.write_manifest_file().await?);
+        }
+
+        if !delete_entries.is_empty() {
+            let entry_groups = group_entries_by_spec(delete_entries);
+            for (spec_id, entries) in entry_groups {
+                let partition_spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Existing entry references unknown partition spec: {spec_id}"),
+                        )
+                    })?;
+
+                let mut writer = self
+                    .new_manifest_writer_for_spec(partition_spec, ManifestContentType::Deletes)?;
+                for entry in entries {
+                    writer.add_existing_entry(entry)?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
+            }
         }
 
         Ok(manifests)
@@ -854,7 +917,8 @@ impl<'a> SnapshotProducer<'a> {
         // Process added delete file entries (position/equality deletes).
         // Delete files are grouped by partition spec, with separate manifests per spec.
         if has_delete_files {
-            let delete_manifests = self.write_delete_manifests().await?;
+            let delete_sequence_number = snapshot_produce_operation.delete_sequence_number();
+            let delete_manifests = self.write_delete_manifests(delete_sequence_number).await?;
             manifest_files.extend(delete_manifests);
         }
 

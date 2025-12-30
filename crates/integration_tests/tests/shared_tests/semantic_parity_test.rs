@@ -60,8 +60,8 @@ use iceberg::transaction::{
 };
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
-use iceberg_datafusion::compaction::{CompactionOptions, compact_table};
 use iceberg_datafusion::IcebergTableProvider;
+use iceberg_datafusion::compaction::{CompactionOptions, compact_table};
 use iceberg_integration_tests::spark_validator::{
     ManifestEntriesResult, ManifestEntryInfo, SnapshotSummaryFields, SnapshotSummaryResult,
     spark_execute_dml_with_container, spark_execute_sql_with_container,
@@ -240,29 +240,94 @@ pub fn compare_snapshot_summaries(
     let spark_fields = spark_summary.summary.as_ref();
 
     let field_pairs = [
-        ("added-data-files", get_field(rust_fields, |f| &f.added_data_files), get_field(spark_fields, |f| &f.added_data_files)),
-        ("deleted-data-files", get_field(rust_fields, |f| &f.deleted_data_files), get_field(spark_fields, |f| &f.deleted_data_files)),
-        ("added-records", get_field(rust_fields, |f| &f.added_records), get_field(spark_fields, |f| &f.added_records)),
-        ("deleted-records", get_field(rust_fields, |f| &f.deleted_records), get_field(spark_fields, |f| &f.deleted_records)),
-        ("added-delete-files", get_field(rust_fields, |f| &f.added_delete_files), get_field(spark_fields, |f| &f.added_delete_files)),
-        ("removed-delete-files", get_field(rust_fields, |f| &f.removed_delete_files), get_field(spark_fields, |f| &f.removed_delete_files)),
-        ("added-position-deletes", get_field(rust_fields, |f| &f.added_position_deletes), get_field(spark_fields, |f| &f.added_position_deletes)),
-        ("removed-position-deletes", get_field(rust_fields, |f| &f.removed_position_deletes), get_field(spark_fields, |f| &f.removed_position_deletes)),
-        ("total-data-files", get_field(rust_fields, |f| &f.total_data_files), get_field(spark_fields, |f| &f.total_data_files)),
-        ("total-delete-files", get_field(rust_fields, |f| &f.total_delete_files), get_field(spark_fields, |f| &f.total_delete_files)),
-        ("total-records", get_field(rust_fields, |f| &f.total_records), get_field(spark_fields, |f| &f.total_records)),
-        ("changed-partition-count", get_field(rust_fields, |f| &f.changed_partition_count), get_field(spark_fields, |f| &f.changed_partition_count)),
+        (
+            "added-data-files",
+            get_field(rust_fields, |f| &f.added_data_files),
+            get_field(spark_fields, |f| &f.added_data_files),
+        ),
+        (
+            "deleted-data-files",
+            get_field(rust_fields, |f| &f.deleted_data_files),
+            get_field(spark_fields, |f| &f.deleted_data_files),
+        ),
+        (
+            "added-records",
+            get_field(rust_fields, |f| &f.added_records),
+            get_field(spark_fields, |f| &f.added_records),
+        ),
+        (
+            "deleted-records",
+            get_field(rust_fields, |f| &f.deleted_records),
+            get_field(spark_fields, |f| &f.deleted_records),
+        ),
+        (
+            "added-delete-files",
+            get_field(rust_fields, |f| &f.added_delete_files),
+            get_field(spark_fields, |f| &f.added_delete_files),
+        ),
+        (
+            "removed-delete-files",
+            get_field(rust_fields, |f| &f.removed_delete_files),
+            get_field(spark_fields, |f| &f.removed_delete_files),
+        ),
+        (
+            "added-position-deletes",
+            get_field(rust_fields, |f| &f.added_position_deletes),
+            get_field(spark_fields, |f| &f.added_position_deletes),
+        ),
+        (
+            "removed-position-deletes",
+            get_field(rust_fields, |f| &f.removed_position_deletes),
+            get_field(spark_fields, |f| &f.removed_position_deletes),
+        ),
+        (
+            "total-data-files",
+            get_field(rust_fields, |f| &f.total_data_files),
+            get_field(spark_fields, |f| &f.total_data_files),
+        ),
+        (
+            "total-delete-files",
+            get_field(rust_fields, |f| &f.total_delete_files),
+            get_field(spark_fields, |f| &f.total_delete_files),
+        ),
+        (
+            "total-records",
+            get_field(rust_fields, |f| &f.total_records),
+            get_field(spark_fields, |f| &f.total_records),
+        ),
+        (
+            "changed-partition-count",
+            get_field(rust_fields, |f| &f.changed_partition_count),
+            get_field(spark_fields, |f| &f.changed_partition_count),
+        ),
     ];
 
     for (name, rust_val, spark_val) in field_pairs {
-        comparisons.push(compare_field(name, rust_val.as_ref(), spark_val.as_ref(), None));
+        comparisons.push(compare_field(
+            name,
+            rust_val.as_ref(),
+            spark_val.as_ref(),
+            None,
+        ));
     }
 
     // Size fields may differ due to compression - document as expected divergence
     let size_fields = [
-        ("added-files-size", get_field(rust_fields, |f| &f.added_files_size), get_field(spark_fields, |f| &f.added_files_size)),
-        ("removed-files-size", get_field(rust_fields, |f| &f.removed_files_size), get_field(spark_fields, |f| &f.removed_files_size)),
-        ("total-files-size", get_field(rust_fields, |f| &f.total_files_size), get_field(spark_fields, |f| &f.total_files_size)),
+        (
+            "added-files-size",
+            get_field(rust_fields, |f| &f.added_files_size),
+            get_field(spark_fields, |f| &f.added_files_size),
+        ),
+        (
+            "removed-files-size",
+            get_field(rust_fields, |f| &f.removed_files_size),
+            get_field(spark_fields, |f| &f.removed_files_size),
+        ),
+        (
+            "total-files-size",
+            get_field(rust_fields, |f| &f.total_files_size),
+            get_field(spark_fields, |f| &f.total_files_size),
+        ),
     ];
 
     for (name, rust_val, spark_val) in size_fields {
@@ -295,9 +360,7 @@ pub fn compare_snapshot_summaries(
 }
 
 fn get_field<F>(fields: Option<&SnapshotSummaryFields>, getter: F) -> Option<String>
-where
-    F: Fn(&SnapshotSummaryFields) -> &Option<String>,
-{
+where F: Fn(&SnapshotSummaryFields) -> &Option<String> {
     fields.and_then(|f| getter(f).clone())
 }
 
@@ -399,7 +462,8 @@ async fn extract_rust_manifest_entries(
 fn partition_multiset_from_rust(entries: &[RustManifestEntryInfo]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for entry in entries {
-        let key = serde_json::to_string(&entry.data_file.partition).unwrap_or_else(|_| "null".to_string());
+        let key = serde_json::to_string(&entry.data_file.partition)
+            .unwrap_or_else(|_| "null".to_string());
         *counts.entry(key).or_insert(0) += 1;
     }
     counts
@@ -431,13 +495,22 @@ fn status_sequence_from_spark(entries: &[ManifestEntryInfo]) -> Vec<i32> {
 }
 
 fn content_sequence_from_rust(entries: &[RustManifestEntryInfo]) -> Vec<i32> {
-    entries.iter().map(|entry| entry.data_file.content).collect()
+    entries
+        .iter()
+        .map(|entry| entry.data_file.content)
+        .collect()
 }
 
 fn content_sequence_from_spark(entries: &[ManifestEntryInfo]) -> Vec<i32> {
     entries
         .iter()
-        .map(|entry| entry.data_file.as_ref().and_then(|df| df.content).unwrap_or(-1))
+        .map(|entry| {
+            entry
+                .data_file
+                .as_ref()
+                .and_then(|df| df.content)
+                .unwrap_or(-1)
+        })
         .collect()
 }
 
@@ -494,7 +567,9 @@ fn compare_manifest_entries(
         None,
     ));
 
-    let rust_seq_present = rust_entries.iter().all(|entry| entry.sequence_number.is_some());
+    let rust_seq_present = rust_entries
+        .iter()
+        .all(|entry| entry.sequence_number.is_some());
     let spark_seq_present = spark_entry_list
         .iter()
         .all(|entry| entry.sequence_number.is_some());
@@ -549,25 +624,76 @@ pub fn extract_rust_snapshot_summary(table: &iceberg::table::Table) -> SnapshotS
                 operation: Some(format!("{:?}", summary.operation).to_lowercase()),
                 committed_at: Some(snapshot.timestamp_ms().to_string()),
                 summary: Some(SnapshotSummaryFields {
-                    added_data_files: summary.additional_properties.get("added-data-files").cloned(),
-                    deleted_data_files: summary.additional_properties.get("deleted-data-files").cloned(),
+                    added_data_files: summary
+                        .additional_properties
+                        .get("added-data-files")
+                        .cloned(),
+                    deleted_data_files: summary
+                        .additional_properties
+                        .get("deleted-data-files")
+                        .cloned(),
                     added_records: summary.additional_properties.get("added-records").cloned(),
-                    deleted_records: summary.additional_properties.get("deleted-records").cloned(),
-                    added_files_size: summary.additional_properties.get("added-files-size").cloned(),
-                    removed_files_size: summary.additional_properties.get("removed-files-size").cloned(),
-                    added_delete_files: summary.additional_properties.get("added-delete-files").cloned(),
-                    removed_delete_files: summary.additional_properties.get("removed-delete-files").cloned(),
-                    added_position_deletes: summary.additional_properties.get("added-position-deletes").cloned(),
-                    removed_position_deletes: summary.additional_properties.get("removed-position-deletes").cloned(),
-                    added_equality_deletes: summary.additional_properties.get("added-equality-deletes").cloned(),
-                    removed_equality_deletes: summary.additional_properties.get("removed-equality-deletes").cloned(),
-                    total_data_files: summary.additional_properties.get("total-data-files").cloned(),
-                    total_delete_files: summary.additional_properties.get("total-delete-files").cloned(),
+                    deleted_records: summary
+                        .additional_properties
+                        .get("deleted-records")
+                        .cloned(),
+                    added_files_size: summary
+                        .additional_properties
+                        .get("added-files-size")
+                        .cloned(),
+                    removed_files_size: summary
+                        .additional_properties
+                        .get("removed-files-size")
+                        .cloned(),
+                    added_delete_files: summary
+                        .additional_properties
+                        .get("added-delete-files")
+                        .cloned(),
+                    removed_delete_files: summary
+                        .additional_properties
+                        .get("removed-delete-files")
+                        .cloned(),
+                    added_position_deletes: summary
+                        .additional_properties
+                        .get("added-position-deletes")
+                        .cloned(),
+                    removed_position_deletes: summary
+                        .additional_properties
+                        .get("removed-position-deletes")
+                        .cloned(),
+                    added_equality_deletes: summary
+                        .additional_properties
+                        .get("added-equality-deletes")
+                        .cloned(),
+                    removed_equality_deletes: summary
+                        .additional_properties
+                        .get("removed-equality-deletes")
+                        .cloned(),
+                    total_data_files: summary
+                        .additional_properties
+                        .get("total-data-files")
+                        .cloned(),
+                    total_delete_files: summary
+                        .additional_properties
+                        .get("total-delete-files")
+                        .cloned(),
                     total_records: summary.additional_properties.get("total-records").cloned(),
-                    total_files_size: summary.additional_properties.get("total-files-size").cloned(),
-                    total_position_deletes: summary.additional_properties.get("total-position-deletes").cloned(),
-                    total_equality_deletes: summary.additional_properties.get("total-equality-deletes").cloned(),
-                    changed_partition_count: summary.additional_properties.get("changed-partition-count").cloned(),
+                    total_files_size: summary
+                        .additional_properties
+                        .get("total-files-size")
+                        .cloned(),
+                    total_position_deletes: summary
+                        .additional_properties
+                        .get("total-position-deletes")
+                        .cloned(),
+                    total_equality_deletes: summary
+                        .additional_properties
+                        .get("total-equality-deletes")
+                        .cloned(),
+                    changed_partition_count: summary
+                        .additional_properties
+                        .get("changed-partition-count")
+                        .cloned(),
                     raw: None,
                 }),
             }
@@ -609,13 +735,10 @@ async fn test_semantic_parity_delete() {
     let spark_container = fixture.spark_container_name();
 
     // Step 1: Perform DELETE on Rust table via iceberg-datafusion
-    let rust_provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "parity_delete_rust",
-    )
-    .await
-    .unwrap();
+    let rust_provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_delete_rust")
+            .await
+            .unwrap();
 
     let deleted_count = rust_provider
         .delete(&ctx.state(), Some(col("value").gt(lit(300))))
@@ -683,13 +806,9 @@ async fn test_spark_snapshot_summary_extraction() {
     let spark_container = fixture.spark_container_name();
 
     // Get snapshot summary from a Spark-created table
-    let summary = spark_snapshot_summary_with_container(
-        &spark_container,
-        "test_compaction",
-        None,
-    )
-    .await
-    .expect("Spark snapshot summary extraction should succeed");
+    let summary = spark_snapshot_summary_with_container(&spark_container, "test_compaction", None)
+        .await
+        .expect("Spark snapshot summary extraction should succeed");
 
     // Verify we got valid data
     assert!(summary.snapshot_id.is_some(), "Should have snapshot ID");
@@ -722,18 +841,12 @@ async fn test_manifest_entry_structure() {
     let spark_container = fixture.spark_container_name();
 
     // Get manifest entries from test_compaction table (has multiple data files)
-    let result = spark_manifest_entries_with_container(
-        &spark_container,
-        "test_compaction",
-        Some(10),
-    )
-    .await
-    .expect("Manifest entry extraction should succeed");
+    let result =
+        spark_manifest_entries_with_container(&spark_container, "test_compaction", Some(10))
+            .await
+            .expect("Manifest entry extraction should succeed");
 
-    assert!(
-        result.entry_count.is_some(),
-        "Should have entry count"
-    );
+    assert!(result.entry_count.is_some(), "Should have entry count");
     assert!(
         result.entry_count.unwrap() >= 5,
         "Should have at least 5 entries (one per insert)"
@@ -754,7 +867,10 @@ async fn test_manifest_entry_structure() {
                 println!("  data_file.content: {:?}", df.content);
                 println!("  data_file.file_format: {:?}", df.file_format);
                 println!("  data_file.record_count: {:?}", df.record_count);
-                println!("  data_file.file_size_in_bytes: {:?}", df.file_size_in_bytes);
+                println!(
+                    "  data_file.file_size_in_bytes: {:?}",
+                    df.file_size_in_bytes
+                );
                 println!("  data_file.partition: {:?}", df.partition);
             }
 
@@ -765,9 +881,18 @@ async fn test_manifest_entry_structure() {
             if let Some(df) = &entry.data_file {
                 assert!(df.content.is_some(), "Data file should have content type");
                 assert!(df.file_path.is_some(), "Data file should have file_path");
-                assert!(df.file_format.is_some(), "Data file should have file_format");
-                assert!(df.record_count.is_some(), "Data file should have record_count");
-                assert!(df.file_size_in_bytes.is_some(), "Data file should have file_size_in_bytes");
+                assert!(
+                    df.file_format.is_some(),
+                    "Data file should have file_format"
+                );
+                assert!(
+                    df.record_count.is_some(),
+                    "Data file should have record_count"
+                );
+                assert!(
+                    df.file_size_in_bytes.is_some(),
+                    "Data file should have file_size_in_bytes"
+                );
             }
         }
     }
@@ -798,13 +923,10 @@ async fn test_edge_case_empty_delete() {
     let initial_snapshot_count = table_before.metadata().snapshots().count();
 
     // Perform DELETE that matches nothing (value > 10000, but max is 500)
-    let rust_provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "parity_delete_rust",
-    )
-    .await
-    .unwrap();
+    let rust_provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_delete_rust")
+            .await
+            .unwrap();
 
     let deleted_count = rust_provider
         .delete(&ctx.state(), Some(col("value").gt(lit(10000))))
@@ -820,13 +942,10 @@ async fn test_edge_case_empty_delete() {
         .unwrap();
     let final_snapshot_count = table_after.metadata().snapshots().count();
 
-    let spark_before = spark_snapshot_summary_with_container(
-        &spark_container,
-        "parity_delete_spark",
-        None,
-    )
-    .await
-    .expect("Spark snapshot summary should succeed");
+    let spark_before =
+        spark_snapshot_summary_with_container(&spark_container, "parity_delete_spark", None)
+            .await
+            .expect("Spark snapshot summary should succeed");
 
     let spark_after = spark_execute_dml_with_container(
         &spark_container,
@@ -872,13 +991,10 @@ async fn test_semantic_parity_null_handling() {
     let spark_container = fixture.spark_container_name();
 
     // Step 1: Perform DELETE WHERE name IS NULL on Rust table
-    let rust_provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "parity_null_rust",
-    )
-    .await
-    .unwrap();
+    let rust_provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_null_rust")
+            .await
+            .unwrap();
 
     let deleted_count = rust_provider
         .delete(&ctx.state(), Some(col("name").is_null()))
@@ -907,7 +1023,8 @@ async fn test_semantic_parity_null_handling() {
     .expect("Spark DELETE with IS NULL should succeed");
 
     // Step 3: Compare snapshot summaries
-    let parity_result = compare_snapshot_summaries("DELETE (NULL handling)", &rust_summary, &spark_summary);
+    let parity_result =
+        compare_snapshot_summaries("DELETE (NULL handling)", &rust_summary, &spark_summary);
 
     println!("\n{}\n", parity_result.summary());
 
@@ -949,13 +1066,10 @@ async fn test_semantic_parity_update() {
     let namespace = iceberg::NamespaceIdent::new("default".to_string());
     let spark_container = fixture.spark_container_name();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "parity_update_rust",
-    )
-    .await
-    .unwrap();
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_update_rust")
+            .await
+            .unwrap();
 
     let updated_count = provider
         .update()
@@ -1032,13 +1146,10 @@ async fn test_semantic_parity_merge() {
     ctx.register_table("merge_source", source_table).unwrap();
     let source_df = ctx.table("merge_source").await.unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "parity_merge_rust",
-    )
-    .await
-    .unwrap();
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_merge_rust")
+            .await
+            .unwrap();
 
     let stats = provider
         .merge(source_df)
@@ -1078,13 +1189,10 @@ WHEN MATCHED THEN UPDATE SET name = source.name, value = source.value
 WHEN NOT MATCHED THEN INSERT *
 "#;
 
-    let spark_summary = spark_execute_sql_with_container(
-        &spark_container,
-        "parity_merge_spark",
-        merge_sql,
-    )
-    .await
-    .expect("Spark MERGE should succeed");
+    let spark_summary =
+        spark_execute_sql_with_container(&spark_container, "parity_merge_spark", merge_sql)
+            .await
+            .expect("Spark MERGE should succeed");
 
     let parity_result = compare_snapshot_summaries("MERGE", &rust_summary, &spark_summary);
 
@@ -1185,7 +1293,8 @@ async fn test_semantic_parity_expire_snapshots() {
     .await
     .expect("Spark expire snapshots should succeed");
 
-    let parity_result = compare_snapshot_summaries("EXPIRE SNAPSHOTS", &rust_summary, &spark_summary);
+    let parity_result =
+        compare_snapshot_summaries("EXPIRE SNAPSHOTS", &rust_summary, &spark_summary);
 
     println!("\n{}\n", parity_result.summary());
     let divergences = parity_result.divergences();
@@ -1214,13 +1323,10 @@ async fn test_semantic_parity_boundary_values() {
     let namespace = iceberg::NamespaceIdent::new("default".to_string());
     let spark_container = fixture.spark_container_name();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "parity_boundary_rust",
-    )
-    .await
-    .unwrap();
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_boundary_rust")
+            .await
+            .unwrap();
 
     let deleted_count = provider
         .delete(
@@ -1252,7 +1358,8 @@ async fn test_semantic_parity_boundary_values() {
     .await
     .expect("Spark DELETE should succeed");
 
-    let parity_result = compare_snapshot_summaries("DELETE (boundary values)", &rust_summary, &spark_summary);
+    let parity_result =
+        compare_snapshot_summaries("DELETE (boundary values)", &rust_summary, &spark_summary);
 
     println!("\n{}\n", parity_result.summary());
     let divergences = parity_result.divergences();
@@ -1281,13 +1388,10 @@ async fn test_semantic_parity_empty_partition_delete() {
     let namespace = iceberg::NamespaceIdent::new("default".to_string());
     let spark_container = fixture.spark_container_name();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "parity_partition_rust",
-    )
-    .await
-    .unwrap();
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_partition_rust")
+            .await
+            .unwrap();
 
     let deleted_count = provider
         .delete(&ctx.state(), Some(col("category").eq(lit("B"))))
@@ -1312,11 +1416,8 @@ async fn test_semantic_parity_empty_partition_delete() {
     .await
     .expect("Spark DELETE should succeed");
 
-    let parity_result = compare_snapshot_summaries(
-        "DELETE (empty partition)",
-        &rust_summary,
-        &spark_summary,
-    );
+    let parity_result =
+        compare_snapshot_summaries("DELETE (empty partition)", &rust_summary, &spark_summary);
 
     println!("\n{}\n", parity_result.summary());
     let divergences = parity_result.divergences();
@@ -1333,13 +1434,10 @@ async fn test_semantic_parity_empty_partition_delete() {
     let rust_entries = extract_rust_manifest_entries(&rust_table)
         .await
         .expect("Rust manifest entry extraction should succeed");
-    let spark_entries = spark_manifest_entries_with_container(
-        &spark_container,
-        "parity_partition_spark",
-        Some(50),
-    )
-    .await
-    .expect("Spark manifest entry extraction should succeed");
+    let spark_entries =
+        spark_manifest_entries_with_container(&spark_container, "parity_partition_spark", Some(50))
+            .await
+            .expect("Spark manifest entry extraction should succeed");
 
     let manifest_parity =
         compare_manifest_entries("DELETE (empty partition)", &rust_entries, &spark_entries);

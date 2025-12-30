@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
-use iceberg_test_utils::docker::DockerCompose;
+use iceberg_test_utils::docker::{DockerCompose, skip_if_docker_unavailable};
 use iceberg_test_utils::{normalize_test_name, set_up};
 
 const REST_CATALOG_PORT: u16 = 8181;
@@ -45,6 +45,7 @@ const MINIO_PORT: u16 = 9000;
 
 pub fn set_test_fixture(func: &str) -> TestFixture {
     set_up();
+    skip_if_docker_unavailable("integration tests");
     let docker_compose = DockerCompose::new(
         normalize_test_name(format!("{}_{func}", module_path!())),
         format!("{}/testdata", env!("CARGO_MANIFEST_DIR")),
@@ -93,9 +94,7 @@ fn wait_for_spark_ready(docker_compose: &DockerCompose) {
         }
 
         if Instant::now() >= deadline {
-            panic!(
-                "Spark provisioning did not complete within 180s (container: {container})"
-            );
+            panic!("Spark provisioning did not complete within 180s (container: {container})");
         }
 
         sleep(Duration::from_secs(1));

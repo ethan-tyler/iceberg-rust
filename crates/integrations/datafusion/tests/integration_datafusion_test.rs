@@ -2955,7 +2955,11 @@ async fn test_time_travel_snapshot_id() -> Result<()> {
         .as_any()
         .downcast_ref::<datafusion::arrow::array::Int32Array>()
         .unwrap();
-    assert_eq!(version_foo1.value(0), 1, "VERSION AS OF row should have foo1=1");
+    assert_eq!(
+        version_foo1.value(0),
+        1,
+        "VERSION AS OF row should have foo1=1"
+    );
 
     Ok(())
 }
@@ -3045,10 +3049,7 @@ async fn test_time_travel_timestamp() -> Result<()> {
     let timestamp_df = ctx.sql(&timestamp_sql).await.unwrap();
     let timestamp_batches = timestamp_df.collect().await.unwrap();
     let timestamp_rows: usize = timestamp_batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        timestamp_rows, 1,
-        "TIMESTAMP AS OF should return 1 row"
-    );
+    assert_eq!(timestamp_rows, 1, "TIMESTAMP AS OF should return 1 row");
 
     // CTE with time travel
     let cte_sql = format!(
@@ -3162,7 +3163,10 @@ async fn test_time_travel_in_join() -> Result<()> {
     let join_version_df = ctx.sql(&join_version_sql).await.unwrap();
     let join_version_batches = join_version_df.collect().await.unwrap();
     let join_version_rows: usize = join_version_batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(join_version_rows, 1, "VERSION AS OF join should return 1 row");
+    assert_eq!(
+        join_version_rows, 1,
+        "VERSION AS OF join should return 1 row"
+    );
 
     Ok(())
 }

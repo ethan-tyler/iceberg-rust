@@ -86,6 +86,7 @@ impl FastAppendAction {
     ///
     /// Branches must exist or will be created implicitly on commit.
     /// Tags are immutable and cannot be used as write targets.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_branch(mut self, branch: impl Into<String>) -> Self {
         self.target_ref = Some(branch.into());
         self

@@ -29,7 +29,7 @@ use iceberg_catalog_hms::{
     HMS_CATALOG_PROP_THRIFT_TRANSPORT, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
     HmsCatalog, HmsCatalogBuilder, THRIFT_TRANSPORT_BUFFERED,
 };
-use iceberg_test_utils::docker::DockerCompose;
+use iceberg_test_utils::docker::{DockerCompose, skip_if_docker_unavailable};
 use iceberg_test_utils::{normalize_test_name, set_up};
 use port_scanner::scan_port_addr;
 use tokio::time::sleep;
@@ -42,6 +42,7 @@ type Result<T> = std::result::Result<T, iceberg::Error>;
 
 #[ctor]
 fn before_all() {
+    skip_if_docker_unavailable("hms catalog integration tests");
     let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
     let docker_compose = DockerCompose::new(
         normalize_test_name(module_path!()),

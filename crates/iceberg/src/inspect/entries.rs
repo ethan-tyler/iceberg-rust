@@ -422,13 +422,7 @@ impl<'a> EntriesTable<'a> {
         let data_file_type = self.data_file_struct_fields(partition_type);
         let arrow_schema = schema_to_arrow_schema(
             &crate::spec::Schema::builder()
-                .with_fields(
-                    data_file_type
-                        .fields()
-                        .iter()
-                        .map(|f| f.clone())
-                        .collect::<Vec<_>>(),
-                )
+                .with_fields(data_file_type.fields().to_vec())
                 .build()
                 .unwrap(),
         )?;
@@ -1038,10 +1032,7 @@ mod tests {
             .as_primitive::<arrow_array::types::Int64Type>();
         assert_eq!(snapshot_id_col.value(0), current_snapshot.snapshot_id());
         assert_eq!(snapshot_id_col.value(1), current_snapshot.snapshot_id());
-        assert_eq!(
-            snapshot_id_col.value(2),
-            current_snapshot.snapshot_id() - 1
-        );
+        assert_eq!(snapshot_id_col.value(2), current_snapshot.snapshot_id() - 1);
 
         // Check data_file struct column
         let data_file_col = batch.column(4).as_struct();
