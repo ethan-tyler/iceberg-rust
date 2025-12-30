@@ -25,6 +25,7 @@ use crate::get_shared_containers;
 
 mod append_data_file_test;
 mod append_partition_data_file_test;
+mod cli_test;
 mod conflict_commit_test;
 mod datafusion;
 mod delete_files_test;
