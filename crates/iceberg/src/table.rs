@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::arrow::ArrowReaderBuilder;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
-use crate::io::object_cache::{CacheStats, ObjectCache, ObjectCacheConfig};
+use crate::io::object_cache::{CacheMetrics, CacheStats, ObjectCache, ObjectCacheConfig};
 use crate::scan::{IncrementalScanBuilder, TableScanBuilder};
 use crate::spec::{DataFile, SchemaRef, TableMetadata, TableMetadataRef};
 use crate::transaction::{
@@ -303,6 +303,11 @@ impl Table {
     /// ```
     pub fn cache_stats(&self) -> CacheStats {
         self.object_cache.stats()
+    }
+
+    /// Returns cache hit/miss/load metrics for monitoring.
+    pub fn cache_metrics(&self) -> CacheMetrics {
+        self.object_cache.metrics()
     }
 
     /// Creates a table scan.

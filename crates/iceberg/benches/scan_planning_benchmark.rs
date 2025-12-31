@@ -26,12 +26,14 @@
 //! cargo bench --bench scan_planning_benchmark -p iceberg -- --baseline main
 //! ```
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::env;
+use std::time::{Duration, Instant};
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use futures::TryStreamExt;
 use iceberg::TableIdent;
-use iceberg::io::FileIO;
+use iceberg::io::{CacheMetrics, CacheStats, FileIO, MANIFEST_CACHE_MAX_TOTAL_BYTES};
 use iceberg::scan::TableScan;
 use iceberg::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestListWriter,
@@ -46,6 +48,101 @@ fn render_template(template: &str, ctx: Value) -> String {
     let mut env = Environment::new();
     env.set_auto_escape_callback(|_| AutoEscape::None);
     env.render_str(template, ctx).unwrap()
+}
+
+struct BenchProfile {
+    name: &'static str,
+    manifest_count: usize,
+    entries_per_manifest: usize,
+    iterations: usize,
+}
+
+struct PlanMeasurement {
+    p50: Duration,
+    p95: Duration,
+    task_count: usize,
+    cache_stats: CacheStats,
+    cache_metrics: CacheMetrics,
+    iterations: usize,
+}
+
+fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
+    if sorted.is_empty() {
+        return Duration::from_secs(0);
+    }
+    let index = (sorted.len() * percentile / 100).min(sorted.len() - 1);
+    sorted[index]
+}
+
+fn diff_metrics(before: CacheMetrics, after: CacheMetrics) -> CacheMetrics {
+    CacheMetrics {
+        hits: after.hits.saturating_sub(before.hits),
+        misses: after.misses.saturating_sub(before.misses),
+        loads: after.loads.saturating_sub(before.loads),
+    }
+}
+
+async fn measure_plan_files(
+    table: &Table,
+    iterations: usize,
+    invalidate_each_time: bool,
+) -> PlanMeasurement {
+    let mut durations = Vec::with_capacity(iterations);
+    let mut expected_task_count: Option<usize> = None;
+    let metrics_before = table.cache_metrics();
+
+    for _ in 0..iterations {
+        if invalidate_each_time {
+            table.invalidate_cache();
+        }
+        let scan = table.scan().build().unwrap();
+        let start = Instant::now();
+        let task_count = plan_files_and_count_tasks(&scan).await;
+        durations.push(start.elapsed());
+
+        match expected_task_count {
+            Some(expected) => {
+                assert_eq!(
+                    task_count, expected,
+                    "scan task count changed between iterations"
+                );
+            }
+            None => expected_task_count = Some(task_count),
+        }
+    }
+
+    durations.sort_unstable();
+
+    let metrics_after = table.cache_metrics();
+    let cache_metrics = diff_metrics(metrics_before, metrics_after);
+
+    PlanMeasurement {
+        p50: percentile(&durations, 50),
+        p95: percentile(&durations, 95),
+        task_count: expected_task_count.unwrap_or(0),
+        cache_stats: table.cache_stats(),
+        cache_metrics,
+        iterations,
+    }
+}
+
+fn print_measurement(profile: &BenchProfile, scenario: &str, measurement: &PlanMeasurement) {
+    println!(
+        "profile={} scenario={} iterations={} tasks={} p50_us={} p95_us={} hits={} misses={} loads={} hit_rate={:.3} entries={} weighted_bytes={} max_bytes={}",
+        profile.name,
+        scenario,
+        measurement.iterations,
+        measurement.task_count,
+        measurement.p50.as_micros(),
+        measurement.p95.as_micros(),
+        measurement.cache_metrics.hits,
+        measurement.cache_metrics.misses,
+        measurement.cache_metrics.loads,
+        measurement.cache_metrics.hit_rate(),
+        measurement.cache_stats.entry_count,
+        measurement.cache_stats.weighted_size,
+        measurement.cache_stats.max_capacity
+    );
 }
 
 struct BenchFixture {
@@ -84,7 +181,23 @@ impl BenchFixture {
             table_metadata_1_location => table_metadata_location.to_str().unwrap(),
         });
 
-        let table_metadata = serde_json::from_str::<TableMetadata>(&metadata_json).unwrap();
+        let mut table_metadata = serde_json::from_str::<TableMetadata>(&metadata_json).unwrap();
+        if let Ok(value) = env::var("ICEBERG_MANIFEST_CACHE_MAX_BYTES") {
+            if let Ok(cache_bytes) = value.parse::<u64>() {
+                let mut properties = HashMap::new();
+                properties.insert(
+                    MANIFEST_CACHE_MAX_TOTAL_BYTES.to_string(),
+                    cache_bytes.to_string(),
+                );
+                table_metadata = table_metadata
+                    .into_builder(None)
+                    .set_properties(properties)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .metadata;
+            }
+        }
 
         let metadata = std::sync::Arc::new(table_metadata);
         let table = Table::builder()
@@ -225,44 +338,80 @@ fn bench_scan_planning(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    // A moderately-sized manifest set so planning is large enough to measure.
-    let fixture = BenchFixture::new(&runtime, 8, 250);
+    let profiles = [
+        BenchProfile {
+            name: "small",
+            manifest_count: 10,
+            entries_per_manifest: 10,
+            iterations: 200,
+        },
+        BenchProfile {
+            name: "medium",
+            manifest_count: 100,
+            entries_per_manifest: 100,
+            iterations: 100,
+        },
+        BenchProfile {
+            name: "large",
+            manifest_count: 1000,
+            entries_per_manifest: 100,
+            iterations: 50,
+        },
+    ];
 
-    let warm_cache_table = fixture.build_table(false, None, None);
-    let cold_cache_table = fixture.build_table(false, None, None);
-    let disabled_cache_table = fixture.build_table(true, None, None);
+    for profile in &profiles {
+        let fixture = BenchFixture::new(&runtime, profile.manifest_count, profile.entries_per_manifest);
 
-    runtime.block_on(async {
-        // Warm cache by planning once.
-        let scan = warm_cache_table.scan().build().unwrap();
-        let _ = plan_files_and_count_tasks(&scan).await;
-    });
+        let warm_cache_table = fixture.build_table(false, None, None);
+        let cold_cache_table = fixture.build_table(false, None, None);
+        let disabled_cache_table = fixture.build_table(true, None, None);
 
-    let mut group = c.benchmark_group("scan_planning_plan_files");
-
-    group.bench_function("disabled_cache", |b| {
-        b.to_async(&runtime).iter(|| async {
-            let scan = disabled_cache_table.scan().build().unwrap();
-            black_box(plan_files_and_count_tasks(&scan).await);
-        })
-    });
-
-    group.bench_function("cold_cache_invalidate_each_time", |b| {
-        b.to_async(&runtime).iter(|| async {
-            cold_cache_table.invalidate_cache();
-            let scan = cold_cache_table.scan().build().unwrap();
-            black_box(plan_files_and_count_tasks(&scan).await);
-        })
-    });
-
-    group.bench_function("warm_cache", |b| {
-        b.to_async(&runtime).iter(|| async {
+        runtime.block_on(async {
             let scan = warm_cache_table.scan().build().unwrap();
-            black_box(plan_files_and_count_tasks(&scan).await);
-        })
-    });
+            let _ = plan_files_and_count_tasks(&scan).await;
+        });
 
-    group.finish();
+        runtime.block_on(async {
+            let disabled_metrics =
+                measure_plan_files(&disabled_cache_table, profile.iterations, false).await;
+            print_measurement(profile, "disabled_cache", &disabled_metrics);
+
+            let cold_metrics =
+                measure_plan_files(&cold_cache_table, profile.iterations, true).await;
+            print_measurement(profile, "cold_cache_invalidate_each_time", &cold_metrics);
+
+            let warm_metrics =
+                measure_plan_files(&warm_cache_table, profile.iterations, false).await;
+            print_measurement(profile, "warm_cache", &warm_metrics);
+        });
+
+        let mut group =
+            c.benchmark_group(format!("scan_planning_plan_files_{}", profile.name));
+
+        group.bench_function("disabled_cache", |b| {
+            b.to_async(&runtime).iter(|| async {
+                let scan = disabled_cache_table.scan().build().unwrap();
+                black_box(plan_files_and_count_tasks(&scan).await);
+            })
+        });
+
+        group.bench_function("cold_cache_invalidate_each_time", |b| {
+            b.to_async(&runtime).iter(|| async {
+                cold_cache_table.invalidate_cache();
+                let scan = cold_cache_table.scan().build().unwrap();
+                black_box(plan_files_and_count_tasks(&scan).await);
+            })
+        });
+
+        group.bench_function("warm_cache", |b| {
+            b.to_async(&runtime).iter(|| async {
+                let scan = warm_cache_table.scan().build().unwrap();
+                black_box(plan_files_and_count_tasks(&scan).await);
+            })
+        });
+
+        group.finish();
+    }
 }
 
 criterion_group!(benches, bench_scan_planning,);

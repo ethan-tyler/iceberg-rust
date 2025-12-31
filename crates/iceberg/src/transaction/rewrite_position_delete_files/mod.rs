@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use parquet::file::properties::WriterProperties;
@@ -33,7 +33,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::writer::IcebergWriter;
+use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_schema,
 };
@@ -44,6 +44,7 @@ use crate::writer::file_writer::location_generator::{
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::{Error, ErrorKind};
 
+/// Action to rewrite position delete files.
 pub struct RewritePositionDeleteFilesAction {
     check_duplicate: bool,
     commit_uuid: Option<Uuid>,
@@ -61,21 +62,25 @@ impl RewritePositionDeleteFilesAction {
         }
     }
 
+    /// Sets whether duplicate position deletes should be checked.
     pub fn with_check_duplicate(mut self, v: bool) -> Self {
         self.check_duplicate = v;
         self
     }
 
+    /// Sets the commit UUID for the rewrite action.
     pub fn set_commit_uuid(mut self, commit_uuid: Uuid) -> Self {
         self.commit_uuid = Some(commit_uuid);
         self
     }
 
+    /// Sets key metadata for encrypted file handling.
     pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
         self.key_metadata = Some(key_metadata);
         self
     }
 
+    /// Sets snapshot properties for the commit.
     pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
         self
@@ -121,7 +126,7 @@ impl TransactionAction for RewritePositionDeleteFilesAction {
                         "rewrite position delete files only supports Parquet delete files",
                     ));
                 }
-                position_delete_entries.push(entry.clone());
+                position_delete_entries.push(entry.as_ref().clone());
             }
         }
 
