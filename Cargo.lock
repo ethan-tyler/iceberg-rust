@@ -3546,6 +3546,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-cli"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs",
+ "futures",
+ "humantime",
+ "iceberg",
+ "iceberg-catalog-loader",
+ "iceberg-datafusion",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "iceberg-datafusion"
 version = "0.7.0"
 dependencies = [
