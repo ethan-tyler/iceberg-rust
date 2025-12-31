@@ -20,13 +20,16 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array as ArrowArray, ArrayRef, Int32Array, RecordBatch, RecordBatchOptions, RunArray,
+    StructArray,
 };
 use arrow_cast::cast;
 use arrow_schema::{
-    DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, SchemaRef,
+    DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    SchemaRef,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use crate::arrow::schema::get_field_id;
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
 use crate::metadata_columns::get_metadata_field;
@@ -610,7 +613,17 @@ impl RecordBatchTransformer {
                     ColumnSource::Promote {
                         target_type,
                         source_index,
-                    } => cast(&*columns[*source_index], target_type)?,
+                    } => {
+                        let source_array = &columns[*source_index];
+                        if let DataType::Struct(target_fields) = target_type {
+                            if let Some(struct_array) =
+                                source_array.as_any().downcast_ref::<StructArray>()
+                            {
+                                return Self::promote_struct_array(struct_array, target_fields);
+                            }
+                        }
+                        cast(&**source_array, target_type)?
+                    }
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
@@ -625,9 +638,7 @@ impl RecordBatchTransformer {
         prim_lit: &Option<PrimitiveLiteral>,
         num_rows: usize,
     ) -> Result<ArrayRef> {
-        // Check if this is a RunEndEncoded type (for constant fields)
         if let DataType::RunEndEncoded(_, values_field) = target_type {
-            // Helper to create a Run-End Encoded array
             let create_ree_array = |values_array: ArrayRef| -> Result<ArrayRef> {
                 let run_ends = if num_rows == 0 {
                     Int32Array::from(Vec::<i32>::new())
@@ -645,16 +656,65 @@ impl RecordBatchTransformer {
                 ))
             };
 
-            // Create the values array using the helper function
             let values_array =
                 create_primitive_array_single_element(values_field.data_type(), prim_lit)?;
 
-            // Wrap in Run-End Encoding
             create_ree_array(values_array)
         } else {
-            // Non-REE type (simple arrays for non-constant fields)
             create_primitive_array_repeated(target_type, prim_lit, num_rows)
         }
+    }
+
+    fn promote_struct_array(
+        source: &StructArray,
+        target_fields: &Fields,
+    ) -> Result<ArrayRef> {
+        let num_rows = source.len();
+        let mut source_by_id = HashMap::new();
+        let mut source_by_name = HashMap::new();
+
+        for (index, field) in source.fields().iter().enumerate() {
+            if let Ok(field_id) = get_field_id(field.as_ref()) {
+                source_by_id.insert(field_id, source.column(index).clone());
+            }
+            source_by_name.insert(field.name().to_string(), source.column(index).clone());
+        }
+
+        let mut arrays = Vec::with_capacity(target_fields.len());
+        for target_field in target_fields.iter() {
+            let source_array = get_field_id(target_field.as_ref())
+                .ok()
+                .and_then(|field_id| source_by_id.get(&field_id))
+                .or_else(|| source_by_name.get(target_field.name()));
+
+            let array = if let Some(source_array) = source_array {
+                if let DataType::Struct(nested_fields) = target_field.data_type() {
+                    if let Some(nested_struct) =
+                        source_array.as_any().downcast_ref::<StructArray>()
+                    {
+                        Self::promote_struct_array(nested_struct, nested_fields)?
+                    } else if source_array.data_type().equals_datatype(target_field.data_type()) {
+                        source_array.clone()
+                    } else {
+                        cast(&**source_array, target_field.data_type())?
+                    }
+                } else if source_array.data_type().equals_datatype(target_field.data_type()) {
+                    source_array.clone()
+                } else {
+                    cast(&**source_array, target_field.data_type())?
+                }
+            } else {
+                create_primitive_array_repeated(target_field.data_type(), &None, num_rows)?
+            };
+
+            arrays.push(array);
+        }
+
+        let nulls = source.nulls().cloned();
+        let struct_array = StructArray::try_new(target_fields.clone(), arrays, nulls)
+            .map_err(|e| Error::new(ErrorKind::Unexpected, "Failed to build struct array")
+                .with_source(e))?;
+        Ok(Arc::new(struct_array))
     }
 }
 

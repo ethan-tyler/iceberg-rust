@@ -34,10 +34,12 @@
 
 use std::collections::HashMap;
 use std::process::{Command as StdCommand, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 /// Result of a Spark validation query.
@@ -242,6 +244,8 @@ impl std::fmt::Display for SparkValidationError {
 
 impl std::error::Error for SparkValidationError {}
 
+static SPARK_SUBMIT_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+
 const DEFAULT_SPARK_VALIDATE_TIMEOUT_SECS: u64 = 120;
 const SPARK_VALIDATE_TIMEOUT_ENV: &str = "ICEBERG_SPARK_VALIDATE_TIMEOUT_SECS";
 const SPARK_CONTAINER_ENV: &str = "ICEBERG_SPARK_CONTAINER";
@@ -258,6 +262,9 @@ async fn run_spark_submit(
     container_name: &str,
     args: Vec<String>,
 ) -> Result<Output, SparkValidationError> {
+    let guard = SPARK_SUBMIT_GUARD.get_or_init(|| Mutex::new(()));
+    let _spark_submit_guard = guard.lock().await;
+
     let timeout_duration = validation_timeout();
     let mut cmd = Command::new("docker");
     cmd.args(&args)

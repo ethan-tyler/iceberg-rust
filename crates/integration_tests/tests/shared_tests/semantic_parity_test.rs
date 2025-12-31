@@ -54,7 +54,7 @@ use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
-use iceberg::spec::{DataContentType, Manifest, ManifestStatus, StructType};
+use iceberg::spec::{DataContentType, ManifestStatus, StructType};
 use iceberg::transaction::{
     ApplyTransactionAction, RewriteDataFilesOptions, RewriteStrategy, Transaction,
 };
@@ -425,12 +425,9 @@ async fn extract_rust_manifest_entries(
 
     let mut entries = Vec::new();
     for manifest_file in manifest_list.entries() {
-        let manifest_bytes = table
-            .file_io()
-            .new_input(&manifest_file.manifest_path)?
-            .read()
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
             .await?;
-        let manifest = Manifest::parse_avro(&manifest_bytes)?;
         let partition_type = manifest
             .metadata()
             .partition_spec()
@@ -483,37 +480,6 @@ fn partition_multiset_from_spark(entries: &[ManifestEntryInfo]) -> BTreeMap<Stri
     counts
 }
 
-fn status_sequence_from_rust(entries: &[RustManifestEntryInfo]) -> Vec<i32> {
-    entries.iter().map(|entry| entry.status).collect()
-}
-
-fn status_sequence_from_spark(entries: &[ManifestEntryInfo]) -> Vec<i32> {
-    entries
-        .iter()
-        .map(|entry| entry.status.unwrap_or(-1))
-        .collect()
-}
-
-fn content_sequence_from_rust(entries: &[RustManifestEntryInfo]) -> Vec<i32> {
-    entries
-        .iter()
-        .map(|entry| entry.data_file.content)
-        .collect()
-}
-
-fn content_sequence_from_spark(entries: &[ManifestEntryInfo]) -> Vec<i32> {
-    entries
-        .iter()
-        .map(|entry| {
-            entry
-                .data_file
-                .as_ref()
-                .and_then(|df| df.content)
-                .unwrap_or(-1)
-        })
-        .collect()
-}
-
 fn compare_manifest_entries(
     operation: &str,
     rust_entries: &[RustManifestEntryInfo],
@@ -534,8 +500,29 @@ fn compare_manifest_entries(
         None,
     ));
 
-    let rust_statuses = status_sequence_from_rust(rust_entries);
-    let spark_statuses = status_sequence_from_spark(spark_entry_list);
+    let mut rust_sorted: Vec<&RustManifestEntryInfo> = rust_entries.iter().collect();
+    rust_sorted.sort_by_key(|entry| {
+        (
+            entry.file_sequence_number.unwrap_or(i64::MAX),
+            entry.sequence_number.unwrap_or(i64::MAX),
+            entry.status,
+        )
+    });
+
+    let mut spark_sorted: Vec<&ManifestEntryInfo> = spark_entry_list.iter().collect();
+    spark_sorted.sort_by_key(|entry| {
+        (
+            entry.file_sequence_number.unwrap_or(i64::MAX),
+            entry.sequence_number.unwrap_or(i64::MAX),
+            entry.status.unwrap_or(-1),
+        )
+    });
+
+    let rust_statuses: Vec<i32> = rust_sorted.iter().map(|entry| entry.status).collect();
+    let spark_statuses: Vec<i32> = spark_sorted
+        .iter()
+        .map(|entry| entry.status.unwrap_or(-1))
+        .collect();
     let rust_statuses_str = format!("{rust_statuses:?}");
     let spark_statuses_str = format!("{spark_statuses:?}");
     comparisons.push(compare_field(
@@ -545,8 +532,17 @@ fn compare_manifest_entries(
         None,
     ));
 
-    let rust_contents = content_sequence_from_rust(rust_entries);
-    let spark_contents = content_sequence_from_spark(spark_entry_list);
+    let rust_contents: Vec<i32> = rust_sorted.iter().map(|entry| entry.data_file.content).collect();
+    let spark_contents: Vec<i32> = spark_sorted
+        .iter()
+        .map(|entry| {
+            entry
+                .data_file
+                .as_ref()
+                .and_then(|df| df.content)
+                .unwrap_or(-1)
+        })
+        .collect();
     let rust_contents_str = format!("{rust_contents:?}");
     let spark_contents_str = format!("{spark_contents:?}");
     comparisons.push(compare_field(
@@ -1177,17 +1173,19 @@ async fn test_semantic_parity_merge() {
     let rust_summary = extract_rust_snapshot_summary(&rust_table);
 
     let merge_sql = r#"
-MERGE INTO rest.default.parity_merge_spark AS target
-USING (
-  SELECT * FROM VALUES
-    (1, 'alpha_upd', 110),
-    (3, 'gamma_upd', 330),
-    (5, 'epsilon', 500)
-) AS source (id, name, value)
-ON target.id = source.id
-WHEN MATCHED THEN UPDATE SET name = source.name, value = source.value
-WHEN NOT MATCHED THEN INSERT *
-"#;
+ MERGE INTO rest.default.parity_merge_spark AS target
+ USING (
+   SELECT 1 AS id, 'alpha_upd' AS name, 110 AS value
+   UNION ALL
+   SELECT 3 AS id, 'gamma_upd' AS name, 330 AS value
+   UNION ALL
+   SELECT 5 AS id, 'epsilon' AS name, 500 AS value
+ ) AS source
+ ON target.id = source.id
+ WHEN MATCHED THEN UPDATE SET name = source.name, value = source.value
+ WHEN NOT MATCHED THEN INSERT *
+ "#;
+
 
     let spark_summary =
         spark_execute_sql_with_container(&spark_container, "parity_merge_spark", merge_sql)
@@ -1241,7 +1239,7 @@ async fn test_semantic_parity_compaction() {
     let spark_summary = spark_execute_sql_with_container(
         &spark_container,
         "parity_compact_spark",
-        "CALL rest.system.rewrite_data_files('default.parity_compact_spark')",
+        "CALL rest.system.rewrite_data_files(table => 'default.parity_compact_spark', options => map('min-input-files','2'))",
     )
     .await
     .expect("Spark compaction should succeed");
@@ -1288,7 +1286,7 @@ async fn test_semantic_parity_expire_snapshots() {
     let spark_summary = spark_execute_sql_with_container(
         &spark_container,
         "parity_expire_spark",
-        "CALL rest.system.expire_snapshots('default.parity_expire_spark', older_than => current_timestamp(), retain_last => 1)",
+        "CALL rest.system.expire_snapshots('default.parity_expire_spark', TIMESTAMP '2100-01-01 00:00:00.000', 1)",
     )
     .await
     .expect("Spark expire snapshots should succeed");

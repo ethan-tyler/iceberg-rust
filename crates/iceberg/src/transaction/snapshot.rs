@@ -731,6 +731,8 @@ impl<'a> SnapshotProducer<'a> {
 
         let mut manifests = Vec::new();
 
+        let format_version = self.table.metadata().format_version();
+
         if !data_entries.is_empty() {
             let entry_groups = group_entries_by_spec(data_entries);
             for (spec_id, entries) in entry_groups {
@@ -748,7 +750,24 @@ impl<'a> SnapshotProducer<'a> {
                 let mut writer =
                     self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
                 for entry in entries {
-                    writer.add_delete_entry(entry)?;
+                    if format_version == FormatVersion::V1 {
+                        writer.add_delete_entry(entry)?;
+                    } else {
+                        let sequence_number = entry.sequence_number().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Deleted entry missing sequence number: {}",
+                                    entry.file_path()
+                                ),
+                            )
+                        })?;
+                        writer.add_delete_file(
+                            entry.data_file().clone(),
+                            sequence_number,
+                            entry.file_sequence_number,
+                        )?;
+                    }
                 }
                 manifests.push(writer.write_manifest_file().await?);
             }
@@ -771,7 +790,24 @@ impl<'a> SnapshotProducer<'a> {
                 let mut writer = self
                     .new_manifest_writer_for_spec(partition_spec, ManifestContentType::Deletes)?;
                 for entry in entries {
-                    writer.add_delete_entry(entry)?;
+                    if format_version == FormatVersion::V1 {
+                        writer.add_delete_entry(entry)?;
+                    } else {
+                        let sequence_number = entry.sequence_number().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Deleted entry missing sequence number: {}",
+                                    entry.file_path()
+                                ),
+                            )
+                        })?;
+                        writer.add_delete_file(
+                            entry.data_file().clone(),
+                            sequence_number,
+                            entry.file_sequence_number,
+                        )?;
+                    }
                 }
                 manifests.push(writer.write_manifest_file().await?);
             }
@@ -857,13 +893,10 @@ impl<'a> SnapshotProducer<'a> {
         &mut self,
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
+        deleted_entries: Vec<ManifestEntry>,
+        existing_entries: Vec<ManifestEntry>,
     ) -> Result<Vec<ManifestFile>> {
-        // Get entries to delete (files being removed from the table)
-        let deleted_entries = snapshot_produce_operation.delete_entries(self).await?;
         let has_deleted_entries = !deleted_entries.is_empty();
-
-        // Get existing entries (files being carried forward from partially affected manifests)
-        let existing_entries = snapshot_produce_operation.existing_entries(self).await?;
         let has_existing_entries = !existing_entries.is_empty();
 
         // Assert current snapshot producer contains new content to add to new snapshot.
@@ -930,6 +963,7 @@ impl<'a> SnapshotProducer<'a> {
     fn summary<OP: SnapshotProduceOperation>(
         &self,
         snapshot_produce_operation: &OP,
+        deleted_entries: &[ManifestEntry],
     ) -> Result<Summary> {
         let mut summary_collector = SnapshotSummaryCollector::default();
         let table_metadata = self.table.metadata_ref();
@@ -993,10 +1027,28 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        let previous_snapshot = table_metadata
-            .snapshot_by_id(self.snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id())
-            .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        for deleted_entry in deleted_entries {
+            let data_file = deleted_entry.data_file();
+            let partition_spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Deleted entry references unknown partition spec: {}",
+                            data_file.partition_spec_id
+                        ),
+                    )
+                })?;
+            let compatible_schema = self.find_compatible_schema(partition_spec)?;
+            summary_collector.remove_file(
+                data_file,
+                compatible_schema.clone(),
+                partition_spec.clone(),
+            );
+        }
+
+        let previous_snapshot = self.current_snapshot()?;
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());
@@ -1006,11 +1058,7 @@ impl<'a> SnapshotProducer<'a> {
             additional_properties,
         };
 
-        update_snapshot_summaries(
-            summary,
-            previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
-        )
+        update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
     fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
@@ -1076,12 +1124,22 @@ impl<'a> SnapshotProducer<'a> {
         // Calling self.summary() before self.manifest_file() is important because self.added_data_files
         // will be set to an empty vec after self.manifest_file() returns, resulting in an empty summary
         // being generated.
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
-            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
-        })?;
+        let deleted_entries = snapshot_produce_operation.delete_entries(&self).await?;
+        let existing_entries = snapshot_produce_operation.existing_entries(&self).await?;
+        let summary = self
+            .summary(&snapshot_produce_operation, &deleted_entries)
+            .map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.")
+                    .with_source(err)
+            })?;
 
         let new_manifests = self
-            .manifest_file(&snapshot_produce_operation, &process)
+            .manifest_file(
+                &snapshot_produce_operation,
+                &process,
+                deleted_entries,
+                existing_entries,
+            )
             .await?;
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;

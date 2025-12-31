@@ -81,6 +81,7 @@ pub use rewrite_manifests::{
     RewriteManifestsAction, RewriteManifestsOptions, RewriteManifestsPlanner,
     RewriteManifestsResult,
 };
+pub use rewrite_position_delete_files::RewritePositionDeleteFilesAction;
 // Internal-only exports for rewrite_manifests implementation (used by action commit)
 #[allow(unused_imports)]
 pub(crate) use rewrite_manifests::{ManifestRewriter, generate_manifest_path};
@@ -99,6 +100,8 @@ pub mod remove_orphan_files;
 mod replace_partitions;
 pub mod rewrite_data_files;
 pub mod rewrite_manifests;
+/// Action for rewriting position delete files.
+pub mod rewrite_position_delete_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -462,6 +465,11 @@ impl Transaction {
     /// - **V2+ tables**: Data and delete manifests (configurable)
     pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
         RewriteManifestsAction::new()
+    }
+
+    /// Creates a rewrite position delete files action.
+    pub fn rewrite_position_delete_files(&self) -> RewritePositionDeleteFilesAction {
+        RewritePositionDeleteFilesAction::new()
     }
 
     /// Creates an expire snapshots action for table maintenance.

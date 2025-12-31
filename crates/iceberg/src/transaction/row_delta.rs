@@ -346,21 +346,41 @@ impl TransactionAction for RowDeltaAction {
         // Validate no conflicting files have been added since baseline
         self.validate_no_conflicts(table).await?;
 
+        let operation = RowDeltaOperation::new(
+            !self.added_data_files.is_empty(),
+            !self.added_delete_files.is_empty(),
+        );
+
         snapshot_producer
-            .commit(RowDeltaOperation, DefaultManifestProcess)
+            .commit(operation, DefaultManifestProcess)
             .await
     }
 }
 
 /// Operation implementation for RowDelta snapshots.
 ///
-/// RowDelta is an additive operation that adds both data files and delete files
-/// to the table. Unlike Overwrite, it does not remove any existing manifest entries.
-struct RowDeltaOperation;
+struct RowDeltaOperation {
+    has_data_files: bool,
+    has_delete_files: bool,
+}
+
+impl RowDeltaOperation {
+    fn new(has_data_files: bool, has_delete_files: bool) -> Self {
+        Self {
+            has_data_files,
+            has_delete_files,
+        }
+    }
+}
 
 impl SnapshotProduceOperation for RowDeltaOperation {
     fn operation(&self) -> Operation {
-        Operation::RowDelta
+        match (self.has_data_files, self.has_delete_files) {
+            (true, false) => Operation::Append,
+            (false, true) => Operation::Delete,
+            (true, true) => Operation::Overwrite,
+            (false, false) => Operation::Append,
+        }
     }
 
     async fn delete_entries(
@@ -398,7 +418,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Struct,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Operation, Struct,
     };
     use crate::transaction::tests::{make_v1_table, make_v2_minimal_table};
     use crate::transaction::{Transaction, TransactionAction};
@@ -435,7 +455,6 @@ mod tests {
         let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
         let updates = action_commit.take_updates();
 
-        // Should create a snapshot with row_delta operation
         assert!(matches!(
             (&updates[0], &updates[1]),
             (
@@ -464,6 +483,12 @@ mod tests {
         let action = tx.row_delta().add_position_delete_files(vec![delete_file]);
         let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
         let updates = action_commit.take_updates();
+
+        let snapshot = match &updates[0] {
+            TableUpdate::AddSnapshot { snapshot } => snapshot,
+            _ => panic!("Expected AddSnapshot update"),
+        };
+        assert_eq!(snapshot.summary().operation, Operation::Delete);
 
         assert_eq!(updates.len(), 2);
         assert!(matches!(updates[0], TableUpdate::AddSnapshot { .. }));
@@ -505,6 +530,12 @@ mod tests {
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
 
+        let snapshot = match &updates[0] {
+            TableUpdate::AddSnapshot { snapshot } => snapshot,
+            _ => panic!("Expected AddSnapshot update"),
+        };
+        assert_eq!(snapshot.summary().operation, Operation::Overwrite);
+
         // Check that we got a snapshot update
         assert!(matches!(
             (&updates[0], &updates[1]),
@@ -527,7 +558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_row_delta_snapshot_operation_is_row_delta() {
+    async fn test_row_delta_snapshot_operation_is_append() {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
 
@@ -546,17 +577,13 @@ mod tests {
         let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
         let updates = action_commit.take_updates();
 
-        // Check snapshot operation is RowDelta
         let snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
             snapshot
         } else {
             panic!("Expected AddSnapshot update");
         };
 
-        assert_eq!(
-            snapshot.summary().operation,
-            crate::spec::Operation::RowDelta
-        );
+        assert_eq!(snapshot.summary().operation, Operation::Append);
     }
 
     #[tokio::test]

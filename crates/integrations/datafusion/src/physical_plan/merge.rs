@@ -99,6 +99,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
+use super::record_batch::coerce_batch_schema;
 use crate::merge::{
     MatchedAction, MergeStats, NotMatchedAction, NotMatchedBySourceAction, WhenMatchedClause,
     WhenNotMatchedBySourceClause, WhenNotMatchedClause,
@@ -1500,7 +1501,7 @@ fn extract_distinct_values(
 /// Optionally applies a partition filter for Dynamic Partition Pruning.
 async fn scan_target_with_metadata(
     table: &Table,
-    _schema: &ArrowSchemaRef,
+    schema: &ArrowSchemaRef,
     partition_filter: Option<Predicate>,
 ) -> DFResult<Vec<RecordBatch>> {
     // Build the scan - select all columns
@@ -1546,7 +1547,7 @@ async fn scan_target_with_metadata(
 
         let mut row_offset = 0i64;
         while let Some(batch_result) = batch_stream.next().await {
-            let batch = batch_result?;
+            let batch = coerce_batch_schema(batch_result?, schema)?;
             let batch_size = batch.num_rows();
 
             // Add metadata columns

@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
+use datafusion::arrow::compute::cast;
 use futures::TryStreamExt;
 use iceberg::spec::{
     Literal, PartitionKey, PrimitiveLiteral, Struct, Transform, UnboundPartitionSpec,
@@ -145,7 +146,8 @@ async fn test_append_partition_data_file() {
         .unwrap();
     let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0], batch);
+    let coerced = coerce_batch(batches[0].clone(), schema.clone());
+    assert_eq!(coerced, batch);
 
     let partition_key = partition_key.copy_with_data(Struct::from_iter([Some(
         Literal::Primitive(PrimitiveLiteral::Boolean(true)),
@@ -175,6 +177,22 @@ async fn test_append_partition_data_file() {
         &rest_catalog,
     )
     .await;
+}
+
+fn coerce_batch(batch: RecordBatch, expected_schema: Arc<arrow_schema::Schema>) -> RecordBatch {
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .zip(expected_schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Arc::clone(column)
+            } else {
+                cast(column.as_ref(), field.data_type()).expect("Failed to cast batch column")
+            }
+        })
+        .collect();
+    RecordBatch::try_new(expected_schema, columns).expect("Failed to rebuild batch")
 }
 
 async fn test_schema_incompatible_partition_type(

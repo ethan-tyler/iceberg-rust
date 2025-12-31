@@ -84,8 +84,11 @@ enum SupportedDeleteWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNa
     Unpartitioned(
         iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<B, L, F>,
     ),
-    /// Writer for partitioned tables - routes to partition-specific writers
-    Fanout(FanoutWriter<PositionDeleteFileWriterBuilder<B, L, F>>),
+    Mixed {
+        unpartitioned:
+            iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<B, L, F>,
+        fanout: FanoutWriter<PositionDeleteFileWriterBuilder<B, L, F>>,
+    },
 }
 
 impl<B, L, F> PositionDeleteTaskWriter<B, L, F>
@@ -122,8 +125,12 @@ where
             let inner = writer_builder.build(None).await?;
             SupportedDeleteWriter::Unpartitioned(inner)
         } else {
-            // For partitioned tables, use FanoutWriter to handle multiple partitions
-            SupportedDeleteWriter::Fanout(FanoutWriter::new(writer_builder))
+            let unpartitioned = writer_builder.clone().build(None).await?;
+            let fanout = FanoutWriter::new(writer_builder);
+            SupportedDeleteWriter::Mixed {
+                unpartitioned,
+                fanout,
+            }
         };
 
         Ok(Self { writer, config })
@@ -145,7 +152,6 @@ where
     /// # Errors
     ///
     /// - Returns error if `partition_key` is `Some` for unpartitioned writer
-    /// - Returns error if `partition_key` is `None` for partitioned writer
     /// - Returns error if underlying writer fails
     pub async fn write(
         &mut self,
@@ -170,15 +176,13 @@ where
                 }
                 writer.write(batch).await
             }
-            SupportedDeleteWriter::Fanout(writer) => {
-                let pk = partition_key.ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "Partition key required for partitioned position delete writer",
-                    )
-                })?;
-                writer.write(pk, batch).await
-            }
+            SupportedDeleteWriter::Mixed {
+                unpartitioned,
+                fanout,
+            } => match partition_key {
+                Some(pk) => fanout.write(pk, batch).await,
+                None => unpartitioned.write(batch).await,
+            },
         }
     }
 
@@ -197,7 +201,14 @@ where
     pub async fn close(self) -> Result<Vec<DataFile>> {
         match self.writer {
             SupportedDeleteWriter::Unpartitioned(mut writer) => writer.close().await,
-            SupportedDeleteWriter::Fanout(writer) => writer.close().await,
+            SupportedDeleteWriter::Mixed {
+                mut unpartitioned,
+                fanout,
+            } => {
+                let mut files = unpartitioned.close().await?;
+                files.extend(fanout.close().await?);
+                Ok(files)
+            }
         }
     }
 

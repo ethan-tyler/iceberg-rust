@@ -81,7 +81,7 @@ pub mod object_cache;
 ///
 /// These types can also be accessed via [`object_cache`] module directly.
 pub use object_cache::{
-    CacheStats, DEFAULT_CACHE_ENABLED, DEFAULT_CACHE_SIZE_BYTES, DEFAULT_CACHE_TTL,
+    CacheMetrics, CacheStats, DEFAULT_CACHE_ENABLED, DEFAULT_CACHE_SIZE_BYTES, DEFAULT_CACHE_TTL,
     MANIFEST_CACHE_ENABLED, MANIFEST_CACHE_EXPIRATION_INTERVAL_MS, MANIFEST_CACHE_MAX_TOTAL_BYTES,
     ObjectCacheConfig, ObjectCacheConfigBuilder,
 };

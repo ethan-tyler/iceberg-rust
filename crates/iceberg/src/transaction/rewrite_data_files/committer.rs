@@ -20,7 +20,7 @@
 //! The committer takes completed file groups (after execution) and produces
 //! the snapshot commit that atomically replaces old files with new files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -657,6 +657,16 @@ struct ReplaceDataFilesOperation {
     starting_sequence_number: i64,
 }
 
+impl ReplaceDataFilesOperation {
+    fn file_paths_to_delete(&self) -> HashSet<String> {
+        self.files_to_delete
+            .iter()
+            .chain(self.delete_files_to_remove.iter())
+            .map(|entry| entry.file_path().to_string())
+            .collect()
+    }
+}
+
 impl SnapshotProduceOperation for ReplaceDataFilesOperation {
     fn operation(&self) -> Operation {
         // Use Replace operation to indicate compaction/rewrite
@@ -678,7 +688,6 @@ impl SnapshotProduceOperation for ReplaceDataFilesOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Get all manifests from current snapshot
         let Some(snapshot) = snapshot_produce.current_snapshot()? else {
             return Ok(vec![]);
         };
@@ -690,21 +699,82 @@ impl SnapshotProduceOperation for ReplaceDataFilesOperation {
             )
             .await?;
 
-        // Filter out manifests that contain ONLY files we're deleting
-        // We need to be careful here: if a manifest contains files we're keeping
-        // AND files we're deleting, we need special handling (existing_entries)
-        //
-        // For now, keep all existing manifests. The deleted files will be
-        // written to a new manifest with DELETED status. Iceberg readers
-        // correctly handle the interplay between Added/Existing/Deleted entries.
-        //
-        // A more optimized implementation could:
-        // 1. Identify manifests that only contain files being deleted
-        // 2. Skip those manifests entirely (don't include in existing_manifest)
-        // 3. Handle mixed manifests by splitting entries
-        //
-        // This optimization is left for a future improvement.
-        Ok(manifest_list.entries().to_vec())
+        let file_paths_to_delete = self.file_paths_to_delete();
+        let mut result = Vec::new();
+
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file
+                .load_manifest(snapshot_produce.table.file_io())
+                .await?;
+
+            let mut has_files_to_delete = false;
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                if file_paths_to_delete.contains(entry.file_path()) {
+                    has_files_to_delete = true;
+                    break;
+                }
+            }
+
+            if !has_files_to_delete {
+                result.push(manifest_file.clone());
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn existing_entries(
+        &self,
+        snapshot_produce: &SnapshotProducer<'_>,
+    ) -> Result<Vec<ManifestEntry>> {
+        let Some(snapshot) = snapshot_produce.current_snapshot()? else {
+            return Ok(vec![]);
+        };
+
+        let manifest_list = snapshot
+            .load_manifest_list(
+                snapshot_produce.table.file_io(),
+                &snapshot_produce.table.metadata_ref(),
+            )
+            .await?;
+
+        let file_paths_to_delete = self.file_paths_to_delete();
+        let mut entries_to_keep = Vec::new();
+
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file
+                .load_manifest(snapshot_produce.table.file_io())
+                .await?;
+
+            let mut has_files_to_delete = false;
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                if file_paths_to_delete.contains(entry.file_path()) {
+                    has_files_to_delete = true;
+                    break;
+                }
+            }
+
+            if !has_files_to_delete {
+                continue;
+            }
+
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                if !file_paths_to_delete.contains(entry.file_path()) {
+                    entries_to_keep.push(entry.as_ref().clone());
+                }
+            }
+        }
+
+        Ok(entries_to_keep)
     }
 
     fn data_sequence_number(&self) -> Option<i64> {

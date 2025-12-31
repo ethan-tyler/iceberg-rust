@@ -653,7 +653,10 @@ impl TransactionAction for OverwriteAction {
         }
 
         // Create operation with filter-based deletion logic
-        let operation = OverwriteOperation { partition_filters };
+        let operation = OverwriteOperation {
+            partition_filters,
+            has_added_files: !self.added_data_files.is_empty(),
+        };
 
         snapshot_producer
             .commit(operation, DefaultManifestProcess)
@@ -664,11 +667,16 @@ impl TransactionAction for OverwriteAction {
 /// Operation implementation for filter-based overwrite.
 struct OverwriteOperation {
     partition_filters: HashMap<i32, BoundPredicate>,
+    has_added_files: bool,
 }
 
 impl SnapshotProduceOperation for OverwriteOperation {
     fn operation(&self) -> Operation {
-        Operation::Overwrite
+        if self.has_added_files {
+            Operation::Overwrite
+        } else {
+            Operation::Delete
+        }
     }
 
     async fn delete_entries(
@@ -775,29 +783,93 @@ impl SnapshotProduceOperation for OverwriteOperation {
             })?;
             let evaluator = ExpressionEvaluator::new(partition_filter.clone());
 
-            // For data manifests, check if any files do NOT match the filter (should be kept)
             let manifest = manifest_file
                 .load_manifest(snapshot_producer.table.file_io())
                 .await?;
 
-            let mut has_files_to_keep = false;
+            let mut has_files_to_delete = false;
             for entry in manifest.entries() {
                 if entry.status() == ManifestStatus::Deleted {
                     continue;
                 }
-                // Keep files that don't match the filter
-                if !evaluator.eval(entry.data_file())? {
-                    has_files_to_keep = true;
+                if evaluator.eval(entry.data_file())? {
+                    has_files_to_delete = true;
                     break;
                 }
             }
 
-            if has_files_to_keep {
+            if !has_files_to_delete {
                 result.push(manifest_file.clone());
             }
         }
 
         Ok(result)
+    }
+
+    async fn existing_entries(
+        &self,
+        snapshot_producer: &SnapshotProducer<'_>,
+    ) -> Result<Vec<ManifestEntry>> {
+        let Some(snapshot) = snapshot_producer.current_snapshot()? else {
+            return Ok(vec![]);
+        };
+
+        let manifest_list = snapshot
+            .load_manifest_list(
+                snapshot_producer.table.file_io(),
+                &snapshot_producer.table.metadata_ref(),
+            )
+            .await?;
+
+        let mut entries_to_keep = Vec::new();
+
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+
+            let spec_id = manifest_file.partition_spec_id;
+            let partition_filter = self.partition_filters.get(&spec_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Manifest '{}' references partition spec id {} which does not exist in table metadata",
+                        manifest_file.manifest_path, spec_id
+                    ),
+                )
+            })?;
+            let evaluator = ExpressionEvaluator::new(partition_filter.clone());
+
+            let manifest = manifest_file
+                .load_manifest(snapshot_producer.table.file_io())
+                .await?;
+
+            let mut has_files_to_delete = false;
+            for entry in manifest.entries() {
+                if entry.status() == ManifestStatus::Deleted {
+                    continue;
+                }
+                if evaluator.eval(entry.data_file())? {
+                    has_files_to_delete = true;
+                    break;
+                }
+            }
+
+            if !has_files_to_delete {
+                continue;
+            }
+
+            for entry in manifest.entries() {
+                if entry.status() == ManifestStatus::Deleted {
+                    continue;
+                }
+                if !evaluator.eval(entry.data_file())? {
+                    entries_to_keep.push(entry.as_ref().clone());
+                }
+            }
+        }
+
+        Ok(entries_to_keep)
     }
 }
 

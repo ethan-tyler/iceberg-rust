@@ -34,6 +34,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::DataFusionError;
@@ -45,8 +46,10 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::expr::Predicate;
 use iceberg::inspect::MetadataTableType;
 use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
@@ -54,6 +57,7 @@ use crate::error::to_datafusion_error;
 use crate::merge::MergeBuilder;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::delete_commit::IcebergDeleteCommitExec;
+use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use crate::physical_plan::delete_scan::IcebergDeleteScanExec;
 use crate::physical_plan::delete_write::IcebergDeleteWriteExec;
 use crate::physical_plan::overwrite_commit::IcebergOverwriteCommitExec;
@@ -159,16 +163,22 @@ impl IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
-        if !table.metadata().default_partition_spec().is_unpartitioned() {
-            return Err(DataFusionError::NotImplemented(
-                "DELETE on partitioned tables is not yet supported".to_string(),
-            ));
-        }
-
         let current_schema = Arc::new(
             schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(to_datafusion_error)?,
         );
+
+        if let Some(filter) = predicate.as_ref() {
+            if self.is_partition_only_exact_filter(&current_schema, filter) {
+                if let Some(iceberg_predicate) =
+                    convert_filters_to_predicate(std::slice::from_ref(filter))
+                {
+                    return self
+                        .delete_by_partition_filter(&table, iceberg_predicate)
+                        .await;
+                }
+            }
+        }
 
         // Capture baseline snapshot ID for concurrency validation
         let baseline_snapshot_id = table.metadata().current_snapshot_id();
@@ -217,6 +227,48 @@ impl IcebergTableProvider {
             })?;
 
         Ok(count_array.value(0))
+    }
+
+    fn is_partition_only_exact_filter(&self, schema: &ArrowSchemaRef, filter: &Expr) -> bool {
+        let referenced_field_ids = referenced_field_ids(schema, filter);
+        if referenced_field_ids.is_empty() {
+            return false;
+        }
+        referenced_field_ids
+            .iter()
+            .all(|id| self.partition_source_ids.contains(id))
+            && is_iceberg_filter_exact(filter)
+    }
+
+    async fn delete_by_partition_filter(
+        &self,
+        table: &Table,
+        predicate: Predicate,
+    ) -> DFResult<u64> {
+        let scan = table
+            .scan()
+            .select_empty()
+            .with_filter(predicate.clone())
+            .build()
+            .map_err(to_datafusion_error)?;
+        let mut tasks = scan.plan_files().await.map_err(to_datafusion_error)?;
+        let mut deleted_rows = 0u64;
+        while let Some(task) = tasks.next().await {
+            let task = task.map_err(to_datafusion_error)?;
+            deleted_rows += task.record_count.unwrap_or(0);
+        }
+
+        if deleted_rows == 0 {
+            return Ok(0);
+        }
+
+        let tx = Transaction::new(table);
+        let action = tx.overwrite().overwrite_filter(predicate);
+        let tx = action.apply(tx).map_err(to_datafusion_error)?;
+        tx.commit(self.catalog.as_ref())
+            .await
+            .map_err(to_datafusion_error)?;
+        Ok(deleted_rows)
     }
 
     /// Creates an UpdateBuilder for updating rows in the table.
@@ -450,12 +502,6 @@ impl TableProvider for IcebergTableProvider {
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
-
-        if !table.metadata().default_partition_spec().is_unpartitioned() {
-            return Err(DataFusionError::NotImplemented(
-                "DELETE on partitioned tables is not yet supported".to_string(),
-            ));
-        }
 
         // Capture baseline snapshot ID for concurrency validation.
         // If another transaction commits between our scan and commit,

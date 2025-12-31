@@ -110,6 +110,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use moka::policy::EvictionPolicy;
@@ -379,6 +380,58 @@ impl CacheStats {
     }
 }
 
+/// Cache hit/miss/load counters for manifest cache operations.
+#[derive(Debug, Clone, Default)]
+pub struct CacheMetrics {
+    /// Number of cache hits.
+    pub hits: u64,
+    /// Number of cache misses.
+    pub misses: u64,
+    /// Number of successful loads after a miss.
+    pub loads: u64,
+}
+
+impl CacheMetrics {
+    /// Returns the hit rate as a ratio (0.0 to 1.0).
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CacheMetricsInner {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    loads: AtomicU64,
+}
+
+impl CacheMetricsInner {
+    fn snapshot(&self) -> CacheMetrics {
+        CacheMetrics {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            loads: self.loads.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_load(&self) {
+        self.loads.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Estimates the memory size of a ManifestList.
 ///
 /// This provides a reasonable approximation of memory usage based on:
@@ -427,6 +480,7 @@ pub struct ObjectCache {
     cache: moka::future::Cache<CachedObjectKey, CachedItem>,
     file_io: FileIO,
     cache_disabled: bool,
+    metrics: Arc<CacheMetricsInner>,
 }
 
 impl ObjectCache {
@@ -461,6 +515,7 @@ impl ObjectCache {
                 cache: builder.build(),
                 file_io,
                 cache_disabled: false,
+                metrics: Arc::new(CacheMetricsInner::default()),
             }
         }
     }
@@ -497,6 +552,7 @@ impl ObjectCache {
             cache: moka::future::Cache::new(0),
             file_io,
             cache_disabled: true,
+            metrics: Arc::new(CacheMetricsInner::default()),
         }
     }
 
@@ -537,6 +593,11 @@ impl ObjectCache {
         }
     }
 
+    /// Returns cache hit/miss/load metrics for monitoring.
+    pub fn metrics(&self) -> CacheMetrics {
+        self.metrics.snapshot()
+    }
+
     #[cfg(test)]
     pub(crate) fn time_to_live(&self) -> Option<Duration> {
         self.cache.policy().time_to_live()
@@ -551,10 +612,10 @@ impl ObjectCache {
     /// or retrieves one from FileIO and parses it if not present
     pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
-            return manifest_file
-                .load_manifest(&self.file_io)
-                .await
-                .map(Arc::new);
+            self.metrics.record_miss();
+            let manifest = manifest_file.load_manifest(&self.file_io).await?;
+            self.metrics.record_load();
+            return Ok(Arc::new(manifest));
         }
 
         let key = CachedObjectKey::Manifest(manifest_file.manifest_path.clone());
@@ -570,8 +631,15 @@ impl ObjectCache {
                     format!("Failed to load manifest {}", manifest_file.manifest_path),
                 )
                 .with_source(err)
-            })?
-            .into_value();
+            })?;
+
+        if cache_entry.is_fresh() {
+            self.metrics.record_miss();
+        } else {
+            self.metrics.record_hit();
+        }
+
+        let cache_entry = cache_entry.into_value();
 
         match cache_entry {
             CachedItem::Manifest(arc_manifest) => Ok(arc_manifest),
@@ -590,10 +658,12 @@ impl ObjectCache {
         table_metadata: &TableMetadataRef,
     ) -> Result<Arc<ManifestList>> {
         if self.cache_disabled {
-            return snapshot
+            self.metrics.record_miss();
+            let manifest_list = snapshot
                 .load_manifest_list(&self.file_io, table_metadata)
-                .await
-                .map(Arc::new);
+                .await?;
+            self.metrics.record_load();
+            return Ok(Arc::new(manifest_list));
         }
 
         let key = CachedObjectKey::ManifestList((
@@ -614,8 +684,15 @@ impl ObjectCache {
                     )
                     .with_source(err)
                 })
-            })?
-            .into_value();
+            })?;
+
+        if cache_entry.is_fresh() {
+            self.metrics.record_miss();
+        } else {
+            self.metrics.record_hit();
+        }
+
+        let cache_entry = cache_entry.into_value();
 
         match cache_entry {
             CachedItem::ManifestList(arc_manifest_list) => Ok(arc_manifest_list),
@@ -628,6 +705,7 @@ impl ObjectCache {
 
     async fn fetch_and_parse_manifest(&self, manifest_file: &ManifestFile) -> Result<CachedItem> {
         let manifest = manifest_file.load_manifest(&self.file_io).await?;
+        self.metrics.record_load();
 
         Ok(CachedItem::Manifest(Arc::new(manifest)))
     }
@@ -640,6 +718,7 @@ impl ObjectCache {
         let manifest_list = snapshot
             .load_manifest_list(&self.file_io, table_metadata)
             .await?;
+        self.metrics.record_load();
 
         Ok(CachedItem::ManifestList(Arc::new(manifest_list)))
     }
@@ -649,6 +728,7 @@ impl ObjectCache {
 mod tests {
     use std::fs;
 
+    use futures::TryStreamExt;
     use minijinja::value::Value;
     use minijinja::{AutoEscape, Environment, context};
     use tempfile::TempDir;
@@ -658,8 +738,8 @@ mod tests {
     use crate::TableIdent;
     use crate::io::{FileIO, OutputFile};
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
-        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Struct, TableMetadata,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestListWriter,
+        ManifestWriterBuilder, Struct, TableMetadata,
     };
     use crate::table::Table;
 
@@ -730,41 +810,55 @@ mod tests {
         }
 
         async fn setup_manifest_files(&mut self) {
+            self.write_manifest_list_with_entries(1, 1).await;
+        }
+
+        async fn write_manifest_list_with_entries(
+            &self,
+            manifest_count: usize,
+            entries_per_manifest: usize,
+        ) {
             let current_snapshot = self.table.metadata().current_snapshot().unwrap();
             let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
             let current_partition_spec = self.table.metadata().default_partition_spec();
 
-            // Write data files
-            let mut writer = ManifestWriterBuilder::new(
-                self.next_manifest_file(),
-                Some(current_snapshot.snapshot_id()),
-                None,
-                current_schema.clone(),
-                current_partition_spec.as_ref().clone(),
-            )
-            .build_v2_data();
-            writer
-                .add_entry(
-                    ManifestEntry::builder()
-                        .status(ManifestStatus::Added)
-                        .data_file(
-                            DataFileBuilder::default()
-                                .partition_spec_id(0)
-                                .content(DataContentType::Data)
-                                .file_path(format!("{}/1.parquet", &self.table_location))
-                                .file_format(DataFileFormat::Parquet)
-                                .file_size_in_bytes(100)
-                                .record_count(1)
-                                .partition(Struct::from_iter([Some(Literal::long(100))]))
-                                .build()
-                                .unwrap(),
-                        )
-                        .build(),
+            let mut manifests = Vec::with_capacity(manifest_count);
+            for manifest_idx in 0..manifest_count {
+                let mut writer = ManifestWriterBuilder::new(
+                    self.next_manifest_file(),
+                    Some(current_snapshot.snapshot_id()),
+                    None,
+                    current_schema.clone(),
+                    current_partition_spec.as_ref().clone(),
                 )
-                .unwrap();
-            let data_file_manifest = writer.write_manifest_file().await.unwrap();
+                .build_v2_data();
 
-            // Write to manifest list
+                for entry_idx in 0..entries_per_manifest {
+                    let partition_value = (manifest_idx * entries_per_manifest + entry_idx) as i64;
+                    let data_file = DataFileBuilder::default()
+                        .partition_spec_id(current_partition_spec.spec_id())
+                        .content(DataContentType::Data)
+                        .file_path(format!(
+                            "{}/{}_{}.parquet",
+                            &self.table_location,
+                            manifest_idx,
+                            entry_idx
+                        ))
+                        .file_format(DataFileFormat::Parquet)
+                        .file_size_in_bytes(100)
+                        .record_count(1)
+                        .partition(Struct::from_iter([Some(Literal::long(partition_value))]))
+                        .build()
+                        .unwrap();
+
+                    writer
+                        .add_file(data_file, current_snapshot.sequence_number())
+                        .unwrap();
+                }
+
+                manifests.push(writer.write_manifest_file().await.unwrap());
+            }
+
             let mut manifest_list_write = ManifestListWriter::v2(
                 self.table
                     .file_io()
@@ -775,10 +869,20 @@ mod tests {
                 current_snapshot.sequence_number(),
             );
             manifest_list_write
-                .add_manifests(vec![data_file_manifest].into_iter())
+                .add_manifests(manifests.into_iter())
                 .unwrap();
             manifest_list_write.close().await.unwrap();
         }
+    }
+
+    async fn plan_files_task_count(table: &Table) -> usize {
+        let scan = table.scan().build().unwrap();
+        let mut stream = scan.plan_files().await.unwrap();
+        let mut task_count = 0usize;
+        while let Some(_task) = stream.try_next().await.unwrap() {
+            task_count += 1;
+        }
+        task_count
     }
 
     #[tokio::test]
@@ -813,7 +917,7 @@ mod tests {
                 .split("/")
                 .last()
                 .unwrap(),
-            "1.parquet"
+            "0_0.parquet"
         );
     }
 
@@ -881,7 +985,7 @@ mod tests {
                 .split("/")
                 .last()
                 .unwrap(),
-            "1.parquet"
+            "0_0.parquet"
         );
 
         // retrieve cached version
@@ -899,7 +1003,7 @@ mod tests {
                 .split("/")
                 .last()
                 .unwrap(),
-            "1.parquet"
+            "0_0.parquet"
         );
     }
 
@@ -937,6 +1041,25 @@ mod tests {
 
         updated_table.object_cache().cache.run_pending_tasks().await;
         assert_eq!(updated_table.object_cache().entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_plan_files_reflects_metadata_update() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let initial_tasks = plan_files_task_count(&fixture.table).await;
+        assert_eq!(initial_tasks, 1);
+
+        fixture.write_manifest_list_with_entries(2, 1).await;
+
+        let updated_table = fixture
+            .table
+            .clone()
+            .with_metadata(Arc::new(fixture.table.metadata().clone()));
+        let updated_tasks = plan_files_task_count(&updated_table).await;
+
+        assert_eq!(updated_tasks, 2);
     }
 
     #[tokio::test]
@@ -1182,6 +1305,15 @@ mod tests {
         assert!(!stats.is_active());
     }
 
+    #[test]
+    fn test_cache_metrics_default() {
+        let metrics = CacheMetrics::default();
+        assert_eq!(metrics.hits, 0);
+        assert_eq!(metrics.misses, 0);
+        assert_eq!(metrics.loads, 0);
+        assert_eq!(metrics.hit_rate(), 0.0);
+    }
+
     // =========================================================================
     // ObjectCache Stats Integration Tests
     // =========================================================================
@@ -1260,5 +1392,41 @@ mod tests {
         assert_eq!(stats.entry_count, 1);
         assert!(stats.weighted_size > 0);
         assert!(stats.utilization() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_object_cache_metrics_after_operations() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let cache = ObjectCache::new_with_config(
+            fixture.table.file_io().clone(),
+            ObjectCacheConfig::default(),
+        );
+
+        let manifest_list = cache
+            .get_manifest_list(
+                fixture.table.metadata().current_snapshot().unwrap(),
+                &fixture.table.metadata_ref(),
+            )
+            .await
+            .unwrap();
+        let manifest_file = manifest_list.entries().first().unwrap();
+
+        cache
+            .get_manifest_list(
+                fixture.table.metadata().current_snapshot().unwrap(),
+                &fixture.table.metadata_ref(),
+            )
+            .await
+            .unwrap();
+        cache.get_manifest(manifest_file).await.unwrap();
+        cache.get_manifest(manifest_file).await.unwrap();
+
+        let metrics = cache.metrics();
+        assert_eq!(metrics.hits, 2);
+        assert_eq!(metrics.misses, 2);
+        assert_eq!(metrics.loads, 2);
+        assert!(metrics.hit_rate() > 0.0);
     }
 }
