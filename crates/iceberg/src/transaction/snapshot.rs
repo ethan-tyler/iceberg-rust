@@ -152,6 +152,10 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     fn data_sequence_number(&self) -> Option<i64> {
         None
     }
+
+    fn delete_sequence_number(&self) -> Option<i64> {
+        None
+    }
 }
 
 pub(crate) struct DefaultManifestProcess;
@@ -176,6 +180,7 @@ pub(crate) trait ManifestProcess: Send + Sync {
 
 pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
+    target_ref: Option<String>,
     snapshot_id: i64,
     commit_uuid: Uuid,
     key_metadata: Option<Vec<u8>>,
@@ -199,6 +204,7 @@ impl<'a> SnapshotProducer<'a> {
     ) -> Self {
         Self {
             table,
+            target_ref: None,
             snapshot_id: Self::generate_unique_snapshot_id(table),
             commit_uuid,
             key_metadata,
@@ -207,6 +213,22 @@ impl<'a> SnapshotProducer<'a> {
             added_delete_files,
             manifest_counter: (0..),
         }
+    }
+
+    pub(crate) fn with_target_ref(mut self, target_ref: impl Into<String>) -> Self {
+        self.target_ref = Some(target_ref.into());
+        self
+    }
+
+    pub(crate) fn current_snapshot_id(&self) -> Result<Option<i64>> {
+        Ok(self.resolve_target_ref()?.base_snapshot_id)
+    }
+
+    pub(crate) fn current_snapshot(&self) -> Result<Option<&Snapshot>> {
+        Ok(self
+            .current_snapshot_id()?
+            .and_then(|id| self.table.metadata().snapshot_by_id(id))
+            .map(|arc| arc.as_ref()))
     }
 
     /// Validates added data files.
@@ -353,7 +375,7 @@ impl<'a> SnapshotProducer<'a> {
         let mut duplicate_data_files = Vec::new();
         let mut duplicate_delete_files = Vec::new();
 
-        if let Some(current_snapshot) = self.table.metadata().current_snapshot() {
+        if let Some(current_snapshot) = self.current_snapshot()? {
             let manifest_list = current_snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
                 .await?;
@@ -630,7 +652,10 @@ impl<'a> SnapshotProducer<'a> {
     /// For tables with partition evolution, position delete files inherit the partition
     /// spec of the data file they reference. Each spec's delete files are written to
     /// a separate manifest to comply with the Iceberg specification.
-    async fn write_delete_manifests(&mut self) -> Result<Vec<ManifestFile>> {
+    async fn write_delete_manifests(
+        &mut self,
+        delete_sequence_number: Option<i64>,
+    ) -> Result<Vec<ManifestFile>> {
         let added_delete_files = std::mem::take(&mut self.added_delete_files);
         if added_delete_files.is_empty() {
             return Err(Error::new(
@@ -664,6 +689,8 @@ impl<'a> SnapshotProducer<'a> {
                     .data_file(delete_file);
                 if format_version == FormatVersion::V1 {
                     builder.snapshot_id(snapshot_id).build()
+                } else if let Some(seq_num) = delete_sequence_number {
+                    builder.sequence_number(seq_num).build()
                 } else {
                     builder.build()
                 }
@@ -698,30 +725,56 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        // Group entries by partition spec for per-spec manifest writing
-        let entry_groups = group_entries_by_spec(deleted_entries);
+        let (data_entries, delete_entries): (Vec<_>, Vec<_>) = deleted_entries
+            .into_iter()
+            .partition(|entry| entry.content_type() == DataContentType::Data);
 
-        let mut manifests = Vec::with_capacity(entry_groups.len());
-        for (spec_id, entries) in entry_groups {
-            let partition_spec = self
-                .table
-                .metadata()
-                .partition_spec_by_id(spec_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Deleted entry references unknown partition spec: {spec_id}"),
-                    )
-                })?;
+        let mut manifests = Vec::new();
 
-            let mut writer =
-                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
-            for entry in entries {
-                // Use add_delete_entry to properly set status=Deleted
-                // (add_entry would override status to Added)
-                writer.add_delete_entry(entry)?;
+        if !data_entries.is_empty() {
+            let entry_groups = group_entries_by_spec(data_entries);
+            for (spec_id, entries) in entry_groups {
+                let partition_spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Deleted entry references unknown partition spec: {spec_id}"),
+                        )
+                    })?;
+
+                let mut writer =
+                    self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
+                for entry in entries {
+                    writer.add_delete_entry(entry)?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
             }
-            manifests.push(writer.write_manifest_file().await?);
+        }
+
+        if !delete_entries.is_empty() {
+            let entry_groups = group_entries_by_spec(delete_entries);
+            for (spec_id, entries) in entry_groups {
+                let partition_spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Deleted entry references unknown partition spec: {spec_id}"),
+                        )
+                    })?;
+
+                let mut writer = self
+                    .new_manifest_writer_for_spec(partition_spec, ManifestContentType::Deletes)?;
+                for entry in entries {
+                    writer.add_delete_entry(entry)?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
+            }
         }
 
         Ok(manifests)
@@ -745,28 +798,56 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        // Group entries by partition spec for per-spec manifest writing
-        let entry_groups = group_entries_by_spec(existing_entries);
+        let (data_entries, delete_entries): (Vec<_>, Vec<_>) = existing_entries
+            .into_iter()
+            .partition(|entry| entry.content_type() == DataContentType::Data);
 
-        let mut manifests = Vec::with_capacity(entry_groups.len());
-        for (spec_id, entries) in entry_groups {
-            let partition_spec = self
-                .table
-                .metadata()
-                .partition_spec_by_id(spec_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Existing entry references unknown partition spec: {spec_id}"),
-                    )
-                })?;
+        let mut manifests = Vec::new();
 
-            let mut writer =
-                self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
-            for entry in entries {
-                writer.add_existing_entry(entry)?;
+        if !data_entries.is_empty() {
+            let entry_groups = group_entries_by_spec(data_entries);
+            for (spec_id, entries) in entry_groups {
+                let partition_spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Existing entry references unknown partition spec: {spec_id}"),
+                        )
+                    })?;
+
+                let mut writer =
+                    self.new_manifest_writer_for_spec(partition_spec, ManifestContentType::Data)?;
+                for entry in entries {
+                    writer.add_existing_entry(entry)?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
             }
-            manifests.push(writer.write_manifest_file().await?);
+        }
+
+        if !delete_entries.is_empty() {
+            let entry_groups = group_entries_by_spec(delete_entries);
+            for (spec_id, entries) in entry_groups {
+                let partition_spec = self
+                    .table
+                    .metadata()
+                    .partition_spec_by_id(spec_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Existing entry references unknown partition spec: {spec_id}"),
+                        )
+                    })?;
+
+                let mut writer = self
+                    .new_manifest_writer_for_spec(partition_spec, ManifestContentType::Deletes)?;
+                for entry in entries {
+                    writer.add_existing_entry(entry)?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
+            }
         }
 
         Ok(manifests)
@@ -836,7 +917,8 @@ impl<'a> SnapshotProducer<'a> {
         // Process added delete file entries (position/equality deletes).
         // Delete files are grouped by partition spec, with separate manifests per spec.
         if has_delete_files {
-            let delete_manifests = self.write_delete_manifests().await?;
+            let delete_sequence_number = snapshot_produce_operation.delete_sequence_number();
+            let delete_manifests = self.write_delete_manifests(delete_sequence_number).await?;
             manifest_files.extend(delete_manifests);
         }
 
@@ -949,6 +1031,18 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
+        // Clone target_ref early to avoid borrow conflicts with mutable self borrows later
+        let target_ref = self
+            .target_ref
+            .clone()
+            .unwrap_or_else(|| MAIN_BRANCH.to_string());
+        let TargetRefInfo {
+            base_snapshot_id,
+            expected_snapshot_id,
+            retention,
+            ..
+        } = self.resolve_target_ref()?;
+
         let manifest_list_path = self.generate_manifest_list_file_path(0);
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
@@ -958,14 +1052,14 @@ impl<'a> SnapshotProducer<'a> {
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                base_snapshot_id,
             ),
             FormatVersion::V2 => ManifestListWriter::v2(
                 self.table
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                base_snapshot_id,
                 next_seq_num,
             ),
             FormatVersion::V3 => ManifestListWriter::v3(
@@ -973,7 +1067,7 @@ impl<'a> SnapshotProducer<'a> {
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                base_snapshot_id,
                 next_seq_num,
                 Some(first_row_id),
             ),
@@ -998,7 +1092,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
-            .with_parent_snapshot_id(self.table.metadata().current_snapshot_id())
+            .with_parent_snapshot_id(base_snapshot_id)
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
             .with_schema_id(self.table.metadata().current_schema_id())
@@ -1018,11 +1112,8 @@ impl<'a> SnapshotProducer<'a> {
                 snapshot: new_snapshot,
             },
             TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(
-                    self.snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
+                ref_name: target_ref.to_string(),
+                reference: SnapshotReference::new(self.snapshot_id, retention),
             },
         ];
 
@@ -1031,13 +1122,73 @@ impl<'a> SnapshotProducer<'a> {
                 uuid: self.table.metadata().uuid(),
             },
             TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: self.table.metadata().current_snapshot_id(),
+                r#ref: target_ref.to_string(),
+                snapshot_id: expected_snapshot_id,
             },
         ];
 
         Ok(ActionCommit::new(updates, requirements))
     }
+
+    fn resolve_target_ref(&self) -> Result<TargetRefInfo> {
+        let metadata = self.table.metadata();
+        let target_ref = self.target_ref.as_deref().unwrap_or(MAIN_BRANCH);
+
+        if target_ref == MAIN_BRANCH {
+            let retention = metadata
+                .refs()
+                .get(MAIN_BRANCH)
+                .map(|r| {
+                    if !r.is_branch() {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Cannot write to reference '{MAIN_BRANCH}': reference is not a branch",
+                            ),
+                        ));
+                    }
+                    Ok(r.retention.clone())
+                })
+                .transpose()?
+                .unwrap_or_else(|| SnapshotRetention::branch(None, None, None));
+
+            let ref_snapshot_id = metadata.refs().get(MAIN_BRANCH).map(|r| r.snapshot_id);
+            let expected_snapshot_id = ref_snapshot_id.or_else(|| metadata.current_snapshot_id());
+
+            return Ok(TargetRefInfo {
+                base_snapshot_id: expected_snapshot_id,
+                expected_snapshot_id,
+                retention,
+            });
+        }
+
+        if let Some(snapshot_ref) = metadata.refs().get(target_ref) {
+            if !snapshot_ref.is_branch() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Cannot write to reference '{target_ref}': reference is not a branch",),
+                ));
+            }
+
+            return Ok(TargetRefInfo {
+                base_snapshot_id: Some(snapshot_ref.snapshot_id),
+                expected_snapshot_id: Some(snapshot_ref.snapshot_id),
+                retention: snapshot_ref.retention.clone(),
+            });
+        }
+
+        Ok(TargetRefInfo {
+            base_snapshot_id: metadata.current_snapshot_id(),
+            expected_snapshot_id: None,
+            retention: SnapshotRetention::branch(None, None, None),
+        })
+    }
+}
+
+struct TargetRefInfo {
+    base_snapshot_id: Option<i64>,
+    expected_snapshot_id: Option<i64>,
+    retention: SnapshotRetention,
 }
 
 #[cfg(test)]

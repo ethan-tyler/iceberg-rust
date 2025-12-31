@@ -21,13 +21,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use uuid::Uuid;
+
 use crate::arrow::ArrowReaderBuilder;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::{CacheStats, ObjectCache, ObjectCacheConfig};
-use crate::scan::TableScanBuilder;
-use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
-use crate::transaction::{ApplyTransactionAction, RemoveOrphanFilesAction, Transaction};
+use crate::scan::{IncrementalScanBuilder, TableScanBuilder};
+use crate::spec::{DataFile, SchemaRef, TableMetadata, TableMetadataRef};
+use crate::transaction::{
+    ApplyTransactionAction, CreateBranchAction, CreateTagAction, FastForwardAction,
+    RemoveOrphanFilesAction, Transaction,
+};
 use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -305,6 +310,36 @@ impl Table {
         TableScanBuilder::new(self)
     }
 
+    /// Creates an incremental scan to get changes between two snapshots.
+    ///
+    /// This is useful for Change Data Capture (CDC) use cases where you need to
+    /// identify which files were added or removed between snapshots.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_snapshot_id` - The starting snapshot (exclusive)
+    /// * `to_snapshot_id` - The ending snapshot (inclusive)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let changes = table.incremental_scan(from_snapshot_id, to_snapshot_id)
+    ///     .build()?
+    ///     .changes()
+    ///     .await?;
+    ///
+    /// for file in changes.added_data_files() {
+    ///     println!("Added: {}", file.file_path());
+    /// }
+    /// ```
+    pub fn incremental_scan(
+        &self,
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+    ) -> IncrementalScanBuilder<'_> {
+        IncrementalScanBuilder::new(self, from_snapshot_id, to_snapshot_id)
+    }
+
     /// Creates a metadata table which provides table-like APIs for inspecting metadata.
     /// See [`MetadataTable`] for more details.
     pub fn inspect(&self) -> MetadataTable<'_> {
@@ -375,6 +410,52 @@ impl Table {
     /// action.
     pub fn remove_orphan_files(&self) -> RemoveOrphanFilesAction {
         RemoveOrphanFilesAction::new(self.clone())
+    }
+
+    // =========================================================================
+    // WAP / Branch-Tag Helpers
+    // =========================================================================
+
+    /// Create a branch reference and commit it to the catalog.
+    ///
+    /// This is a convenience wrapper over [`Transaction::create_branch`]. The catalog
+    /// is only required at commit time, following the same pattern as
+    /// [`Table::update_properties`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let table = table.create_branch("staging").commit(&catalog).await?;
+    /// ```
+    pub fn create_branch(&self, name: impl Into<String>) -> TableCreateBranchBuilder {
+        TableCreateBranchBuilder::new(self.clone(), name)
+    }
+
+    /// Create a tag reference and commit it to the catalog.
+    ///
+    /// This is a convenience wrapper over [`Transaction::create_tag`].
+    pub fn create_tag(&self, name: impl Into<String>) -> TableCreateTagBuilder {
+        TableCreateTagBuilder::new(self.clone(), name)
+    }
+
+    /// Fast-forward a target branch to match another reference and commit it.
+    ///
+    /// This is the final step in Write-Audit-Publish workflows, promoting a
+    /// staged branch to main.
+    pub fn fast_forward(
+        &self,
+        target: impl Into<String>,
+        source: impl Into<String>,
+    ) -> TableFastForwardBuilder {
+        TableFastForwardBuilder::new(self.clone(), target, source)
+    }
+
+    /// Write new data files to a specific branch using fast append.
+    ///
+    /// This helper creates a branch-targeted append and commits it in a single
+    /// call. Use `fast_forward()` to promote the branch after validation.
+    pub fn write_to_branch(&self, branch: impl Into<String>) -> BranchWriteBuilder {
+        BranchWriteBuilder::new(self.clone(), branch)
     }
 
     // =========================================================================
@@ -510,6 +591,196 @@ impl Table {
     /// ```
     pub fn update_properties(&self) -> TableUpdatePropertiesBuilder {
         TableUpdatePropertiesBuilder::new(self.clone())
+    }
+}
+
+/// Builder for creating a new branch ref and committing it.
+pub struct TableCreateBranchBuilder {
+    table: Table,
+    action: CreateBranchAction,
+}
+
+impl TableCreateBranchBuilder {
+    /// Create a new branch builder for the given table and branch name.
+    pub fn new(table: Table, name: impl Into<String>) -> Self {
+        Self {
+            table,
+            action: CreateBranchAction::new().name(name),
+        }
+    }
+
+    /// Set the snapshot ID the branch should point to.
+    pub fn from_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.action = self.action.from_snapshot(snapshot_id);
+        self
+    }
+
+    /// Set the minimum number of snapshots to keep for this branch.
+    pub fn min_snapshots_to_keep(mut self, count: i32) -> Self {
+        self.action = self.action.min_snapshots_to_keep(count);
+        self
+    }
+
+    /// Set the maximum snapshot age for this branch.
+    pub fn max_snapshot_age_ms(mut self, age_ms: i64) -> Self {
+        self.action = self.action.max_snapshot_age_ms(age_ms);
+        self
+    }
+
+    /// Set the maximum ref age for this branch.
+    pub fn max_ref_age_ms(mut self, age_ms: i64) -> Self {
+        self.action = self.action.max_ref_age_ms(age_ms);
+        self
+    }
+
+    /// Commit the branch creation to the catalog.
+    pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        let tx = Transaction::new(&self.table);
+        let tx = self.action.apply(tx)?;
+        tx.commit(catalog).await
+    }
+}
+
+/// Builder for creating a new tag ref and committing it.
+pub struct TableCreateTagBuilder {
+    table: Table,
+    action: CreateTagAction,
+}
+
+impl TableCreateTagBuilder {
+    /// Create a new tag builder for the given table and tag name.
+    pub fn new(table: Table, name: impl Into<String>) -> Self {
+        Self {
+            table,
+            action: CreateTagAction::new().name(name),
+        }
+    }
+
+    /// Set the snapshot ID the tag should point to.
+    pub fn from_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.action = self.action.from_snapshot(snapshot_id);
+        self
+    }
+
+    /// Set the maximum ref age for this tag.
+    pub fn max_ref_age_ms(mut self, age_ms: i64) -> Self {
+        self.action = self.action.max_ref_age_ms(age_ms);
+        self
+    }
+
+    /// Commit the tag creation to the catalog.
+    pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        let tx = Transaction::new(&self.table);
+        let tx = self.action.apply(tx)?;
+        tx.commit(catalog).await
+    }
+}
+
+/// Builder for fast-forwarding a target branch to a source reference.
+pub struct TableFastForwardBuilder {
+    table: Table,
+    action: FastForwardAction,
+}
+
+impl TableFastForwardBuilder {
+    /// Create a new fast-forward builder for the given table, target branch, and source ref.
+    pub fn new(table: Table, target: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            table,
+            action: FastForwardAction::new().target(target).source(source),
+        }
+    }
+
+    /// Commit the fast-forward update to the catalog.
+    pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        let tx = Transaction::new(&self.table);
+        let tx = self.action.apply(tx)?;
+        tx.commit(catalog).await
+    }
+}
+
+/// Builder for appending new data files to a specific branch.
+pub struct BranchWriteBuilder {
+    table: Table,
+    branch: String,
+    check_duplicate: bool,
+    commit_uuid: Option<Uuid>,
+    key_metadata: Option<Vec<u8>>,
+    snapshot_properties: HashMap<String, String>,
+    added_data_files: Vec<DataFile>,
+}
+
+impl BranchWriteBuilder {
+    /// Create a new branch write builder for the given table and branch name.
+    pub fn new(table: Table, branch: impl Into<String>) -> Self {
+        Self {
+            table,
+            branch: branch.into(),
+            check_duplicate: true,
+            commit_uuid: None,
+            key_metadata: None,
+            snapshot_properties: HashMap::new(),
+            added_data_files: Vec::new(),
+        }
+    }
+
+    /// Add a data file to the branch append.
+    pub fn add_data_file(mut self, file: DataFile) -> Self {
+        self.added_data_files.push(file);
+        self
+    }
+
+    /// Add multiple data files to the branch append.
+    pub fn add_data_files(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
+        self.added_data_files.extend(files);
+        self
+    }
+
+    /// Set whether to check duplicate files.
+    pub fn with_check_duplicate(mut self, check: bool) -> Self {
+        self.check_duplicate = check;
+        self
+    }
+
+    /// Set commit UUID for the snapshot.
+    pub fn set_commit_uuid(mut self, commit_uuid: Uuid) -> Self {
+        self.commit_uuid = Some(commit_uuid);
+        self
+    }
+
+    /// Set key metadata for manifest files.
+    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
+        self.key_metadata = Some(key_metadata);
+        self
+    }
+
+    /// Set snapshot summary properties.
+    pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
+        self.snapshot_properties = snapshot_properties;
+        self
+    }
+
+    /// Commit the append to the catalog.
+    pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        let tx = Transaction::new(&self.table);
+        let mut action = tx
+            .fast_append()
+            .with_check_duplicate(self.check_duplicate)
+            .add_data_files(self.added_data_files)
+            .to_branch(self.branch);
+
+        if let Some(commit_uuid) = self.commit_uuid {
+            action = action.set_commit_uuid(commit_uuid);
+        }
+        if let Some(key_metadata) = self.key_metadata {
+            action = action.set_key_metadata(key_metadata);
+        }
+        if !self.snapshot_properties.is_empty() {
+            action = action.set_snapshot_properties(self.snapshot_properties);
+        }
+
+        let tx = action.apply(tx)?;
+        tx.commit(catalog).await
     }
 }
 
@@ -1018,6 +1289,95 @@ mod tests {
         assert!(result.is_ok());
         let returned_table = result.unwrap();
         assert_eq!(returned_table.identifier(), table.identifier());
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_builder_commits() {
+        use crate::catalog::MockCatalog;
+        use crate::transaction::tests::make_v2_table;
+
+        let table = make_v2_table();
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_table = table.clone();
+        mock_catalog.expect_load_table().returning_st(move |_| {
+            let t = load_table.clone();
+            Box::pin(async move { Ok(t) })
+        });
+
+        let update_table = table.clone();
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(move |commit| {
+                let t = update_table.clone();
+                Box::pin(async move { commit.apply(t) })
+            });
+
+        let updated = table
+            .create_branch("audit")
+            .commit(&mock_catalog)
+            .await
+            .unwrap();
+
+        let branch_ref = updated.metadata().refs().get("audit").unwrap();
+        assert_eq!(
+            Some(branch_ref.snapshot_id),
+            updated.metadata().current_snapshot_id()
+        );
+        assert!(branch_ref.is_branch());
+    }
+
+    #[tokio::test]
+    async fn test_write_to_branch_builder_commits() {
+        use crate::catalog::MockCatalog;
+        use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+        use crate::transaction::tests::make_v2_minimal_table;
+
+        let table = make_v2_minimal_table();
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/table/data/part-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(1))]))
+            .build()
+            .unwrap();
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_table = table.clone();
+        mock_catalog.expect_load_table().returning_st(move |_| {
+            let t = load_table.clone();
+            Box::pin(async move { Ok(t) })
+        });
+
+        let update_table = table.clone();
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(move |commit| {
+                let t = update_table.clone();
+                Box::pin(async move { commit.apply(t) })
+            });
+
+        let updated = table
+            .write_to_branch("staging")
+            .add_data_file(data_file)
+            .commit(&mock_catalog)
+            .await
+            .unwrap();
+
+        let branch_ref = updated.metadata().refs().get("staging").unwrap();
+        assert!(
+            updated
+                .metadata()
+                .snapshot_by_id(branch_ref.snapshot_id)
+                .is_some()
+        );
+        assert!(updated.metadata().current_snapshot_id().is_none());
     }
 
     // =========================================================================

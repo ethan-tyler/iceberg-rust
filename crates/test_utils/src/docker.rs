@@ -17,6 +17,7 @@
 
 use std::net::IpAddr;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use tracing::error;
 
@@ -31,6 +32,44 @@ pub struct DockerCompose {
     docker_compose_dir: String,
 }
 
+static DOCKER_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+pub fn docker_available() -> bool {
+    *DOCKER_AVAILABLE.get_or_init(|| {
+        let mut cmd = Command::new("docker");
+        cmd.arg("info").arg("--format").arg("{{.ServerVersion}}");
+        match cmd.output() {
+            Ok(output) => {
+                if output.status.success() {
+                    true
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if stderr.trim().is_empty() {
+                        error!(
+                            "Docker unavailable: docker info returned {:?}",
+                            output.status
+                        );
+                    } else {
+                        error!("Docker unavailable: {}", stderr.trim());
+                    }
+                    false
+                }
+            }
+            Err(err) => {
+                error!("Docker unavailable: {}", err);
+                false
+            }
+        }
+    })
+}
+
+pub fn skip_if_docker_unavailable(context: &str) {
+    if !docker_available() {
+        eprintln!("Skipping {context}: docker daemon not available.");
+        std::process::exit(0);
+    }
+}
+
 impl DockerCompose {
     pub fn new(project_name: impl ToString, docker_compose_dir: impl ToString) -> Self {
         Self {
@@ -41,6 +80,10 @@ impl DockerCompose {
 
     pub fn project_name(&self) -> &str {
         self.project_name.as_str()
+    }
+
+    pub fn container_name(&self, service_name: impl AsRef<str>) -> String {
+        format!("{}-{}-1", self.project_name, service_name.as_ref())
     }
 
     fn get_os_arch() -> String {
@@ -137,7 +180,7 @@ impl DockerCompose {
     }
 
     pub fn get_container_ip(&self, service_name: impl AsRef<str>) -> IpAddr {
-        let container_name = format!("{}-{}-1", self.project_name, service_name.as_ref());
+        let container_name = self.container_name(service_name);
         let mut cmd = Command::new("docker");
         cmd.arg("inspect")
             .arg("-f")

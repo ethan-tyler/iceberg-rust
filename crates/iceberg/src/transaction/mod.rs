@@ -55,9 +55,15 @@ mod action;
 pub use action::*;
 pub use evolve_partition::EvolvePartitionAction;
 pub use expire_snapshots::{
-    CleanupLevel, ExpireSnapshotsAction, ExpireSnapshotsResult, RetentionPolicy,
+    CleanupExecutionResult, CleanupLevel, CleanupPlan, ExpireOptions, ExpireProgressCallback,
+    ExpireProgressEvent, ExpireSnapshotsAction, ExpireSnapshotsPlan, ExpireSnapshotsResult,
+    RetentionPolicy, compute_cleanup_plan, execute_cleanup_plan,
 };
-pub use manage_snapshots::{ManageSnapshotsAction, ManageSnapshotsOperation};
+pub use insert_overwrite::{InsertOverwriteAction, InsertOverwriteMode};
+pub use manage_snapshots::{
+    CreateBranchAction, CreateTagAction, FastForwardAction, ManageSnapshotsAction,
+    ManageSnapshotsOperation,
+};
 pub use overwrite::OverwriteAction;
 pub use remove_orphan_files::{
     FileUriNormalizer, NormalizedUri, OrphanFileInfo, OrphanFileType, OrphanFilesProgressCallback,
@@ -70,21 +76,35 @@ pub use rewrite_data_files::{
     RewriteDataFilesCommitter, RewriteDataFilesOptions, RewriteDataFilesPlan,
     RewriteDataFilesPlanner, RewriteDataFilesResult, RewriteJobOrder, RewriteStrategy,
 };
+pub use rewrite_manifests::{
+    DEFAULT_MAX_ENTRIES_IN_MEMORY, DEFAULT_TARGET_MANIFEST_SIZE_BYTES, ManifestPredicate,
+    RewriteManifestsAction, RewriteManifestsOptions, RewriteManifestsPlanner,
+    RewriteManifestsResult,
+};
+// Internal-only exports for rewrite_manifests implementation (used by action commit)
+#[allow(unused_imports)]
+pub(crate) use rewrite_manifests::{ManifestRewriter, generate_manifest_path};
 pub use row_delta::RowDeltaAction;
+pub use update_schema::UpdateSchemaAction;
 mod append;
+#[cfg(test)]
+mod concurrent;
 mod delete;
 mod evolve_partition;
 pub mod expire_snapshots;
+mod insert_overwrite;
 mod manage_snapshots;
 mod overwrite;
 pub mod remove_orphan_files;
 mod replace_partitions;
 pub mod rewrite_data_files;
+pub mod rewrite_manifests;
 mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
 mod update_properties;
+mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
 
@@ -162,6 +182,11 @@ impl Transaction {
     /// Update table's property.
     pub fn update_table_properties(&self) -> UpdatePropertiesAction {
         UpdatePropertiesAction::new()
+    }
+
+    /// Update table schema.
+    pub fn update_schema(&self) -> UpdateSchemaAction {
+        UpdateSchemaAction::new()
     }
 
     /// Creates a fast append action.
@@ -272,6 +297,33 @@ impl Transaction {
         OverwriteAction::new()
     }
 
+    /// Creates an insert overwrite action with dynamic or static semantics.
+    ///
+    /// By default this uses dynamic overwrite semantics (replace only partitions touched
+    /// by the incoming data). Use `static_overwrite(filter)` to replace partitions matching
+    /// an explicit filter, even if there are no incoming rows for them.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::expr::Reference;
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.insert_overwrite()
+    ///     .add_data_files(new_files);
+    /// let tx = action.apply(tx)?;
+    ///
+    /// let filter = Reference::new("date").equal_to(Datum::string("2024-01-01"));
+    /// let action = tx.insert_overwrite()
+    ///     .static_overwrite(filter)
+    ///     .add_data_files(new_files);
+    /// let tx = action.apply(tx)?;
+    /// ```
+    pub fn insert_overwrite(&self) -> InsertOverwriteAction {
+        InsertOverwriteAction::new()
+    }
+
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
         ReplaceSortOrderAction::new()
@@ -365,6 +417,53 @@ impl Transaction {
         RewriteDataFilesAction::new()
     }
 
+    /// Creates a rewrite manifests action for manifest consolidation.
+    ///
+    /// This action consolidates small manifests into larger, optimally-sized
+    /// manifests while preserving data file references and clustering files
+    /// by partition for optimal query pruning.
+    ///
+    /// # Use Cases
+    ///
+    /// - Consolidate manifests from frequent streaming writes
+    /// - Reduce query planning overhead from manifest count
+    /// - Optimize metadata storage and API costs
+    /// - Improve partition pruning effectiveness
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// let tx = Transaction::new(&table);
+    ///
+    /// // Build manifest rewrite action with default settings
+    /// let action = tx.rewrite_manifests();
+    /// let tx = action.apply(tx)?;
+    /// // let table = tx.commit(&catalog).await?;
+    ///
+    /// // Custom configuration
+    /// let tx = Transaction::new(&table);
+    /// let action = tx.rewrite_manifests()
+    ///     .target_size_bytes(16 * 1024 * 1024)  // 16 MB target
+    ///     .rewrite_if_smaller_than(5 * 1024 * 1024);  // Only small manifests
+    /// let tx = action.apply(tx)?;
+    /// // let table = tx.commit(&catalog).await?;
+    /// ```
+    ///
+    /// # Atomicity
+    ///
+    /// The operation is atomic: manifests are only replaced on successful commit.
+    /// On failure, original manifests remain unchanged.
+    ///
+    /// # Format Version Support
+    ///
+    /// - **V1 tables**: Data manifests only
+    /// - **V2+ tables**: Data and delete manifests (configurable)
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
+    }
+
     /// Creates an expire snapshots action for table maintenance.
     ///
     /// This action removes old snapshots that are no longer needed for time travel
@@ -408,11 +507,13 @@ impl Transaction {
     /// - Snapshots referenced by branches and tags
     /// - Minimum number of snapshots per branch (configurable)
     ///
-    /// # Cleanup Levels
+    /// # Cleanup Behavior
     ///
-    /// - `Full`: Delete data files, manifests, and manifest lists (default)
-    /// - `MetadataOnly`: Delete only manifest metadata, not data files
-    /// - `None`: Only remove snapshots from metadata, no file deletion
+    /// - Default: metadata-only expiration (no file deletion)
+    /// - `delete_files(true)`: enable file cleanup planning/execution
+    ///
+    /// File deletion is performed via [`ExpireSnapshotsAction::execute`] or by
+    /// creating a cleanup plan and running [`execute_cleanup_plan`] after commit.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
     }
@@ -467,6 +568,80 @@ impl Transaction {
     /// | `set_current_snapshot` | Not required | Branch operations, cherry-picking |
     pub fn manage_snapshots(&self) -> ManageSnapshotsAction {
         ManageSnapshotsAction::new()
+    }
+
+    /// Creates a branch from the current or specified snapshot.
+    ///
+    /// A branch is a mutable named reference that can be updated to point to
+    /// new snapshots. This is useful for Write-Audit-Publish (WAP) workflows
+    /// where changes are staged on a branch before being promoted to main.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// // Create a branch from the current snapshot
+    /// let tx = Transaction::new(&table);
+    /// let tx = tx.create_branch()
+    ///     .name("staging")
+    ///     .apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    ///
+    /// // Create a branch from a specific snapshot
+    /// let tx = Transaction::new(&table);
+    /// let tx = tx.create_branch()
+    ///     .name("staging")
+    ///     .from_snapshot(snapshot_id)
+    ///     .apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    pub fn create_branch(&self) -> CreateBranchAction {
+        CreateBranchAction::new()
+    }
+
+    /// Creates a tag from the current or specified snapshot.
+    ///
+    /// A tag is an immutable named reference that always points to the same
+    /// snapshot. Use tags to mark important points like releases or audits.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// // Create a tag from the current snapshot
+    /// let tx = Transaction::new(&table);
+    /// let tx = tx.create_tag()
+    ///     .name("release-v1.0")
+    ///     .apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    pub fn create_tag(&self) -> CreateTagAction {
+        CreateTagAction::new()
+    }
+
+    /// Fast-forwards a branch to match another reference's snapshot.
+    ///
+    /// This is the key operation for completing Write-Audit-Publish workflows:
+    /// after staging changes on a branch and auditing them, use fast-forward
+    /// to atomically update main to the branch's snapshot.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use iceberg::transaction::{Transaction, ApplyTransactionAction};
+    ///
+    /// // Fast-forward main to match a staging branch
+    /// let tx = Transaction::new(&table);
+    /// let tx = tx.fast_forward()
+    ///     .target("main")
+    ///     .source("staging")
+    ///     .apply(tx)?;
+    /// let table = tx.commit(&catalog).await?;
+    /// ```
+    pub fn fast_forward(&self) -> FastForwardAction {
+        FastForwardAction::new()
     }
 
     /// Commit transaction.
@@ -550,7 +725,7 @@ impl Transaction {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;
@@ -576,7 +751,7 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/00001-11111111-1111-1111-1111-111111111111.metadata.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIOBuilder::new("memory").build().unwrap())
             .build()
@@ -595,7 +770,7 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/00001-11111111-1111-1111-1111-111111111111.metadata.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIOBuilder::new("memory").build().unwrap())
             .build()
@@ -614,7 +789,7 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/00001-11111111-1111-1111-1111-111111111111.metadata.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIOBuilder::new("memory").build().unwrap())
             .build()

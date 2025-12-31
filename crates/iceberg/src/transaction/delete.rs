@@ -128,7 +128,7 @@ impl SnapshotProduceOperation for DeleteOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.current_snapshot()? else {
             return Ok(vec![]);
         };
 

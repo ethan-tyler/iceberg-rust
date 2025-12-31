@@ -78,6 +78,7 @@ impl<T: TransactionAction + 'static> ApplyTransactionAction for T {
 ///
 /// This struct contains the updates to apply to the table's metadata
 /// and any preconditions that must be satisfied before the update can be committed.
+#[derive(Debug)]
 pub struct ActionCommit {
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,

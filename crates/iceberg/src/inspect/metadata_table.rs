@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilesTable, HistoryTable, ManifestsTable, PropertiesTable, RefsTable, SnapshotsTable};
+use super::{
+    EntriesTable, FilesTable, HistoryTable, ManifestsTable, PartitionsTable, PropertiesTable,
+    RefsTable, SnapshotsTable,
+};
 use crate::table::Table;
 
 /// Metadata table is used to inspect a table's history, snapshots, and other metadata as a table.
@@ -42,6 +45,10 @@ pub enum MetadataTableType {
     Files,
     /// [`PropertiesTable`]
     Properties,
+    /// [`PartitionsTable`]
+    Partitions,
+    /// [`EntriesTable`]
+    Entries,
 }
 
 impl MetadataTableType {
@@ -54,6 +61,8 @@ impl MetadataTableType {
             MetadataTableType::Refs => "refs",
             MetadataTableType::Files => "files",
             MetadataTableType::Properties => "properties",
+            MetadataTableType::Partitions => "partitions",
+            MetadataTableType::Entries => "entries",
         }
     }
 
@@ -75,6 +84,8 @@ impl TryFrom<&str> for MetadataTableType {
             "refs" => Ok(Self::Refs),
             "files" => Ok(Self::Files),
             "properties" => Ok(Self::Properties),
+            "partitions" => Ok(Self::Partitions),
+            "entries" => Ok(Self::Entries),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -114,5 +125,15 @@ impl<'a> MetadataTable<'a> {
     /// Get the properties table.
     pub fn properties(&self) -> PropertiesTable<'_> {
         PropertiesTable::new(self.0)
+    }
+
+    /// Get the partitions table.
+    pub fn partitions(&self) -> PartitionsTable<'_> {
+        PartitionsTable::new(self.0)
+    }
+
+    /// Get the entries table.
+    pub fn entries(&self) -> EntriesTable<'_> {
+        EntriesTable::new(self.0)
     }
 }

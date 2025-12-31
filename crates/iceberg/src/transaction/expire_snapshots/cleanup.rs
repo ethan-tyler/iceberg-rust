@@ -25,7 +25,7 @@
 //!
 //! 1. **Manifest list files** - From expired snapshots
 //! 2. **Manifest files** - No longer referenced by any retained snapshot
-//! 3. **Data files** - Marked as DELETED in manifests of expired snapshots
+//! 3. **Data/Delete files** - Referenced only by expired snapshots (not in retained snapshots)
 //!
 //! # Safety
 //!
@@ -34,11 +34,10 @@
 
 use std::collections::HashSet;
 
-use crate::io::FileIO;
-use crate::spec::{ManifestStatus, TableMetadata};
-use crate::Result;
-
 use super::result::{ExpireProgressCallback, ExpireProgressEvent};
+use crate::Result;
+use crate::io::FileIO;
+use crate::spec::{DataContentType, TableMetadata};
 
 /// Files identified for cleanup after snapshot expiration.
 #[derive(Debug, Clone, Default)]
@@ -49,6 +48,10 @@ pub struct CleanupPlan {
     pub manifest_files: Vec<String>,
     /// Data file paths to delete.
     pub data_files: Vec<String>,
+    /// Position delete file paths to delete.
+    pub position_delete_files: Vec<String>,
+    /// Equality delete file paths to delete.
+    pub equality_delete_files: Vec<String>,
     /// Total bytes that will be freed (estimated).
     pub total_bytes: u64,
 }
@@ -59,11 +62,17 @@ impl CleanupPlan {
         self.manifest_list_files.is_empty()
             && self.manifest_files.is_empty()
             && self.data_files.is_empty()
+            && self.position_delete_files.is_empty()
+            && self.equality_delete_files.is_empty()
     }
 
     /// Total number of files to delete.
     pub fn total_files(&self) -> usize {
-        self.manifest_list_files.len() + self.manifest_files.len() + self.data_files.len()
+        self.manifest_list_files.len()
+            + self.manifest_files.len()
+            + self.data_files.len()
+            + self.position_delete_files.len()
+            + self.equality_delete_files.len()
     }
 }
 
@@ -72,6 +81,10 @@ impl CleanupPlan {
 pub struct CleanupExecutionResult {
     /// Number of data files successfully deleted.
     pub deleted_data_files: u64,
+    /// Number of position delete files successfully deleted.
+    pub deleted_position_delete_files: u64,
+    /// Number of equality delete files successfully deleted.
+    pub deleted_equality_delete_files: u64,
     /// Number of manifest files successfully deleted.
     pub deleted_manifest_files: u64,
     /// Number of manifest list files successfully deleted.
@@ -81,7 +94,11 @@ pub struct CleanupExecutionResult {
 impl CleanupExecutionResult {
     /// Total number of files successfully deleted.
     pub fn total_deleted_files(&self) -> u64 {
-        self.deleted_data_files + self.deleted_manifest_files + self.deleted_manifest_list_files
+        self.deleted_data_files
+            + self.deleted_position_delete_files
+            + self.deleted_equality_delete_files
+            + self.deleted_manifest_files
+            + self.deleted_manifest_list_files
     }
 }
 
@@ -89,11 +106,11 @@ impl CleanupExecutionResult {
 ///
 /// # Algorithm
 ///
-/// 1. Build "live file set" from retained snapshots (manifests + data files)
+/// 1. Build "live file set" from retained snapshots (manifests + data/delete files)
 /// 2. For each expired snapshot:
 ///    - Add manifest list to delete list
 ///    - For each manifest not in live set, add to delete list
-///    - For each data file marked DELETED not in live set, add to delete list
+///    - For each file referenced by expired snapshots but not in live set, add to delete list
 ///
 /// # Arguments
 ///
@@ -118,14 +135,17 @@ pub async fn compute_cleanup_plan(
     }
 
     // Step 1: Build live file set from retained snapshots
+    // This includes both data files and delete files (position/equality)
     let live_manifests = build_live_manifest_set(file_io, metadata, retained_snapshot_ids).await?;
-    let live_data_files =
-        build_live_data_file_set(file_io, metadata, retained_snapshot_ids).await?;
+    let live_files = build_live_file_set(file_io, metadata, retained_snapshot_ids).await?;
 
     // Use sets to avoid duplicates and keep byte estimates correct.
     let mut manifest_list_files = HashSet::new();
     let mut manifest_files = HashSet::new();
     let mut data_files = HashSet::new();
+    let mut position_delete_files = HashSet::new();
+    let mut equality_delete_files = HashSet::new();
+    let mut scanned_manifests = HashSet::new();
     let mut total_bytes = 0u64;
 
     // Step 2: Analyze expired snapshots
@@ -150,26 +170,37 @@ pub async fn compute_cleanup_plan(
         for manifest_file in manifest_list.entries() {
             let manifest_path = &manifest_file.manifest_path;
 
-            // If manifest is not in live set, it can be deleted
-            if !live_manifests.contains(manifest_path) {
-                if manifest_files.insert(manifest_path.clone())
-                    && manifest_file.manifest_length > 0
-                {
-                    total_bytes =
-                        total_bytes.saturating_add(manifest_file.manifest_length as u64);
+            // If manifest is not in live set, it can be deleted.
+            if !live_manifests.contains(manifest_path)
+                && manifest_files.insert(manifest_path.clone())
+                && manifest_file.manifest_length > 0
+            {
+                total_bytes = total_bytes.saturating_add(manifest_file.manifest_length as u64);
+            }
+
+            if !scanned_manifests.insert(manifest_path.clone()) {
+                continue;
+            }
+
+            // Collect data and delete files referenced by expired snapshots.
+            let manifest = manifest_file.load_manifest(file_io).await?;
+            for entry in manifest.entries() {
+                let file_path = entry.file_path();
+                if live_files.contains(file_path) {
+                    continue;
                 }
 
-                // Also check for DELETED data files in this manifest
-                let manifest = manifest_file.load_manifest(file_io).await?;
-                for entry in manifest.entries() {
-                    if entry.status() == ManifestStatus::Deleted {
-                        let file_path = entry.file_path();
-                        if !live_data_files.contains(file_path)
-                            && data_files.insert(file_path.to_string())
-                        {
-                            total_bytes = total_bytes.saturating_add(entry.file_size_in_bytes());
-                        }
+                let inserted = match entry.content_type() {
+                    DataContentType::Data => data_files.insert(file_path.to_string()),
+                    DataContentType::PositionDeletes => {
+                        position_delete_files.insert(file_path.to_string())
                     }
+                    DataContentType::EqualityDeletes => {
+                        equality_delete_files.insert(file_path.to_string())
+                    }
+                };
+                if inserted {
+                    total_bytes = total_bytes.saturating_add(entry.file_size_in_bytes());
                 }
             }
         }
@@ -179,15 +210,21 @@ pub async fn compute_cleanup_plan(
         manifest_list_files: manifest_list_files.into_iter().collect(),
         manifest_files: manifest_files.into_iter().collect(),
         data_files: data_files.into_iter().collect(),
+        position_delete_files: position_delete_files.into_iter().collect(),
+        equality_delete_files: equality_delete_files.into_iter().collect(),
         total_bytes,
     };
     plan.manifest_list_files.sort();
     plan.manifest_files.sort();
     plan.data_files.sort();
+    plan.position_delete_files.sort();
+    plan.equality_delete_files.sort();
 
     if let Some(callback) = progress_callback {
         callback(ExpireProgressEvent::FilesIdentified {
             data_files: plan.data_files.len(),
+            position_delete_files: plan.position_delete_files.len(),
+            equality_delete_files: plan.equality_delete_files.len(),
             manifest_files: plan.manifest_files.len(),
             manifest_list_files: plan.manifest_list_files.len(),
         });
@@ -218,16 +255,17 @@ async fn build_live_manifest_set(
     Ok(live_manifests)
 }
 
-/// Build set of data file paths that are "alive" in retained snapshots.
+/// Build set of file paths that are "alive" in retained snapshots.
 ///
-/// A data file is "alive" if it appears with status ADDED or EXISTING
-/// in any manifest of any retained snapshot.
-async fn build_live_data_file_set(
+/// A file is "alive" if it appears with status ADDED or EXISTING
+/// in any manifest of any retained snapshot. This includes both
+/// data files and delete files (position and equality).
+async fn build_live_file_set(
     file_io: &FileIO,
     metadata: &TableMetadata,
     retained_snapshot_ids: &HashSet<i64>,
 ) -> Result<HashSet<String>> {
-    let mut live_data_files = HashSet::new();
+    let mut live_files = HashSet::new();
 
     for &snapshot_id in retained_snapshot_ids {
         let Some(snapshot) = metadata.snapshot_by_id(snapshot_id) else {
@@ -238,15 +276,15 @@ async fn build_live_data_file_set(
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file.load_manifest(file_io).await?;
             for entry in manifest.entries() {
-                // Files that are ADDED or EXISTING are live
+                // Files that are ADDED or EXISTING are live (includes data and delete files)
                 if entry.is_alive() {
-                    live_data_files.insert(entry.file_path().to_string());
+                    live_files.insert(entry.file_path().to_string());
                 }
             }
         }
     }
 
-    Ok(live_data_files)
+    Ok(live_files)
 }
 
 /// Execute the cleanup plan by deleting files.
@@ -269,7 +307,7 @@ pub async fn execute_cleanup_plan(
     let mut result = CleanupExecutionResult::default();
     let mut current = 0usize;
 
-    // Delete in order: data files, manifests, manifest lists
+    // Delete in order: data files, delete files, manifests, manifest lists
     // (manifest lists should be deleted last as they reference manifests)
 
     for file_path in &plan.data_files {
@@ -283,6 +321,32 @@ pub async fn execute_cleanup_plan(
         // Ignore errors for individual file deletions (file might already be gone)
         if file_io.delete(file_path).await.is_ok() {
             result.deleted_data_files += 1;
+        }
+    }
+
+    for file_path in &plan.position_delete_files {
+        current += 1;
+        if let Some(callback) = progress_callback {
+            callback(ExpireProgressEvent::DeletingFiles {
+                current,
+                total: total_files,
+            });
+        }
+        if file_io.delete(file_path).await.is_ok() {
+            result.deleted_position_delete_files += 1;
+        }
+    }
+
+    for file_path in &plan.equality_delete_files {
+        current += 1;
+        if let Some(callback) = progress_callback {
+            callback(ExpireProgressEvent::DeletingFiles {
+                current,
+                total: total_files,
+            });
+        }
+        if file_io.delete(file_path).await.is_ok() {
+            result.deleted_equality_delete_files += 1;
         }
     }
 
@@ -332,10 +396,26 @@ mod tests {
             manifest_list_files: vec!["a".to_string()],
             manifest_files: vec!["b".to_string(), "c".to_string()],
             data_files: vec!["d".to_string(), "e".to_string(), "f".to_string()],
+            position_delete_files: vec!["pd1".to_string()],
+            equality_delete_files: vec!["ed1".to_string(), "ed2".to_string()],
             total_bytes: 1000,
         };
         assert!(!plan.is_empty());
-        assert_eq!(plan.total_files(), 6);
+        assert_eq!(plan.total_files(), 9); // 1 + 2 + 3 + 1 + 2 = 9
+    }
+
+    #[test]
+    fn test_cleanup_plan_with_delete_files() {
+        let plan = CleanupPlan {
+            manifest_list_files: vec![],
+            manifest_files: vec![],
+            data_files: vec![],
+            position_delete_files: vec!["pd1".to_string()],
+            equality_delete_files: vec!["ed1".to_string()],
+            total_bytes: 0,
+        };
+        assert!(!plan.is_empty());
+        assert_eq!(plan.total_files(), 2);
     }
 
     #[test]
@@ -344,6 +424,8 @@ mod tests {
             manifest_list_files: vec!["a".to_string(), "a".to_string()],
             manifest_files: vec!["b".to_string(), "b".to_string(), "c".to_string()],
             data_files: vec!["d".to_string()],
+            position_delete_files: vec![],
+            equality_delete_files: vec![],
             total_bytes: 0,
         };
 
@@ -355,5 +437,17 @@ mod tests {
 
         assert_eq!(plan.manifest_list_files.len(), 1);
         assert_eq!(plan.manifest_files.len(), 2);
+    }
+
+    #[test]
+    fn test_cleanup_execution_result_total() {
+        let result = CleanupExecutionResult {
+            deleted_data_files: 5,
+            deleted_position_delete_files: 2,
+            deleted_equality_delete_files: 1,
+            deleted_manifest_files: 3,
+            deleted_manifest_list_files: 1,
+        };
+        assert_eq!(result.total_deleted_files(), 12);
     }
 }

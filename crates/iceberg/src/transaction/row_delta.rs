@@ -377,7 +377,7 @@ impl SnapshotProduceOperation for RowDeltaOperation {
     ) -> Result<Vec<ManifestFile>> {
         // Include all existing manifests (both data and delete)
         // RowDelta adds new manifests alongside existing ones
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.current_snapshot()? else {
             return Ok(vec![]);
         };
 

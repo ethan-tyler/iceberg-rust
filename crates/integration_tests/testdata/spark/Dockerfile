@@ -48,10 +48,14 @@ ENV PATH="/opt/spark/sbin:/opt/spark/bin:${PATH}"
 RUN chmod u+x /opt/spark/sbin/* && \
     chmod u+x /opt/spark/bin/*
 
+# Install PyArrow for equality delete file creation
+RUN pip install pyarrow
+
 WORKDIR '/home/'
 
 COPY entrypoint.sh .
 COPY provision.py .
+COPY validate.py .
 
 HEALTHCHECK --retries=120 --interval=1s \
   CMD ls /tmp/ready || exit 1

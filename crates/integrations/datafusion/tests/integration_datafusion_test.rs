@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
+use chrono::{DateTime, Utc};
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::context::SessionContext;
@@ -176,6 +177,8 @@ async fn test_provider_list_table_names() -> Result<()> {
             "my_table$refs",
             "my_table$files",
             "my_table$properties",
+            "my_table$partitions",
+            "my_table$entries",
         ]
     "#]]
     .assert_debug_eq(&result);
@@ -2457,7 +2460,11 @@ async fn test_non_partitioned_table_no_regression() -> Result<()> {
         .as_any()
         .downcast_ref::<datafusion::arrow::array::Int32Array>()
         .unwrap();
-    let value_array = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let value_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     assert_eq!(id_array.value(0), 2);
     assert_eq!(value_array.value(0), "b");
@@ -2483,7 +2490,6 @@ async fn test_non_partitioned_table_no_regression() -> Result<()> {
 
     Ok(())
 }
-
 
 /// Test partition pruning on a partitioned table.
 /// Verifies that filters can be applied to partition pruning.
@@ -2564,7 +2570,11 @@ async fn test_partition_pruning_with_in_list() -> Result<()> {
         .as_any()
         .downcast_ref::<datafusion::arrow::array::Int32Array>()
         .unwrap();
-    let region_array = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let region_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     // Verify the results
     assert_eq!(id_array.value(0), 1);
@@ -2700,7 +2710,9 @@ async fn test_dynamic_partition_pruning_with_join() -> Result<()> {
         let mut total = 0;
         let mut stack = vec![Arc::clone(plan)];
         while let Some(node) = stack.pop() {
-            if node.name() == "IcebergTableScan" && let Some(metrics) = node.metrics() {
+            if node.name() == "IcebergTableScan"
+                && let Some(metrics) = node.metrics()
+            {
                 for metric in metrics.iter() {
                     if let MetricValue::Count { name, count } = metric.value()
                         && name == "planned_tasks"
@@ -2754,12 +2766,9 @@ async fn test_dynamic_partition_pruning_with_join() -> Result<()> {
         .unwrap();
     let baseline_task_ctx = Arc::new(baseline_df.task_ctx());
     let baseline_plan = baseline_df.create_physical_plan().await.unwrap();
-    datafusion::physical_plan::collect(
-        Arc::clone(&baseline_plan),
-        baseline_task_ctx,
-    )
-    .await
-    .unwrap();
+    datafusion::physical_plan::collect(Arc::clone(&baseline_plan), baseline_task_ctx)
+        .await
+        .unwrap();
     let baseline_tasks = planned_tasks_for_iceberg_scans(&baseline_plan);
     assert!(
         baseline_tasks >= 4,
@@ -2778,12 +2787,9 @@ async fn test_dynamic_partition_pruning_with_join() -> Result<()> {
         .unwrap();
     let join_task_ctx = Arc::new(join_df.task_ctx());
     let join_plan = join_df.clone().create_physical_plan().await.unwrap();
-    let result = datafusion::physical_plan::collect(
-        Arc::clone(&join_plan),
-        join_task_ctx,
-    )
-    .await
-    .unwrap();
+    let result = datafusion::physical_plan::collect(Arc::clone(&join_plan), join_task_ctx)
+        .await
+        .unwrap();
     let join_fact_tasks = planned_tasks_for_fact_scan(&join_plan);
     assert!(
         join_fact_tasks < baseline_tasks,
@@ -2808,7 +2814,11 @@ async fn test_dynamic_partition_pruning_with_join() -> Result<()> {
         .as_any()
         .downcast_ref::<datafusion::arrow::array::Int32Array>()
         .unwrap();
-    let partition_name_array = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+    let partition_name_array = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     // Verify the join results
     assert_eq!(id_array.value(0), 1);
@@ -2849,6 +2859,430 @@ async fn test_dynamic_partition_pruning_with_join() -> Result<()> {
     assert!(
         plan_str.value(1).contains("dynamic_filter:[enabled]"),
         "Expected IcebergTableScan to show an enabled dynamic filter"
+    );
+
+    Ok(())
+}
+
+// =============================================================================
+// Time Travel Tests
+// =============================================================================
+
+/// Test time travel using snapshot ID syntax (table@v<snapshot_id>)
+///
+/// This test:
+/// 1. Creates a table
+/// 2. Inserts initial data (creates snapshot 1)
+/// 3. Inserts more data (creates snapshot 2)
+/// 4. Uses @v<snapshot_id> syntax to query the first snapshot
+/// 5. Verifies that the time travel query returns only the original data
+#[tokio::test]
+async fn test_time_travel_snapshot_id() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_time_travel_snapshot".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "tt_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert initial data - this creates snapshot 1
+    ctx.sql("INSERT INTO catalog.test_time_travel_snapshot.tt_table VALUES (1, 'first')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Get the snapshot ID after first insert
+    let table = client
+        .load_table(&TableIdent::new(namespace.clone(), "tt_table".to_string()))
+        .await
+        .unwrap();
+    let snapshot1_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+    // Insert more data - this creates snapshot 2
+    ctx.sql("INSERT INTO catalog.test_time_travel_snapshot.tt_table VALUES (2, 'second')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Query current snapshot - should return 2 rows
+    let current_df = ctx
+        .sql("SELECT * FROM catalog.test_time_travel_snapshot.tt_table ORDER BY foo1")
+        .await
+        .unwrap();
+    let current_batches = current_df.collect().await.unwrap();
+    let total_rows: usize = current_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Current snapshot should have 2 rows");
+
+    // Query historical snapshot using @v<snapshot_id> syntax - should return 1 row
+    let historical_sql = format!(
+        "SELECT * FROM \"catalog\".\"test_time_travel_snapshot\".\"tt_table@v{}\" ORDER BY foo1",
+        snapshot1_id
+    );
+    let historical_df = ctx.sql(&historical_sql).await.unwrap();
+    let historical_batches = historical_df.collect().await.unwrap();
+    let historical_rows: usize = historical_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(historical_rows, 1, "Historical snapshot should have 1 row");
+
+    // Verify the historical data is correct
+    let batch = &historical_batches[0];
+    let foo1_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    assert_eq!(foo1_col.value(0), 1, "Historical row should have foo1=1");
+
+    // Query historical snapshot using VERSION AS OF syntax - should return 1 row
+    let version_sql = format!(
+        "SELECT * FROM catalog.test_time_travel_snapshot.tt_table VERSION AS OF {snapshot1_id} ORDER BY foo1",
+    );
+    let version_df = ctx.sql(&version_sql).await.unwrap();
+    let version_batches = version_df.collect().await.unwrap();
+    let version_rows: usize = version_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(version_rows, 1, "VERSION AS OF should return 1 row");
+
+    let version_batch = &version_batches[0];
+    let version_foo1 = version_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    assert_eq!(
+        version_foo1.value(0),
+        1,
+        "VERSION AS OF row should have foo1=1"
+    );
+
+    Ok(())
+}
+
+/// Test time travel using timestamp syntax (table@ts<timestamp_ms>)
+///
+/// This test:
+/// 1. Creates a table
+/// 2. Records timestamp before first insert
+/// 3. Inserts initial data (creates snapshot 1)
+/// 4. Records timestamp between inserts
+/// 5. Inserts more data (creates snapshot 2)
+/// 6. Uses @ts<timestamp> syntax to query at the middle timestamp
+/// 7. Verifies that the time travel query returns only the first insert's data
+#[tokio::test]
+async fn test_time_travel_timestamp() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_time_travel_ts".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "ts_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert initial data - this creates snapshot 1
+    ctx.sql("INSERT INTO catalog.test_time_travel_ts.ts_table VALUES (1, 'first')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Get the timestamp of snapshot 1
+    let table = client
+        .load_table(&TableIdent::new(namespace.clone(), "ts_table".to_string()))
+        .await
+        .unwrap();
+    let snapshot1_ts = table.metadata().current_snapshot().unwrap().timestamp_ms();
+    let snapshot1_ts_str = DateTime::<Utc>::from_timestamp_millis(snapshot1_ts)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string();
+
+    // Small delay to ensure next snapshot has a different timestamp
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    // Insert more data - this creates snapshot 2
+    ctx.sql("INSERT INTO catalog.test_time_travel_ts.ts_table VALUES (2, 'second')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Query using timestamp that matches snapshot 1 exactly
+    let ts_sql = format!(
+        "SELECT * FROM \"catalog\".\"test_time_travel_ts\".\"ts_table@ts{}\" ORDER BY foo1",
+        snapshot1_ts
+    );
+    let ts_df = ctx.sql(&ts_sql).await.unwrap();
+    let ts_batches = ts_df.collect().await.unwrap();
+    let ts_rows: usize = ts_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        ts_rows, 1,
+        "Query at snapshot1 timestamp should return 1 row"
+    );
+
+    // Verify the data is correct
+    let batch = &ts_batches[0];
+    let foo1_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    assert_eq!(foo1_col.value(0), 1, "Row should have foo1=1");
+
+    // Query using TIMESTAMP AS OF with a string literal - should return 1 row
+    let timestamp_sql = format!(
+        "SELECT * FROM catalog.test_time_travel_ts.ts_table TIMESTAMP AS OF '{}' ORDER BY foo1",
+        snapshot1_ts_str
+    );
+    let timestamp_df = ctx.sql(&timestamp_sql).await.unwrap();
+    let timestamp_batches = timestamp_df.collect().await.unwrap();
+    let timestamp_rows: usize = timestamp_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(timestamp_rows, 1, "TIMESTAMP AS OF should return 1 row");
+
+    // CTE with time travel
+    let cte_sql = format!(
+        "WITH historical AS (SELECT * FROM catalog.test_time_travel_ts.ts_table TIMESTAMP AS OF '{}') \
+         SELECT count(*) FROM historical",
+        snapshot1_ts_str
+    );
+    let cte_batches = ctx.sql(&cte_sql).await.unwrap().collect().await.unwrap();
+    let cte_count = cte_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(cte_count.value(0), 1, "CTE time travel should return 1 row");
+
+    Ok(())
+}
+
+/// Test time travel in a JOIN query
+///
+/// This test verifies that time travel works correctly in JOIN operations
+/// by joining current data with historical data.
+#[tokio::test]
+async fn test_time_travel_in_join() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_time_travel_join".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "join_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert initial data
+    ctx.sql("INSERT INTO catalog.test_time_travel_join.join_table VALUES (1, 'old_value')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Get the snapshot ID
+    let table = client
+        .load_table(&TableIdent::new(
+            namespace.clone(),
+            "join_table".to_string(),
+        ))
+        .await
+        .unwrap();
+    let snapshot1_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+    // Insert updated data (same foo1 key, different foo2 value)
+    ctx.sql("INSERT INTO catalog.test_time_travel_join.join_table VALUES (1, 'new_value')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Join current with historical to see the change
+    let join_sql = format!(
+        r#"SELECT
+            current.foo1,
+            historical.foo2 as old_foo2,
+            current.foo2 as new_foo2
+        FROM catalog.test_time_travel_join.join_table AS current
+        JOIN "catalog"."test_time_travel_join"."join_table@v{}" AS historical
+            ON current.foo1 = historical.foo1
+        WHERE current.foo2 = 'new_value'
+        ORDER BY current.foo1"#,
+        snapshot1_id
+    );
+
+    let join_df = ctx.sql(&join_sql).await.unwrap();
+    let join_batches = join_df.collect().await.unwrap();
+    let join_rows: usize = join_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(join_rows, 1, "Join should return 1 row");
+
+    // Verify the joined data shows old and new values
+    let batch = &join_batches[0];
+    let old_foo2 = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let new_foo2 = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(old_foo2.value(0), "old_value");
+    assert_eq!(new_foo2.value(0), "new_value");
+
+    // Join using VERSION AS OF syntax
+    let join_version_sql = format!(
+        r#"SELECT
+            current.foo1,
+            historical.foo2 as old_foo2,
+            current.foo2 as new_foo2
+        FROM catalog.test_time_travel_join.join_table AS current
+        JOIN catalog.test_time_travel_join.join_table VERSION AS OF {snapshot1_id} AS historical
+            ON current.foo1 = historical.foo1
+        WHERE current.foo2 = 'new_value'
+        ORDER BY current.foo1"#,
+    );
+
+    let join_version_df = ctx.sql(&join_version_sql).await.unwrap();
+    let join_version_batches = join_version_df.collect().await.unwrap();
+    let join_version_rows: usize = join_version_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        join_version_rows, 1,
+        "VERSION AS OF join should return 1 row"
+    );
+
+    Ok(())
+}
+
+/// Test time travel error handling for invalid snapshot ID
+#[tokio::test]
+async fn test_time_travel_invalid_snapshot_id() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_time_travel_error".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "error_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert some data
+    ctx.sql("INSERT INTO catalog.test_time_travel_error.error_table VALUES (1, 'test')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Try to query with an invalid snapshot ID (99999 is unlikely to exist)
+    let invalid_sql = "SELECT * FROM \"catalog\".\"test_time_travel_error\".\"error_table@v99999\"";
+    let result = ctx.sql(invalid_sql).await;
+
+    // Should fail with a clear error message about snapshot not found
+    assert!(
+        result.is_err(),
+        "Query with invalid snapshot ID should fail"
+    );
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("99999") && error_msg.contains("not found"),
+        "Error message should mention the invalid snapshot ID: {}",
+        error_msg
+    );
+
+    // Try VERSION AS OF with an invalid snapshot ID
+    let invalid_version_sql =
+        "SELECT * FROM catalog.test_time_travel_error.error_table VERSION AS OF 99999";
+    let version_result = ctx.sql(invalid_version_sql).await;
+    assert!(
+        version_result.is_err(),
+        "VERSION AS OF with invalid snapshot ID should fail"
+    );
+    let version_error_msg = version_result.unwrap_err().to_string();
+    assert!(
+        version_error_msg.contains("99999") && version_error_msg.contains("not found"),
+        "VERSION AS OF error message should mention the invalid snapshot ID: {}",
+        version_error_msg
+    );
+
+    Ok(())
+}
+
+/// Test time travel error handling for timestamp before any snapshot
+#[tokio::test]
+async fn test_time_travel_timestamp_too_early() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_time_travel_early".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "early_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert some data
+    ctx.sql("INSERT INTO catalog.test_time_travel_early.early_table VALUES (1, 'test')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Try to query with a very old timestamp (epoch + 1ms)
+    let early_sql = "SELECT * FROM \"catalog\".\"test_time_travel_early\".\"early_table@ts1\"";
+    let result = ctx.sql(early_sql).await;
+
+    // Should fail with a clear error message about no snapshot found
+    assert!(
+        result.is_err(),
+        "Query with timestamp before any snapshot should fail"
+    );
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("No snapshot found"),
+        "Error message should indicate no snapshot was found: {}",
+        error_msg
+    );
+
+    // Try TIMESTAMP AS OF with a timestamp before any snapshot
+    let early_ts_sql = "SELECT * FROM catalog.test_time_travel_early.early_table TIMESTAMP AS OF '1970-01-01 00:00:00.001'";
+    let ts_result = ctx.sql(early_ts_sql).await;
+    assert!(
+        ts_result.is_err(),
+        "TIMESTAMP AS OF with early timestamp should fail"
+    );
+    let ts_error_msg = ts_result.unwrap_err().to_string();
+    assert!(
+        ts_error_msg.contains("No snapshot found"),
+        "TIMESTAMP AS OF error message should indicate no snapshot was found: {}",
+        ts_error_msg
     );
 
     Ok(())

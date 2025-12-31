@@ -98,6 +98,12 @@ impl SchemaBuilder {
         self
     }
 
+    /// Replace fields in schema builder.
+    pub fn replace_fields(mut self, fields: impl IntoIterator<Item = NestedFieldRef>) -> Self {
+        self.fields = fields.into_iter().collect();
+        self
+    }
+
     /// Reassign all field-ids (including nested) on build.
     /// Reassignment starts from the field-id specified in `start_from` (inclusive).
     ///

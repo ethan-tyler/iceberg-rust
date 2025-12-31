@@ -27,7 +27,7 @@ mod tests {
         CustomAwsCredentialLoader, FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION,
         S3_SECRET_ACCESS_KEY,
     };
-    use iceberg_test_utils::docker::DockerCompose;
+    use iceberg_test_utils::docker::{DockerCompose, docker_available};
     use iceberg_test_utils::{normalize_test_name, set_up};
     use reqsign::{AwsCredential, AwsCredentialLoad};
     use reqwest::Client;
@@ -37,6 +37,10 @@ mod tests {
 
     #[ctor]
     fn before_all() {
+        if !docker_available() {
+            eprintln!("Skipping docker setup for file_io_s3_test: docker unavailable.");
+            return;
+        }
         let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
         let docker_compose = DockerCompose::new(
             normalize_test_name(module_path!()),
@@ -52,39 +56,49 @@ mod tests {
         guard.take();
     }
 
-    async fn get_file_io() -> FileIO {
+    async fn get_file_io() -> Option<FileIO> {
+        if !docker_available() {
+            return None;
+        }
         set_up();
 
-        let container_ip = get_container_ip("minio");
+        let container_ip = get_container_ip("minio")?;
         let minio_socket_addr = SocketAddr::new(container_ip, MINIO_PORT);
 
-        FileIOBuilder::new("s3")
-            .with_props(vec![
-                (S3_ENDPOINT, format!("http://{minio_socket_addr}")),
-                (S3_ACCESS_KEY_ID, "admin".to_string()),
-                (S3_SECRET_ACCESS_KEY, "password".to_string()),
-                (S3_REGION, "us-east-1".to_string()),
-            ])
-            .build()
-            .unwrap()
+        Some(
+            FileIOBuilder::new("s3")
+                .with_props(vec![
+                    (S3_ENDPOINT, format!("http://{minio_socket_addr}")),
+                    (S3_ACCESS_KEY_ID, "admin".to_string()),
+                    (S3_SECRET_ACCESS_KEY, "password".to_string()),
+                    (S3_REGION, "us-east-1".to_string()),
+                ])
+                .build()
+                .unwrap(),
+        )
     }
 
-    fn get_container_ip(service_name: &str) -> IpAddr {
+    fn get_container_ip(service_name: &str) -> Option<IpAddr> {
         let guard = DOCKER_COMPOSE_ENV.read().unwrap();
-        let docker_compose = guard.as_ref().unwrap();
-        docker_compose.get_container_ip(service_name)
+        guard
+            .as_ref()
+            .map(|docker_compose| docker_compose.get_container_ip(service_name))
     }
 
     #[tokio::test]
     async fn test_file_io_s3_exists() {
-        let file_io = get_file_io().await;
+        let Some(file_io) = get_file_io().await else {
+            return;
+        };
         assert!(!file_io.exists("s3://bucket2/any").await.unwrap());
         assert!(file_io.exists("s3://bucket1/").await.unwrap());
     }
 
     #[tokio::test]
     async fn test_file_io_s3_output() {
-        let file_io = get_file_io().await;
+        let Some(file_io) = get_file_io().await else {
+            return;
+        };
         assert!(!file_io.exists("s3://bucket1/test_output").await.unwrap());
         let output_file = file_io.new_output("s3://bucket1/test_output").unwrap();
         {
@@ -95,7 +109,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_io_s3_input() {
-        let file_io = get_file_io().await;
+        let Some(file_io) = get_file_io().await else {
+            return;
+        };
         let output_file = file_io.new_output("s3://bucket1/test_input").unwrap();
         {
             output_file.write("test_input".into()).await.unwrap();
@@ -194,14 +210,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_with_custom_credential_loader_integration() {
-        let _file_io = get_file_io().await;
+        let Some(_file_io) = get_file_io().await else {
+            return;
+        };
 
         // Create a mock credential loader
         let mock_loader = MockCredentialLoader::new_minio();
         let custom_loader = CustomAwsCredentialLoader::new(Arc::new(mock_loader));
 
         // Get container info for endpoint
-        let container_ip = get_container_ip("minio");
+        let Some(container_ip) = get_container_ip("minio") else {
+            return;
+        };
         let minio_socket_addr = SocketAddr::new(container_ip, MINIO_PORT);
 
         // Build FileIO with custom credential loader
@@ -223,14 +243,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_with_custom_credential_loader_integration_failure() {
-        let _file_io = get_file_io().await;
+        let Some(_file_io) = get_file_io().await else {
+            return;
+        };
 
         // Create a mock credential loader with no credentials
         let mock_loader = MockCredentialLoader::new(None);
         let custom_loader = CustomAwsCredentialLoader::new(Arc::new(mock_loader));
 
         // Get container info for endpoint
-        let container_ip = get_container_ip("minio");
+        let Some(container_ip) = get_container_ip("minio") else {
+            return;
+        };
         let minio_socket_addr = SocketAddr::new(container_ip, MINIO_PORT);
 
         // Build FileIO with custom credential loader

@@ -25,6 +25,7 @@ use crate::get_shared_containers;
 
 mod append_data_file_test;
 mod append_partition_data_file_test;
+mod cli_test;
 mod conflict_commit_test;
 mod datafusion;
 mod delete_files_test;
@@ -32,6 +33,8 @@ mod partition_evolution_crossengine;
 mod read_evolved_schema;
 mod read_positional_deletes;
 mod scan_all_type;
+mod schema_evolution_crossengine;
+mod semantic_parity_test;
 
 pub async fn random_ns() -> Namespace {
     let fixture = get_shared_containers();

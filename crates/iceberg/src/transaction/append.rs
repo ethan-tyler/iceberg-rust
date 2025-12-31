@@ -37,6 +37,7 @@ pub struct FastAppendAction {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    target_ref: Option<String>,
 }
 
 impl FastAppendAction {
@@ -47,6 +48,7 @@ impl FastAppendAction {
             key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            target_ref: None,
         }
     }
 
@@ -79,12 +81,22 @@ impl FastAppendAction {
         self.snapshot_properties = snapshot_properties;
         self
     }
+
+    /// Write the snapshot to a specific branch reference.
+    ///
+    /// Branches must exist or will be created implicitly on commit.
+    /// Tags are immutable and cannot be used as write targets.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn to_branch(mut self, branch: impl Into<String>) -> Self {
+        self.target_ref = Some(branch.into());
+        self
+    }
 }
 
 #[async_trait]
 impl TransactionAction for FastAppendAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        let snapshot_producer = SnapshotProducer::new(
+        let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.key_metadata.clone(),
@@ -92,6 +104,10 @@ impl TransactionAction for FastAppendAction {
             self.added_data_files.clone(),
             vec![], // No delete files for append
         );
+
+        if let Some(ref target_ref) = self.target_ref {
+            snapshot_producer = snapshot_producer.with_target_ref(target_ref.clone());
+        }
 
         // validate added files
         snapshot_producer.validate_added_data_files()?;
@@ -125,7 +141,7 @@ impl SnapshotProduceOperation for FastAppendOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.current_snapshot()? else {
             return Ok(vec![]);
         };
 

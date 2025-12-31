@@ -17,18 +17,50 @@
 
 //! Result types for snapshot expiration.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+/// Progress event emitted during expire snapshots operation.
+#[derive(Debug, Clone)]
+pub enum ExpireProgressEvent {
+    /// Analyzing a snapshot for files to delete.
+    AnalyzingSnapshot {
+        /// Index of the snapshot being analyzed (0-based).
+        index: usize,
+        /// ID of the snapshot being analyzed.
+        snapshot_id: i64,
+    },
+    /// Files have been identified for deletion.
+    FilesIdentified {
+        /// Number of data files to delete.
+        data_files: usize,
+        /// Number of position delete files to delete.
+        position_delete_files: usize,
+        /// Number of equality delete files to delete.
+        equality_delete_files: usize,
+        /// Number of manifest files to delete.
+        manifest_files: usize,
+        /// Number of manifest list files to delete.
+        manifest_list_files: usize,
+    },
+    /// Deleting files.
+    DeletingFiles {
+        /// Current file being deleted (1-based).
+        current: usize,
+        /// Total number of files to delete.
+        total: usize,
+    },
+}
+
+/// Callback for progress events during expire snapshots.
+pub type ExpireProgressCallback = Arc<dyn Fn(ExpireProgressEvent) + Send + Sync>;
 
 /// Result of an expire_snapshots operation.
 ///
 /// This struct contains statistics about what was deleted during expiration.
 /// In dry-run mode, it shows what would be deleted without making changes.
-///
-/// **Note:** File deletion is not yet implemented. Currently only metadata
-/// changes (snapshot removal) are performed. File cleanup will be added
-/// in a future release.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpireSnapshotsResult {
     /// Number of snapshots expired (removed from metadata).
@@ -38,27 +70,21 @@ pub struct ExpireSnapshotsResult {
     pub deleted_refs_count: u64,
 
     /// Number of data files deleted.
-    /// Currently always 0 - file deletion not yet implemented.
     pub deleted_data_files_count: u64,
 
     /// Number of position delete files deleted.
-    /// Currently always 0 - file deletion not yet implemented.
     pub deleted_position_delete_files_count: u64,
 
     /// Number of equality delete files deleted.
-    /// Currently always 0 - file deletion not yet implemented.
     pub deleted_equality_delete_files_count: u64,
 
     /// Number of manifest files deleted.
-    /// Currently always 0 - file deletion not yet implemented.
     pub deleted_manifest_files_count: u64,
 
     /// Number of manifest list files deleted.
-    /// Currently always 0 - file deletion not yet implemented.
     pub deleted_manifest_list_files_count: u64,
 
-    /// Total bytes freed by file deletion.
-    /// Currently always 0 - file deletion not yet implemented.
+    /// Total bytes freed by file deletion (estimated).
     pub total_bytes_freed: u64,
 
     /// Execution duration in milliseconds.
@@ -140,7 +166,7 @@ mod tests {
         assert_eq!(result.deleted_refs_count, 2);
         assert_eq!(result.duration_ms, 1500);
         assert!(result.has_changes());
-        assert!(!result.has_deleted_files()); // File deletion not implemented
+        assert!(!result.has_deleted_files());
     }
 
     #[test]
