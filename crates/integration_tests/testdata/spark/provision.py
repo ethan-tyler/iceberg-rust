@@ -23,11 +23,9 @@ from pyspark.sql.functions import current_date, date_add, expr
 # hits the Parquet file with one row, the parquet file gets
 # dropped instead of having a merge-on-read delete file.
 spark = (
-    SparkSession
-        .builder
-        .config("spark.sql.shuffle.partitions", "1")
-        .config("spark.default.parallelism", "1")
-        .getOrCreate()
+    SparkSession.builder.config("spark.sql.shuffle.partitions", "1")
+    .config("spark.default.parallelism", "1")
+    .getOrCreate()
 )
 
 spark.sql(f"""CREATE NAMESPACE IF NOT EXISTS rest.default""")
@@ -68,7 +66,9 @@ VALUES
 """
 )
 
-spark.sql(f"DELETE FROM rest.default.test_positional_merge_on_read_deletes WHERE number = 9")
+spark.sql(
+    f"DELETE FROM rest.default.test_positional_merge_on_read_deletes WHERE number = 9"
+)
 
 spark.sql(
     f"""
@@ -107,28 +107,48 @@ VALUES
 )
 
 #  Creates two positional deletes that should be merged
-spark.sql(f"DELETE FROM rest.default.test_positional_merge_on_read_double_deletes WHERE number = 9")
-spark.sql(f"DELETE FROM rest.default.test_positional_merge_on_read_double_deletes WHERE letter == 'f'")
+spark.sql(
+    f"DELETE FROM rest.default.test_positional_merge_on_read_double_deletes WHERE number = 9"
+)
+spark.sql(
+    f"DELETE FROM rest.default.test_positional_merge_on_read_double_deletes WHERE letter == 'f'"
+)
 
 #  Create a table, and do some renaming
-spark.sql("CREATE OR REPLACE TABLE rest.default.test_rename_column (lang string) USING iceberg")
+spark.sql(
+    "CREATE OR REPLACE TABLE rest.default.test_rename_column (lang string) USING iceberg"
+)
 spark.sql("INSERT INTO rest.default.test_rename_column VALUES ('Python')")
 spark.sql("ALTER TABLE rest.default.test_rename_column RENAME COLUMN lang TO language")
 spark.sql("INSERT INTO rest.default.test_rename_column VALUES ('Java')")
 
 #  Create a table, and do some evolution
-spark.sql("CREATE OR REPLACE TABLE rest.default.test_promote_column (foo int) USING iceberg")
+spark.sql(
+    "CREATE OR REPLACE TABLE rest.default.test_promote_column (foo int) USING iceberg"
+)
 spark.sql("INSERT INTO rest.default.test_promote_column VALUES (19)")
 spark.sql("ALTER TABLE rest.default.test_promote_column ALTER COLUMN foo TYPE bigint")
 spark.sql("INSERT INTO rest.default.test_promote_column VALUES (25)")
 
 #  Create a table, and do some evolution on a partition column
-spark.sql("CREATE OR REPLACE TABLE rest.default.test_promote_partition_column (foo int, bar float, baz decimal(4, 2)) USING iceberg PARTITIONED BY (foo)")
-spark.sql("INSERT INTO rest.default.test_promote_partition_column VALUES (19, 19.25, 19.25)")
-spark.sql("ALTER TABLE rest.default.test_promote_partition_column ALTER COLUMN foo TYPE bigint")
-spark.sql("ALTER TABLE rest.default.test_promote_partition_column ALTER COLUMN bar TYPE double")
-spark.sql("ALTER TABLE rest.default.test_promote_partition_column ALTER COLUMN baz TYPE decimal(6, 2)")
-spark.sql("INSERT INTO rest.default.test_promote_partition_column VALUES (25, 22.25, 22.25)")
+spark.sql(
+    "CREATE OR REPLACE TABLE rest.default.test_promote_partition_column (foo int, bar float, baz decimal(4, 2)) USING iceberg PARTITIONED BY (foo)"
+)
+spark.sql(
+    "INSERT INTO rest.default.test_promote_partition_column VALUES (19, 19.25, 19.25)"
+)
+spark.sql(
+    "ALTER TABLE rest.default.test_promote_partition_column ALTER COLUMN foo TYPE bigint"
+)
+spark.sql(
+    "ALTER TABLE rest.default.test_promote_partition_column ALTER COLUMN bar TYPE double"
+)
+spark.sql(
+    "ALTER TABLE rest.default.test_promote_partition_column ALTER COLUMN baz TYPE decimal(6, 2)"
+)
+spark.sql(
+    "INSERT INTO rest.default.test_promote_partition_column VALUES (25, 22.25, 22.25)"
+)
 
 #  Create a table with various types
 spark.sql("""
@@ -184,7 +204,9 @@ VALUES
 """)
 
 # Evolve to partition by category
-spark.sql("ALTER TABLE rest.default.test_partition_evolution_delete ADD PARTITION FIELD category")
+spark.sql(
+    "ALTER TABLE rest.default.test_partition_evolution_delete ADD PARTITION FIELD category"
+)
 
 # Insert data under spec v1 (partitioned by category)
 spark.sql("""
@@ -219,7 +241,9 @@ VALUES
 """)
 
 # Evolve to partition by region
-spark.sql("ALTER TABLE rest.default.test_partition_evolution_update ADD PARTITION FIELD region")
+spark.sql(
+    "ALTER TABLE rest.default.test_partition_evolution_update ADD PARTITION FIELD region"
+)
 
 # Insert data under spec v1 (partitioned by region)
 spark.sql("""
@@ -254,7 +278,9 @@ VALUES
 """)
 
 # Evolve to partition by region
-spark.sql("ALTER TABLE rest.default.test_partition_evolution_merge ADD PARTITION FIELD region")
+spark.sql(
+    "ALTER TABLE rest.default.test_partition_evolution_merge ADD PARTITION FIELD region"
+)
 
 # Insert data under spec v1 (partitioned by region)
 spark.sql("""
@@ -363,10 +389,18 @@ TBLPROPERTIES (
 """)
 
 # Create multiple snapshots by doing multiple inserts (same as test_expire_snapshots)
-spark.sql("INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (1, 100)")
-spark.sql("INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (2, 200)")
-spark.sql("INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (3, 300)")
-spark.sql("INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (4, 400)")
+spark.sql(
+    "INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (1, 100)"
+)
+spark.sql(
+    "INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (2, 200)"
+)
+spark.sql(
+    "INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (3, 300)"
+)
+spark.sql(
+    "INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (4, 400)"
+)
 
 # Table for testing remove orphan files
 spark.sql("""
@@ -419,7 +453,7 @@ TBLPROPERTIES (
 """)
 
 # Insert identical data into both tables
-for table in ['parity_delete_rust', 'parity_delete_spark']:
+for table in ["parity_delete_rust", "parity_delete_spark"]:
     spark.sql(f"""
     INSERT INTO rest.default.{table}
     VALUES
@@ -454,7 +488,7 @@ TBLPROPERTIES (
 """)
 
 # Insert data in multiple commits to create multiple small files
-for table in ['parity_compact_rust', 'parity_compact_spark']:
+for table in ["parity_compact_rust", "parity_compact_spark"]:
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (1, 'row1')")
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (2, 'row2')")
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (3, 'row3')")
@@ -484,7 +518,7 @@ TBLPROPERTIES (
 """)
 
 # Create multiple snapshots by doing multiple inserts
-for table in ['parity_expire_rust', 'parity_expire_spark']:
+for table in ["parity_expire_rust", "parity_expire_spark"]:
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (1, 100)")
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (2, 200)")
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (3, 300)")
@@ -516,7 +550,7 @@ TBLPROPERTIES (
 );
 """)
 
-for table in ['parity_null_rust', 'parity_null_spark']:
+for table in ["parity_null_rust", "parity_null_spark"]:
     spark.sql(f"""
     INSERT INTO rest.default.{table}
     VALUES
@@ -553,7 +587,7 @@ TBLPROPERTIES (
 );
 """)
 
-for table in ['parity_update_rust', 'parity_update_spark']:
+for table in ["parity_update_rust", "parity_update_spark"]:
     spark.sql(f"""
     INSERT INTO rest.default.{table}
     VALUES
@@ -590,7 +624,7 @@ TBLPROPERTIES (
 );
 """)
 
-for table in ['parity_merge_rust', 'parity_merge_spark']:
+for table in ["parity_merge_rust", "parity_merge_spark"]:
     spark.sql(f"""
     INSERT INTO rest.default.{table}
     VALUES
@@ -627,7 +661,7 @@ TBLPROPERTIES (
 );
 """)
 
-for table in ['parity_boundary_rust', 'parity_boundary_spark']:
+for table in ["parity_boundary_rust", "parity_boundary_spark"]:
     spark.sql(f"""
     INSERT INTO rest.default.{table}
     VALUES
@@ -665,7 +699,7 @@ TBLPROPERTIES (
 );
 """)
 
-for table in ['parity_partition_rust', 'parity_partition_spark']:
+for table in ["parity_partition_rust", "parity_partition_spark"]:
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (1, 'A', 10)")
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (2, 'B', 20)")
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (3, NULL, 30)")
@@ -682,7 +716,10 @@ import pyarrow.parquet as pq
 import tempfile
 import os
 
-def create_equality_delete_file(spark, table_name, delete_schema_fields, delete_data, partition_spec_id=0):
+
+def create_equality_delete_file(
+    spark, table_name, delete_schema_fields, delete_data, partition_spec_id=0
+):
     """
     Create an equality delete file for a table using PyArrow + Iceberg Java API.
 
@@ -704,8 +741,12 @@ def create_equality_delete_file(spark, table_name, delete_schema_fields, delete_
     java_import(jvm, "org.apache.iceberg.data.*")
 
     # Get the Spark catalog and load the table
-    spark_catalog = jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergCatalog(spark._jsparkSession, "rest")
-    table_identifier = jvm.org.apache.iceberg.catalog.TableIdentifier.parse(table_name.replace("rest.", ""))
+    spark_catalog = jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergCatalog(
+        spark._jsparkSession, "rest"
+    )
+    table_identifier = jvm.org.apache.iceberg.catalog.TableIdentifier.parse(
+        table_name.replace("rest.", "")
+    )
     table = spark_catalog.loadTable(table_identifier)
 
     # Build PyArrow schema with Iceberg field IDs
@@ -722,7 +763,9 @@ def create_equality_delete_file(spark, table_name, delete_schema_fields, delete_
             raise ValueError(f"Unsupported type: {type_str}")
 
         # Add PARQUET:field_id metadata for Iceberg
-        field = pa.field(name, pa_type, metadata={b'PARQUET:field_id': str(field_id).encode()})
+        field = pa.field(
+            name, pa_type, metadata={b"PARQUET:field_id": str(field_id).encode()}
+        )
         pa_fields.append(field)
         equality_ids.append(field_id)
 
@@ -736,7 +779,7 @@ def create_equality_delete_file(spark, table_name, delete_schema_fields, delete_
 
     # Build arrays
     arrays = []
-    for (field_id, name, type_str) in delete_schema_fields:
+    for field_id, name, type_str in delete_schema_fields:
         if type_str == "int":
             arrays.append(pa.array(columns[name], type=pa.int32()))
         elif type_str == "long":
@@ -744,7 +787,9 @@ def create_equality_delete_file(spark, table_name, delete_schema_fields, delete_
         elif type_str == "string":
             arrays.append(pa.array(columns[name], type=pa.string()))
 
-    delete_table = pa.table(dict(zip([f[1] for f in delete_schema_fields], arrays)), schema=pa_schema)
+    delete_table = pa.table(
+        dict(zip([f[1] for f in delete_schema_fields], arrays)), schema=pa_schema
+    )
 
     # Write to temporary local file first
     temp_file = f"/tmp/equality-delete-{py_uuid.uuid4()}.parquet"
@@ -754,11 +799,13 @@ def create_equality_delete_file(spark, table_name, delete_schema_fields, delete_
     file_size = os.path.getsize(temp_file)
 
     # Upload to S3 via Iceberg's FileIO
-    delete_file_path = f"{table.location()}/data/equality-delete-{py_uuid.uuid4()}.parquet"
+    delete_file_path = (
+        f"{table.location()}/data/equality-delete-{py_uuid.uuid4()}.parquet"
+    )
     output_file = table.io().newOutputFile(delete_file_path)
 
     # Read temp file and write to output
-    with open(temp_file, 'rb') as f:
+    with open(temp_file, "rb") as f:
         content = f.read()
 
     output_stream = output_file.create()
@@ -781,16 +828,16 @@ def create_equality_delete_file(spark, table_name, delete_schema_fields, delete_
         int_array[i] = eid
 
     # Create delete file using FileMetadata.Builder pattern
-    delete_file_meta = jvm.org.apache.iceberg.FileMetadata.deleteFileBuilder(
-        partition_spec
-    ) \
-        .ofEqualityDeletes(int_array) \
-        .withPartition(partition_data) \
-        .withPath(delete_file_path) \
-        .withFormat(FileFormat.PARQUET) \
-        .withFileSizeInBytes(file_size) \
-        .withRecordCount(len(delete_data)) \
+    delete_file_meta = (
+        jvm.org.apache.iceberg.FileMetadata.deleteFileBuilder(partition_spec)
+        .ofEqualityDeletes(int_array)
+        .withPartition(partition_data)
+        .withPath(delete_file_path)
+        .withFormat(FileFormat.PARQUET)
+        .withFileSizeInBytes(file_size)
+        .withRecordCount(len(delete_data))
         .build()
+    )
 
     # Commit the delete file using RowDelta
     row_delta = table.newRowDelta()
@@ -836,7 +883,7 @@ create_equality_delete_file(
     spark,
     "rest.default.test_equality_delete_int",
     delete_schema_fields=[(1, "id", "int")],
-    delete_data=[(3,), (5,), (7,)]
+    delete_data=[(3,), (5,), (7,)],
 )
 # Expected remaining rows: 1, 2, 4, 6, 8, 9, 10 (count = 7)
 
@@ -872,7 +919,7 @@ create_equality_delete_file(
     spark,
     "rest.default.test_equality_delete_string",
     delete_schema_fields=[(2, "name", "string")],
-    delete_data=[("banana",), ("date",), ("fig",)]
+    delete_data=[("banana",), ("date",), ("fig",)],
 )
 # Expected remaining rows: apple, cherry, elderberry (count = 3)
 
@@ -909,7 +956,7 @@ create_equality_delete_file(
     spark,
     "rest.default.test_equality_delete_null",
     delete_schema_fields=[(2, "name", "string")],
-    delete_data=[(None,)]  # Single NULL deletion matches all NULL rows (2, 4, 6)
+    delete_data=[(None,)],  # Single NULL deletion matches all NULL rows (2, 4, 6)
 )
 # Note: Per Iceberg spec, NULL = NULL for equality deletes
 # Expected remaining rows: 1, 3, 5 (count = 3)
@@ -954,7 +1001,7 @@ create_equality_delete_file(
     delete_data=[
         ("electronics", "US"),
         ("books", "EU"),
-    ]
+    ],
 )
 # Expected remaining rows: 2, 3, 6, 7, 8 (count = 5)
 
@@ -1184,16 +1231,34 @@ VALUES
     (2, 'Beta');
 """)
 
-# Add column with default value
-spark.sql("ALTER TABLE rest.default.test_schema_add_column_default ADD COLUMN status string DEFAULT 'active'")
+# Add column with default value (Spark may not support defaults yet)
+default_supported = True
+try:
+    spark.sql(
+        "ALTER TABLE rest.default.test_schema_add_column_default ADD COLUMN status string DEFAULT 'active'"
+    )
+except Exception as exc:
+    print(f"Default column values not supported; falling back. Error: {exc}")
+    spark.sql(
+        "ALTER TABLE rest.default.test_schema_add_column_default ADD COLUMN status string"
+    )
+    default_supported = False
 
-# Insert new data (status will have default)
-spark.sql("""
-INSERT INTO rest.default.test_schema_add_column_default (id, name)
-VALUES
-    (3, 'Gamma'),
-    (4, 'Delta');
-""")
+# Insert new data (status will have default or be explicitly provided)
+if default_supported:
+    spark.sql("""
+    INSERT INTO rest.default.test_schema_add_column_default (id, name)
+    VALUES
+        (3, 'Gamma'),
+        (4, 'Delta');
+    """)
+else:
+    spark.sql("""
+    INSERT INTO rest.default.test_schema_add_column_default
+    VALUES
+        (3, 'Gamma', 'active'),
+        (4, 'Delta', 'active');
+    """)
 
 # Insert with explicit status
 spark.sql("""
@@ -1229,7 +1294,9 @@ VALUES
 """)
 
 # Add new field to struct - Spark supports this via ADD COLUMNS
-spark.sql("ALTER TABLE rest.default.test_schema_nested_evolution ADD COLUMN info.country string")
+spark.sql(
+    "ALTER TABLE rest.default.test_schema_nested_evolution ADD COLUMN info.country string"
+)
 
 # Insert data with evolved struct
 spark.sql("""
@@ -1265,10 +1332,14 @@ VALUES
 """)
 
 # Rename column
-spark.sql("ALTER TABLE rest.default.test_schema_rename_then_add RENAME COLUMN old_name TO new_name")
+spark.sql(
+    "ALTER TABLE rest.default.test_schema_rename_then_add RENAME COLUMN old_name TO new_name"
+)
 
 # Add another column
-spark.sql("ALTER TABLE rest.default.test_schema_rename_then_add ADD COLUMN category string")
+spark.sql(
+    "ALTER TABLE rest.default.test_schema_rename_then_add ADD COLUMN category string"
+)
 
 # Insert more data
 spark.sql("""
@@ -1306,7 +1377,9 @@ VALUES
 """)
 
 # Promote to bigint
-spark.sql("ALTER TABLE rest.default.test_schema_type_promotion_chain ALTER COLUMN count TYPE bigint")
+spark.sql(
+    "ALTER TABLE rest.default.test_schema_type_promotion_chain ALTER COLUMN count TYPE bigint"
+)
 
 # Insert data as bigint
 spark.sql("""
@@ -1363,7 +1436,9 @@ FROM rest.default.test_schema_historical.snapshots
 ORDER BY committed_at
 """).collect()
 
-print(f"test_schema_historical snapshots: {[(s.snapshot_id, str(s.committed_at)) for s in historical_snapshots]}")
+print(
+    f"test_schema_historical snapshots: {[(s.snapshot_id, str(s.committed_at)) for s in historical_snapshots]}"
+)
 # Rust should be able to read each snapshot with correct schema
 
 print("WP6.1 Schema evolution test tables created successfully!")

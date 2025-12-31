@@ -1550,8 +1550,7 @@ async fn test_crossengine_equality_delete_multi_column_key() {
 #[tokio::test]
 async fn test_crossengine_dynamic_overwrite_partitioned() {
     use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use iceberg::spec::DataFileFormat;
+    use iceberg::spec::{DataFileFormat, Literal, PartitionKey, Struct};
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -1616,14 +1615,25 @@ async fn test_crossengine_dynamic_overwrite_partitioned() {
         file_name_generator,
     );
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
-    let mut writer = data_file_writer_builder.build(None).await.unwrap();
+    let partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        table.metadata().current_schema().clone(),
+        Struct::from_iter([Some(Literal::string("electronics"))]),
+    );
+    let mut writer = data_file_writer_builder
+        .build(Some(partition_key))
+        .await
+        .unwrap();
 
     // Create Arrow schema matching table schema
-    let arrow_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("category", DataType::Utf8, false),
-        Field::new("value", DataType::Int32, false),
-    ]));
+    let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
 
     // New data for electronics partition (replacing ids 1, 2 with new values)
     let batch = RecordBatch::try_new(arrow_schema, vec![
@@ -1718,9 +1728,8 @@ async fn test_crossengine_dynamic_overwrite_partitioned() {
 #[tokio::test]
 async fn test_crossengine_static_overwrite_with_filter() {
     use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use iceberg::expr::Reference;
-    use iceberg::spec::{DataFileFormat, Datum};
+    use iceberg::spec::{DataFileFormat, Datum, Literal, PartitionKey, Struct};
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -1760,14 +1769,25 @@ async fn test_crossengine_static_overwrite_with_filter() {
         file_name_generator,
     );
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
-    let mut writer = data_file_writer_builder.build(None).await.unwrap();
+    let partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        table.metadata().current_schema().clone(),
+        Struct::from_iter([Some(Literal::string("US"))]),
+    );
+    let mut writer = data_file_writer_builder
+        .build(Some(partition_key))
+        .await
+        .unwrap();
 
     // Create Arrow schema matching table schema
-    let arrow_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("region", DataType::Utf8, false),
-        Field::new("amount", DataType::Int32, false),
-    ]));
+    let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
 
     // New data for US partition (replacing ids 1, 2 with new single row)
     let batch = RecordBatch::try_new(arrow_schema, vec![
@@ -1960,7 +1980,6 @@ async fn test_crossengine_static_overwrite_delete_partition() {
 #[tokio::test]
 async fn test_crossengine_dynamic_overwrite_unpartitioned() {
     use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use iceberg::spec::DataFileFormat;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -2005,11 +2024,14 @@ async fn test_crossengine_dynamic_overwrite_unpartitioned() {
     let mut writer = data_file_writer_builder.build(None).await.unwrap();
 
     // Create Arrow schema matching table schema
-    let arrow_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Int32, false),
-    ]));
+    let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
 
     // Completely new data (replacing original alpha, beta, gamma)
     let batch = RecordBatch::try_new(arrow_schema, vec![

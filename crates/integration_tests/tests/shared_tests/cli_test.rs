@@ -18,12 +18,10 @@
 //! Integration tests for iceberg-cli against harness tables.
 
 use std::collections::HashMap;
-use std::env;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Once, OnceLock};
-use std::thread;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
@@ -33,67 +31,7 @@ use crate::get_shared_containers;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(120);
 const CLI_BIN_ENV: &str = "ICEBERG_CLI_BIN";
-
-static CLI_BUILD_ONCE: Once = Once::new();
-static CLI_BIN_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|parent| parent.parent())
-        .expect("Expected repo root two levels up from CARGO_MANIFEST_DIR")
-        .to_path_buf()
-}
-
-fn target_dir(repo_root: &Path) -> PathBuf {
-    match env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => {
-            let path = PathBuf::from(dir);
-            if path.is_absolute() {
-                path
-            } else {
-                repo_root.join(path)
-            }
-        }
-        None => repo_root.join("target"),
-    }
-}
-
-fn iceberg_cli_bin() -> PathBuf {
-    if let Ok(path) = env::var(CLI_BIN_ENV) {
-        let bin = PathBuf::from(path);
-        if !bin.exists() {
-            panic!("ICEBERG_CLI_BIN points to missing binary: {}", bin.display());
-        }
-        return bin;
-    }
-
-    CLI_BIN_PATH
-        .get_or_init(|| {
-            let repo_root = repo_root();
-            let target_dir = target_dir(&repo_root);
-            let bin_name = format!("iceberg-cli{}", env::consts::EXE_SUFFIX);
-            let bin_path = target_dir.join("debug").join(bin_name);
-
-            if !bin_path.exists() {
-                CLI_BUILD_ONCE.call_once(|| {
-                    let status = Command::new("cargo")
-                        .current_dir(&repo_root)
-                        .args(["build", "--package", "iceberg-cli", "--quiet"])
-                        .status()
-                        .expect("Failed to run cargo build for iceberg-cli");
-                    assert!(status.success(), "cargo build -p iceberg-cli failed");
-                });
-            }
-
-            if !bin_path.exists() {
-                panic!("iceberg-cli binary not found at {}", bin_path.display());
-            }
-
-            bin_path
-        })
-        .clone()
-}
+const CLI_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 struct CliResult {
@@ -116,6 +54,136 @@ impl CliResult {
     }
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("Failed to resolve repository root from CARGO_MANIFEST_DIR")
+        .to_path_buf()
+}
+
+fn resolve_cli_binary() -> PathBuf {
+    static CLI_BIN: OnceLock<PathBuf> = OnceLock::new();
+    CLI_BIN
+        .get_or_init(|| {
+            if let Ok(path) = std::env::var(CLI_BIN_ENV) {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    let override_path = PathBuf::from(trimmed);
+                    if !override_path.exists() {
+                        panic!(
+                            "ICEBERG_CLI_BIN points to missing binary: {}",
+                            override_path.display()
+                        );
+                    }
+                    return override_path;
+                }
+            }
+
+            let repo_root = repo_root();
+            let mut target_dir = std::env::var("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| repo_root.join("target"));
+            if target_dir.is_relative() {
+                target_dir = repo_root.join(target_dir);
+            }
+
+            let cli_path = target_dir.join("debug").join(format!(
+                "iceberg-cli{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+
+            if !cli_path.exists() {
+                build_cli(&repo_root);
+            }
+
+            if !cli_path.exists() {
+                panic!("iceberg-cli binary not found at {}", cli_path.display());
+            }
+
+            cli_path
+        })
+        .clone()
+}
+
+fn build_cli(repo_root: &PathBuf) {
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--package")
+        .arg("iceberg-cli")
+        .arg("--quiet")
+        .current_dir(repo_root)
+        .status()
+        .expect("Failed to build iceberg-cli");
+    if !status.success() {
+        panic!("Failed to build iceberg-cli (status: {status:?})");
+    }
+}
+
+fn command_description(cmd: &Command) -> String {
+    let program = cmd.get_program().to_string_lossy();
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    if args.is_empty() {
+        program.into_owned()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
+fn read_pipe(reader: &mut impl Read, label: &str) -> String {
+    let mut buffer = Vec::new();
+    reader
+        .read_to_end(&mut buffer)
+        .unwrap_or_else(|err| panic!("Failed to read {label}: {err}"));
+    String::from_utf8_lossy(&buffer).to_string()
+}
+
+fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> CliResult {
+    let command_desc = command_description(&cmd);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn CLI process");
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("Failed to capture CLI stdout");
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("Failed to capture CLI stderr");
+
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("Failed to poll CLI process") {
+            return CliResult {
+                status,
+                stdout: read_pipe(&mut stdout, "stdout"),
+                stderr: read_pipe(&mut stderr, "stderr"),
+            };
+        }
+
+        if start.elapsed() >= timeout {
+            child
+                .kill()
+                .expect("Failed to kill timed-out CLI process");
+            let _ = child.wait();
+            panic!(
+                "CLI command timed out after {:?}. Command: {}",
+                timeout, command_desc
+            );
+        }
+
+        std::thread::sleep(CLI_POLL_INTERVAL);
+    }
+}
+
 struct CliRunner {
     catalog_props: HashMap<String, String>,
 }
@@ -126,8 +194,8 @@ impl CliRunner {
     }
 
     fn base_command(&self) -> Command {
-        let bin_path = iceberg_cli_bin();
-        let mut cmd = Command::new(bin_path);
+        let mut cmd = Command::new(resolve_cli_binary());
+        cmd.current_dir(repo_root());
 
         cmd.arg("--catalog-type").arg("rest");
         cmd.arg("--catalog-name").arg("rest");
@@ -171,63 +239,18 @@ impl CliRunner {
     }
 }
 
-fn read_pipe<T: Read>(pipe: &mut Option<T>) -> String {
-    let mut buf = Vec::new();
-    if let Some(mut handle) = pipe.take() {
-        handle
-            .read_to_end(&mut buf)
-            .expect("Failed to read CLI output");
-    }
-    String::from_utf8_lossy(&buf).to_string()
-}
-
-fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> CliResult {
-    let program = cmd.get_program().to_string_lossy().into_owned();
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn CLI process");
-
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .expect("Failed to poll CLI process status")
-        {
-            let stdout = read_pipe(&mut child.stdout);
-            let stderr = read_pipe(&mut child.stderr);
-            return CliResult {
-                status,
-                stdout,
-                stderr,
-            };
-        }
-
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "CLI command timed out after {:?}. Command: {} {:?}",
-                timeout, program, args
-            );
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
 #[test]
 fn run_command_with_timeout_succeeds() {
     let mut cmd = Command::new("cargo");
     cmd.arg("--version");
+
     let result = run_command_with_timeout(cmd, Duration::from_secs(10));
-    assert!(result.success());
+
+    assert!(
+        result.success(),
+        "Expected command to succeed: {}",
+        result.stderr
+    );
 }
 
 #[cfg(unix)]
@@ -236,6 +259,7 @@ fn run_command_with_timeout_succeeds() {
 fn run_command_with_timeout_times_out_unix() {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", "sleep 5"]);
+
     let _ = run_command_with_timeout(cmd, Duration::from_millis(100));
 }
 

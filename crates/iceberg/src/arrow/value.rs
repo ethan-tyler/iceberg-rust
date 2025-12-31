@@ -641,6 +641,9 @@ pub(crate) fn create_primitive_array_single_element(
             Ok(Arc::new(Date32Array::from(vec![*v])))
         }
         (DataType::Date32, None) => Ok(Arc::new(Date32Array::from(vec![Option::<i32>::None]))),
+        (DataType::Int64, Some(PrimitiveLiteral::Int(v))) => {
+            Ok(Arc::new(Int64Array::from(vec![i64::from(*v)])))
+        }
         (DataType::Int64, Some(PrimitiveLiteral::Long(v))) => {
             Ok(Arc::new(Int64Array::from(vec![*v])))
         }
@@ -785,6 +788,9 @@ pub(crate) fn create_primitive_array_repeated(
         (DataType::Date32, None) => {
             let vals: Vec<Option<i32>> = vec![None; num_rows];
             Arc::new(Date32Array::from(vals))
+        }
+        (DataType::Int64, Some(PrimitiveLiteral::Int(value))) => {
+            Arc::new(Int64Array::from(vec![i64::from(*value); num_rows]))
         }
         (DataType::Int64, Some(PrimitiveLiteral::Long(value))) => {
             Arc::new(Int64Array::from(vec![*value; num_rows]))

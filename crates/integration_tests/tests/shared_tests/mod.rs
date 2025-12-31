@@ -44,7 +44,7 @@ pub async fn random_ns() -> Namespace {
         .unwrap();
 
     let ns = Namespace::with_properties(
-        NamespaceIdent::from_strs([uuid::Uuid::new_v4().to_string()]).unwrap(),
+        NamespaceIdent::from_strs([uuid::Uuid::new_v4().simple().to_string()]).unwrap(),
         HashMap::from([
             ("owner".to_string(), "ray".to_string()),
             ("community".to_string(), "apache".to_string()),

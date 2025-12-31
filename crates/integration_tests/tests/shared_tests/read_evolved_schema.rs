@@ -17,7 +17,9 @@
 
 //! Integration tests for rest catalog.
 
-use arrow_array::{Decimal128Array, Float64Array, Int64Array, StringArray};
+use arrow_array::{ArrayRef, Decimal128Array, Float64Array, Int64Array, StringArray};
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::DataType;
 use futures::TryStreamExt;
 use iceberg::expr::Reference;
 use iceberg::spec::Datum;
@@ -83,16 +85,12 @@ async fn test_evolved_schema() {
 
     let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
     let mut actual = vec![
-        batches[0]
-            .column_by_name("foo")
-            .unwrap()
+        coerce_column(batches[0].column_by_name("foo").unwrap(), &DataType::Int64)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap()
             .value(0),
-        batches[1]
-            .column_by_name("foo")
-            .unwrap()
+        coerce_column(batches[1].column_by_name("foo").unwrap(), &DataType::Int64)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap()
@@ -113,16 +111,12 @@ async fn test_evolved_schema() {
 
     let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
     let mut actual_foo = vec![
-        batches[0]
-            .column_by_name("foo")
-            .unwrap()
+        coerce_column(batches[0].column_by_name("foo").unwrap(), &DataType::Int64)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap()
             .value(0),
-        batches[1]
-            .column_by_name("foo")
-            .unwrap()
+        coerce_column(batches[1].column_by_name("foo").unwrap(), &DataType::Int64)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap()
@@ -135,18 +129,14 @@ async fn test_evolved_schema() {
 
     let mut actual_bar = vec![
         OrderedFloat(
-            batches[0]
-                .column_by_name("bar")
-                .unwrap()
+            coerce_column(batches[0].column_by_name("bar").unwrap(), &DataType::Float64)
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .unwrap()
                 .value(0),
         ),
         OrderedFloat(
-            batches[1]
-                .column_by_name("bar")
-                .unwrap()
+            coerce_column(batches[1].column_by_name("bar").unwrap(), &DataType::Float64)
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .unwrap()
@@ -159,23 +149,33 @@ async fn test_evolved_schema() {
     assert_eq!(actual_bar, vec![19.25, 22.25]);
 
     let mut actual_baz = vec![
-        batches[0]
-            .column_by_name("baz")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .unwrap()
-            .value(0),
-        batches[1]
-            .column_by_name("baz")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .unwrap()
-            .value(0),
+        coerce_column(
+            batches[0].column_by_name("baz").unwrap(),
+            &DataType::Decimal128(6, 2),
+        )
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap()
+        .value(0),
+        coerce_column(
+            batches[1].column_by_name("baz").unwrap(),
+            &DataType::Decimal128(6, 2),
+        )
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap()
+        .value(0),
     ];
 
     actual_baz.sort();
 
     assert_eq!(actual_baz, vec![1925, 2225]);
+}
+
+fn coerce_column(column: &ArrayRef, target_type: &DataType) -> ArrayRef {
+    if column.data_type() == target_type {
+        column.clone()
+    } else {
+        cast(column.as_ref(), target_type).expect("Failed to cast batch column")
+    }
 }

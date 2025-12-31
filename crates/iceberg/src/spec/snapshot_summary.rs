@@ -57,6 +57,7 @@ pub struct SnapshotSummaryCollector {
     partition_metrics: HashMap<String, UpdateMetrics>,
     max_changed_partitions_for_summaries: u64,
     properties: HashMap<String, String>,
+    has_unpartitioned_change: bool,
     trust_partition_metrics: bool,
 }
 
@@ -80,9 +81,11 @@ impl SnapshotSummaryCollector {
         partition_spec: PartitionSpecRef,
     ) {
         self.metrics.add_file(data_file);
-        if !data_file.partition.fields().is_empty() {
-            self.update_partition_metrics(schema, partition_spec, data_file, true);
+        if data_file.partition.fields().is_empty() {
+            self.has_unpartitioned_change = true;
+            return;
         }
+        self.update_partition_metrics(schema, partition_spec, data_file, true);
     }
 
     /// Removes a data file from the summary collector
@@ -93,15 +96,18 @@ impl SnapshotSummaryCollector {
         partition_spec: PartitionSpecRef,
     ) {
         self.metrics.remove_file(data_file);
-        if !data_file.partition.fields().is_empty() {
-            self.update_partition_metrics(schema, partition_spec, data_file, false);
+        if data_file.partition.fields().is_empty() {
+            self.has_unpartitioned_change = true;
+            return;
         }
+        self.update_partition_metrics(schema, partition_spec, data_file, false);
     }
 
     /// Adds a manifest to the summary collector
     pub fn add_manifest(&mut self, manifest: &ManifestFile) {
         self.trust_partition_metrics = false;
         self.partition_metrics.clear();
+        self.has_unpartitioned_change = false;
         self.metrics.add_manifest(manifest);
     }
 
@@ -129,6 +135,7 @@ impl SnapshotSummaryCollector {
         self.properties.extend(summary.properties);
 
         if self.trust_partition_metrics && summary.trust_partition_metrics {
+            self.has_unpartitioned_change |= summary.has_unpartitioned_change;
             for (partition, partition_metric) in summary.partition_metrics.iter() {
                 self.partition_metrics
                     .entry(partition.to_string())
@@ -137,6 +144,7 @@ impl SnapshotSummaryCollector {
             }
         } else {
             self.partition_metrics.clear();
+            self.has_unpartitioned_change = false;
             self.trust_partition_metrics = false;
         }
     }
@@ -144,7 +152,15 @@ impl SnapshotSummaryCollector {
     /// Builds final map of summaries
     pub fn build(&self) -> HashMap<String, String> {
         let mut properties = self.metrics.to_map();
-        let changed_partitions_count = self.partition_metrics.len() as u64;
+        let changed_partitions_count = if self.partition_metrics.is_empty() {
+            if self.has_unpartitioned_change {
+                1
+            } else {
+                0
+            }
+        } else {
+            self.partition_metrics.len() as u64
+        };
         set_if_positive(
             &mut properties,
             changed_partitions_count,
@@ -340,6 +356,7 @@ pub(crate) fn update_snapshot_summaries(
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
         && summary.operation != Operation::RowDelta
+        && summary.operation != Operation::Replace
     {
         return Err(Error::new(
             ErrorKind::DataInvalid,

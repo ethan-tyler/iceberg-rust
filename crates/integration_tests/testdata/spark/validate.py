@@ -39,10 +39,12 @@ from pyspark.sql import SparkSession
 def get_spark():
     """Get or create SparkSession configured for Iceberg REST catalog."""
     return (
-        SparkSession.builder
-        .appName("IcebergValidation")
+        SparkSession.builder.appName("IcebergValidation")
         .config("spark.sql.shuffle.partitions", "1")
         .config("spark.default.parallelism", "1")
+        .config("spark.sql.catalog.rest.write.delete.mode", "merge-on-read")
+        .config("spark.sql.catalog.rest.write.update.mode", "merge-on-read")
+        .config("spark.sql.catalog.rest.write.merge.mode", "merge-on-read")
         .getOrCreate()
     )
 
@@ -78,7 +80,9 @@ def validate_full(spark, table_name):
         col_type = str(df.schema[col_name].dataType)
         if "Int" in col_type or "Long" in col_type or "Double" in col_type:
             try:
-                min_max = df.selectExpr(f"min({col_name})", f"max({col_name})").collect()[0]
+                min_max = df.selectExpr(
+                    f"min({col_name})", f"max({col_name})"
+                ).collect()[0]
                 bounds[col_name] = {"min": min_max[0], "max": min_max[1]}
             except Exception:
                 pass
@@ -104,7 +108,9 @@ def validate_metadata(spark, table_name):
             if latest:
                 current_snapshot = {
                     "snapshot_id": latest["snapshot_id"],
-                    "operation": latest["operation"] if "operation" in latest.asDict() else None,
+                    "operation": latest["operation"]
+                    if "operation" in latest.asDict()
+                    else None,
                 }
     except Exception as e:
         return {"error": f"Failed to read snapshots: {str(e)}"}
@@ -171,16 +177,20 @@ def validate_snapshot_summary(spark, table_name, snapshot_id=None):
         if not snapshot_row:
             return {"error": "No snapshot found"}
 
+        row_dict = snapshot_row.asDict(recursive=True)
+
         # Extract core fields
         result = {
-            "snapshot_id": snapshot_row["snapshot_id"],
-            "parent_id": snapshot_row.get("parent_id"),
-            "operation": snapshot_row.get("operation"),
-            "committed_at": str(snapshot_row.get("committed_at")) if snapshot_row.get("committed_at") else None,
+            "snapshot_id": row_dict.get("snapshot_id"),
+            "parent_id": row_dict.get("parent_id"),
+            "operation": row_dict.get("operation"),
+            "committed_at": str(row_dict.get("committed_at"))
+            if row_dict.get("committed_at")
+            else None,
         }
 
         # Extract summary map - this contains the key fields for parity comparison
-        summary = snapshot_row.get("summary")
+        summary = row_dict.get("summary")
         if summary:
             # summary is a map/dict in Spark
             summary_dict = {}
@@ -189,7 +199,11 @@ def validate_snapshot_summary(spark, table_name, snapshot_id=None):
             else:
                 # Handle Row type
                 try:
-                    summary_dict = summary.asDict() if hasattr(summary, 'asDict') else dict(summary)
+                    summary_dict = (
+                        summary.asDict()
+                        if hasattr(summary, "asDict")
+                        else dict(summary)
+                    )
                 except:
                     summary_dict = {}
 
@@ -205,9 +219,13 @@ def validate_snapshot_summary(spark, table_name, snapshot_id=None):
                 "added-delete-files": summary_dict.get("added-delete-files"),
                 "removed-delete-files": summary_dict.get("removed-delete-files"),
                 "added-position-deletes": summary_dict.get("added-position-deletes"),
-                "removed-position-deletes": summary_dict.get("removed-position-deletes"),
+                "removed-position-deletes": summary_dict.get(
+                    "removed-position-deletes"
+                ),
                 "added-equality-deletes": summary_dict.get("added-equality-deletes"),
-                "removed-equality-deletes": summary_dict.get("removed-equality-deletes"),
+                "removed-equality-deletes": summary_dict.get(
+                    "removed-equality-deletes"
+                ),
                 # Totals
                 "total-data-files": summary_dict.get("total-data-files"),
                 "total-delete-files": summary_dict.get("total-delete-files"),
@@ -347,10 +365,14 @@ VALIDATORS = {
 
 def main():
     if len(sys.argv) < 3:
-        print(json.dumps({
-            "error": "Usage: validate.py <table_name> <validation_type> [options]",
-            "available_types": list(VALIDATORS.keys()),
-        }))
+        print(
+            json.dumps(
+                {
+                    "error": "Usage: validate.py <table_name> <validation_type> [options]",
+                    "available_types": list(VALIDATORS.keys()),
+                }
+            )
+        )
         sys.exit(1)
 
     table_name = sys.argv[1]
@@ -372,13 +394,17 @@ def main():
             }
         elif validation_type == "query":
             if len(sys.argv) < 4:
-                result = {"error": "Query validation requires a query template as third argument"}
+                result = {
+                    "error": "Query validation requires a query template as third argument"
+                }
             else:
                 query_template = sys.argv[3]
                 result = validate_query(spark, table_name, query_template)
         elif validation_type == "distinct":
             if len(sys.argv) < 4:
-                result = {"error": "Distinct validation requires a column name as third argument"}
+                result = {
+                    "error": "Distinct validation requires a column name as third argument"
+                }
             else:
                 column = sys.argv[3]
                 result = validate_distinct_count(spark, table_name, column)
@@ -393,15 +419,21 @@ def main():
         elif validation_type == "spark_dml":
             # Required: dml_type, optional: predicate, update_values
             if len(sys.argv) < 4:
-                result = {"error": "spark_dml requires at least dml_type (delete/update) as third argument"}
+                result = {
+                    "error": "spark_dml requires at least dml_type (delete/update) as third argument"
+                }
             else:
                 dml_type = sys.argv[3]
                 predicate = sys.argv[4] if len(sys.argv) > 4 else None
                 update_values = sys.argv[5] if len(sys.argv) > 5 else None
-                result = validate_spark_dml(spark, table_name, dml_type, predicate, update_values)
+                result = validate_spark_dml(
+                    spark, table_name, dml_type, predicate, update_values
+                )
         elif validation_type == "execute_sql":
             if len(sys.argv) < 4:
-                result = {"error": "execute_sql requires a SQL statement as third argument"}
+                result = {
+                    "error": "execute_sql requires a SQL statement as third argument"
+                }
             else:
                 sql_template = sys.argv[3]
                 result = validate_execute_sql(spark, table_name, sql_template)
