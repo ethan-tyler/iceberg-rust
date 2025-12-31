@@ -214,7 +214,12 @@ pub fn compute_retention(
 
         // Retain snapshots within max_age that are ancestors of this ref
         let cutoff_ms = (now - max_age).timestamp_millis();
-        retain_snapshots_within_age(metadata, ref_snapshot_id, cutoff_ms, &mut result.retained_snapshot_ids);
+        retain_snapshots_within_age(
+            metadata,
+            ref_snapshot_id,
+            cutoff_ms,
+            &mut result.retained_snapshot_ids,
+        );
     }
 
     // Sort expired refs for deterministic behavior
@@ -244,8 +249,8 @@ fn check_ref_expired(
     };
 
     // Use ref-specific setting, fall back to policy, then default to "never expires"
-    let effective_max_age_ms = max_ref_age_ms
-        .or_else(|| policy.max_ref_age.map(|d| d.num_milliseconds()));
+    let effective_max_age_ms =
+        max_ref_age_ms.or_else(|| policy.max_ref_age.map(|d| d.num_milliseconds()));
 
     match effective_max_age_ms {
         Some(max_age_ms) if max_age_ms > 0 => {
@@ -253,10 +258,10 @@ fn check_ref_expired(
             // Note: We'd need the snapshot timestamp to check this properly
             // For now, we rely on the ref's snapshot being present
             // A more complete implementation would check the snapshot timestamp
-            let cutoff = now_ms - max_age_ms;
+            let _cutoff = now_ms - max_age_ms;
             // This is a simplified check - in practice we'd check the ref creation time
             // or the snapshot timestamp
-            cutoff > 0 && false // Conservative: don't expire refs without more info
+            false // Conservative: don't expire refs without more info
         }
         _ => false, // No max age = never expires
     }
@@ -521,7 +526,7 @@ mod integration_tests {
             .with_timestamp_ms(timestamp_ms)
             .with_sequence_number(id)
             .with_schema_id(0)
-            .with_manifest_list(format!("/snap-{}", id))
+            .with_manifest_list(format!("/snap-{id}"))
             .with_summary(Summary {
                 operation: Operation::Append,
                 additional_properties: HashMap::new(),
@@ -536,7 +541,7 @@ mod integration_tests {
         let base_time = base.last_updated_ms();
 
         // Create a chain of 5 snapshots, each 1 day apart (in the future from table creation)
-        let snap1 = create_snapshot(1, base_time + 1 * DAY_MS, None);
+        let snap1 = create_snapshot(1, base_time + DAY_MS, None);
         let snap2 = create_snapshot(2, base_time + 2 * DAY_MS, Some(1));
         let snap3 = create_snapshot(3, base_time + 3 * DAY_MS, Some(2));
         let snap4 = create_snapshot(4, base_time + 4 * DAY_MS, Some(3));
@@ -555,17 +560,14 @@ mod integration_tests {
             .unwrap()
             .add_snapshot(snap5)
             .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference {
-                    snapshot_id: 5,
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: Some(3),
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
+            .set_ref("main", SnapshotReference {
+                snapshot_id: 5,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(3),
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
             .build()
             .unwrap()
@@ -606,25 +608,21 @@ mod integration_tests {
             .unwrap()
             .add_snapshot(snap2)
             .unwrap()
-            .set_ref(
-                "release-1.0",
-                SnapshotReference {
-                    snapshot_id: 1,
-                    retention: SnapshotRetention::Tag { max_ref_age_ms: None },
+            .set_ref("release-1.0", SnapshotReference {
+                snapshot_id: 1,
+                retention: SnapshotRetention::Tag {
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference {
-                    snapshot_id: 2,
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: Some(1),
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
+            .set_ref("main", SnapshotReference {
+                snapshot_id: 2,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(1),
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
             .build()
             .unwrap()
@@ -651,7 +649,7 @@ mod integration_tests {
         let base_time = base.last_updated_ms();
 
         // Create snapshots at different times
-        let snap1 = create_snapshot(1, base_time + 1 * DAY_MS, None);
+        let snap1 = create_snapshot(1, base_time + DAY_MS, None);
         let snap2 = create_snapshot(2, base_time + 5 * DAY_MS, Some(1));
         let snap3 = create_snapshot(3, base_time + 8 * DAY_MS, Some(2));
         let snap4 = create_snapshot(4, base_time + 10 * DAY_MS, Some(3));
@@ -669,17 +667,14 @@ mod integration_tests {
             .unwrap()
             .add_snapshot(snap5)
             .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference {
-                    snapshot_id: 5,
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: Some(1),
-                        max_snapshot_age_ms: Some(5 * DAY_MS), // Keep snapshots from last 5 days
-                        max_ref_age_ms: None,
-                    },
+            .set_ref("main", SnapshotReference {
+                snapshot_id: 5,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(1),
+                    max_snapshot_age_ms: Some(5 * DAY_MS), // Keep snapshots from last 5 days
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
             .build()
             .unwrap()

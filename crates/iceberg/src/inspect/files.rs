@@ -310,15 +310,18 @@ impl<'a> FilesTable<'a> {
                     }
 
                     // split_offsets
-                    let offsets = data_file.split_offsets();
-                    if offsets.is_empty() {
-                        split_offsets.append_null();
-                    } else {
-                        let values = split_offsets.values();
-                        for offset in offsets {
-                            values.append_value(*offset);
+                    if let Some(offsets) = data_file.split_offsets() {
+                        if offsets.is_empty() {
+                            split_offsets.append_null();
+                        } else {
+                            let values = split_offsets.values();
+                            for offset in offsets {
+                                values.append_value(*offset);
+                            }
+                            split_offsets.append(true);
                         }
-                        split_offsets.append(true);
+                    } else {
+                        split_offsets.append_null();
                     }
 
                     // equality_ids
@@ -1295,7 +1298,7 @@ mod tests {
             .nan_value_counts(nan_value_counts)
             .lower_bounds(lower_bounds)
             .upper_bounds(upper_bounds)
-            .split_offsets(vec![0, 400])
+            .split_offsets(Some(vec![0, 400]))
             .sort_order_id(0)
             .build()
             .unwrap();

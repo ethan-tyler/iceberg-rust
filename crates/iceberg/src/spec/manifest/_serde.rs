@@ -469,7 +469,7 @@ mod tests {
             snapshot_id: 12345,
             data_file: DataFileSerde {
                 spec_id: None, // V1 doesn't have spec_id in JSON
-                content: 0, // DataFileSerde is shared between V1/V2
+                content: 0,    // DataFileSerde is shared between V1/V2
                 file_path: "test/path.parquet".to_string(),
                 file_format: "PARQUET".to_string(),
                 partition,
@@ -551,7 +551,7 @@ mod tests {
         // (missing V2 fields would be None due to #[serde(default)])
         let v1_style_data_file = DataFileSerde {
             spec_id: None, // V1 doesn't have spec_id in JSON
-            content: 0, // V1 doesn't have this field, defaults to 0 via #[serde(default)]
+            content: 0,    // V1 doesn't have this field, defaults to 0 via #[serde(default)]
             file_path: "test/data.parquet".to_string(),
             file_format: "PARQUET".to_string(),
             partition,

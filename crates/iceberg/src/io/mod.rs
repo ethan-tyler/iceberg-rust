@@ -70,7 +70,21 @@ mod file_io;
 mod storage;
 
 pub use file_io::*;
-pub(crate) mod object_cache;
+
+/// Object cache for Iceberg metadata.
+///
+/// This module provides caching for manifest and manifest list objects,
+/// reducing remote storage reads during query planning.
+pub mod object_cache;
+
+/// Re-exports of commonly used cache configuration types.
+///
+/// These types can also be accessed via [`object_cache`] module directly.
+pub use object_cache::{
+    CacheStats, DEFAULT_CACHE_ENABLED, DEFAULT_CACHE_SIZE_BYTES, DEFAULT_CACHE_TTL,
+    MANIFEST_CACHE_ENABLED, MANIFEST_CACHE_EXPIRATION_INTERVAL_MS, MANIFEST_CACHE_MAX_TOTAL_BYTES,
+    ObjectCacheConfig, ObjectCacheConfigBuilder,
+};
 
 #[cfg(feature = "storage-azdls")]
 mod storage_azdls;

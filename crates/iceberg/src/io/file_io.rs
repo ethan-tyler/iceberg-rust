@@ -114,6 +114,73 @@ impl FileIO {
         Ok(op.remove_all(&path).await?)
     }
 
+    /// List all files under a directory recursively.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - It should be *absolute* path starting with scheme string used to construct [`FileIO`].
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`FileEntry`] containing file metadata.
+    ///
+    /// # Note
+    ///
+    /// This method lists files recursively under the given path. Only files are returned,
+    /// directories are filtered out.
+    pub async fn list(&self, path: impl AsRef<str>) -> Result<Vec<FileEntry>> {
+        let path_ref = path.as_ref();
+        let (op, relative_path) = self.inner.create_operator(&path_ref)?;
+
+        // Ensure path ends with / for directory listing
+        let list_path = if relative_path.ends_with('/') {
+            relative_path.to_string()
+        } else {
+            format!("{relative_path}/")
+        };
+
+        // Calculate the prefix to reconstruct full paths
+        let prefix_len = path_ref.len() - relative_path.len();
+        let path_prefix = &path_ref[..prefix_len];
+
+        let mut entries = Vec::new();
+
+        // Use list_with to get recursive listing
+        let mut lister = op.lister_with(&list_path).recursive(true).await?;
+
+        use futures::StreamExt;
+        while let Some(entry) = lister.next().await {
+            let entry = entry?;
+            let meta = if entry.metadata().last_modified().is_none() {
+                op.stat(entry.path()).await?
+            } else {
+                entry.metadata().clone()
+            };
+
+            // Skip directories
+            if meta.is_dir() {
+                continue;
+            }
+
+            // Reconstruct full path with original scheme
+            let full_path = format!("{}{}", path_prefix, entry.path());
+
+            // Convert opendal::raw::Timestamp to chrono::DateTime<Utc> via SystemTime
+            let last_modified = meta.last_modified().map(|ts| {
+                let system_time: std::time::SystemTime = ts.into();
+                chrono::DateTime::<chrono::Utc>::from(system_time)
+            });
+
+            entries.push(FileEntry {
+                path: full_path,
+                size: meta.content_length(),
+                last_modified,
+            });
+        }
+
+        Ok(entries)
+    }
+
     /// Check file exists.
     ///
     /// # Arguments
@@ -276,6 +343,20 @@ impl FileIOBuilder {
 pub struct FileMetadata {
     /// The size of the file.
     pub size: u64,
+}
+
+/// Represents an entry from a directory listing.
+///
+/// This struct contains metadata about a file discovered during listing operations,
+/// used by maintenance actions like remove orphan files.
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    /// Full path to the file including scheme (e.g., `s3://bucket/path/file.parquet`).
+    pub path: String,
+    /// Size of the file in bytes.
+    pub size: u64,
+    /// Last modification timestamp, if available from the storage system.
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Trait for reading file.

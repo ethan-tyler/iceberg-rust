@@ -245,7 +245,7 @@ impl RowDeltaAction {
             let snapshot = table.metadata().snapshot_by_id(snap_id).ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!("Snapshot {} not found in metadata during conflict detection", snap_id),
+                    format!("Snapshot {snap_id} not found in metadata during conflict detection"),
                 )
             })?;
 
@@ -296,7 +296,10 @@ impl RowDeltaAction {
                                 entry.data_file().partition()
                             ),
                         )
-                        .with_context("conflicting_file", entry.data_file().file_path().to_string())
+                        .with_context(
+                            "conflicting_file",
+                            entry.data_file().file_path().to_string(),
+                        )
                         .with_retryable(true));
                     }
                 }
@@ -931,10 +934,12 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.err().unwrap();
-        // Data file validation checks against default partition spec
+        // Data file validation checks that partition spec exists in table metadata
         assert!(
             err.message()
-                .contains("Data file partition spec id does not match table default partition spec id")
+                .contains("Data file references unknown partition spec"),
+            "Expected error about unknown partition spec, got: {}",
+            err.message()
         );
     }
 

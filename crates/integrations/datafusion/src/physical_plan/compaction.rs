@@ -402,8 +402,13 @@ impl ExecutionPlan for IcebergCompactionExec {
                     }
 
                     // Process the file group (read + optional sort + write)
-                    let result =
-                        process_file_group_with_strategy(&table, &file_group, &strategy, row_group_size).await;
+                    let result = process_file_group_with_strategy(
+                        &table,
+                        &file_group,
+                        &strategy,
+                        row_group_size,
+                    )
+                    .await;
 
                     match result {
                         Ok(write_result) => {
@@ -553,7 +558,7 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
             FileScanTaskDeleteFile {
                 file_path: delete_file.file_path().to_string(),
                 file_type: delete_file.content_type(),
-                partition_spec_id: delete_file.partition_spec_id(),
+                partition_spec_id: delete_file.partition_spec_id_or_default(),
                 equality_ids: if delete_file.content_type() == DataContentType::EqualityDeletes {
                     delete_file.equality_ids().map(|ids| ids.to_vec())
                 } else {
@@ -579,7 +584,7 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
 
     for entry in &file_group.data_files {
         let data_file = &entry.data_file;
-        let data_file_spec_id = data_file.partition_spec_id();
+        let data_file_spec_id = data_file.partition_spec_id_or_default();
         if data_file_spec_id != file_group.partition_spec_id {
             return Err(DataFusionError::Internal(format!(
                 "File group {} contains data file with partition spec id {}, expected {}",
@@ -598,6 +603,7 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
             predicate: None, // Read all rows
             deletes: delete_files.clone(),
             partition: Some(data_file.partition().clone()),
+            partition_spec_id: Some(file_group.partition_spec_id),
             partition_spec: Some(partition_spec.clone()),
             name_mapping: None,
         };
@@ -749,10 +755,7 @@ fn build_column_id_map(schema: &iceberg::spec::Schema) -> HashMap<i32, String> {
 /// If an explicit sort order is provided, uses that.
 /// Otherwise, uses the table's default sort order.
 /// Returns None if strategy is not Sort.
-fn resolve_sort_order(
-    table: &Table,
-    strategy: &RewriteStrategy,
-) -> DFResult<Option<SortOrder>> {
+fn resolve_sort_order(table: &Table, strategy: &RewriteStrategy) -> DFResult<Option<SortOrder>> {
     match strategy {
         RewriteStrategy::Sort {
             sort_order: Some(order),
@@ -802,8 +805,8 @@ pub async fn process_file_group_with_strategy(
     // Step 2: Apply sorting if using sort strategy
     let sorted_batches = match strategy {
         RewriteStrategy::Sort { .. } => {
-            let sort_order = resolve_sort_order(table, strategy)?
-                .expect("Sort strategy should have sort order");
+            let sort_order =
+                resolve_sort_order(table, strategy)?.expect("Sort strategy should have sort order");
             let column_id_map = build_column_id_map(table.metadata().current_schema());
             sort_batches(batches, &sort_order, &column_id_map).await?
         }
@@ -933,7 +936,7 @@ pub fn serialize_data_files(files: Vec<DataFile>, table: &Table) -> DFResult<Vec
     files
         .into_iter()
         .map(|f| {
-            let spec_id = f.partition_spec_id();
+            let spec_id = f.partition_spec_id_or_default();
             let partition_type = partition_types.get(&spec_id).ok_or_else(|| {
                 DataFusionError::Internal(format!("Partition type not found for spec {spec_id}"))
             })?;
@@ -988,13 +991,10 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![3, 1, 2])),
-                Arc::new(StringArray::from(vec!["c", "a", "b"])),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![3, 1, 2])),
+            Arc::new(StringArray::from(vec!["c", "a", "b"])),
+        ])
         .unwrap();
 
         // Create sort order: ORDER BY id ASC
@@ -1046,15 +1046,12 @@ mod tests {
         )]));
 
         // Include a null value
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![
-                Some(1),
-                None,
-                Some(3),
-                Some(2),
-            ]))],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+            Some(2),
+        ]))])
         .unwrap();
 
         // ORDER BY id DESC NULLS LAST
@@ -1100,13 +1097,10 @@ mod tests {
             Field::new("id", DataType::Int64, false),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["b", "a", "b", "a"])),
-                Arc::new(Int64Array::from(vec![2, 1, 1, 2])),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(vec!["b", "a", "b", "a"])),
+            Arc::new(Int64Array::from(vec![2, 1, 1, 2])),
+        ])
         .unwrap();
 
         // ORDER BY category ASC, id ASC
@@ -1194,10 +1188,9 @@ mod tests {
             false,
         )]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![3, 1, 2]))],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![
+            3, 1, 2,
+        ]))])
         .unwrap();
 
         // Unsorted order (empty fields) should pass through unchanged

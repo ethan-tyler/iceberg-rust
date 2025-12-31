@@ -2403,7 +2403,7 @@ message schema {
             deletes: vec![],
             partition: None,
             partition_spec: None,
-                partition_spec_id: None,
+            partition_spec_id: None,
             name_mapping: None,
         };
 
@@ -2420,7 +2420,7 @@ message schema {
             deletes: vec![],
             partition: None,
             partition_spec: None,
-                partition_spec_id: None,
+            partition_spec_id: None,
             name_mapping: None,
         };
 
@@ -2720,7 +2720,7 @@ message schema {
             }],
             partition: None,
             partition_spec: None,
-                partition_spec_id: None,
+            partition_spec_id: None,
             name_mapping: None,
         };
 
@@ -2938,7 +2938,7 @@ message schema {
             }],
             partition: None,
             partition_spec: None,
-                partition_spec_id: None,
+            partition_spec_id: None,
             name_mapping: None,
         };
 
@@ -3149,7 +3149,7 @@ message schema {
             }],
             partition: None,
             partition_spec: None,
-                partition_spec_id: None,
+            partition_spec_id: None,
             name_mapping: None,
         };
 

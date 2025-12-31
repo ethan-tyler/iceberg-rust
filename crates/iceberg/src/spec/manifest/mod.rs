@@ -1348,7 +1348,8 @@ mod tests {
             .map(|f| {
                 let spec_id = f.partition_spec_id_or_default();
                 let (_, ptype) = partition_specs.get(&spec_id).unwrap();
-                let json = serialize_data_file_to_json(f.clone(), ptype, FormatVersion::V2).unwrap();
+                let json =
+                    serialize_data_file_to_json(f.clone(), ptype, FormatVersion::V2).unwrap();
                 (spec_id, json)
             })
             .collect();
@@ -1537,13 +1538,11 @@ mod tests {
         // Verify the JSON contains the partition field and spec_id
         assert!(
             json.contains("category"),
-            "JSON should contain category field: {}",
-            json
+            "JSON should contain category field: {json}"
         );
         assert!(
             json.contains("\"spec_id\":0") || json.contains("\"spec_id\": 0"),
-            "JSON should contain spec_id: {}",
-            json
+            "JSON should contain spec_id: {json}"
         );
 
         // Deserialize with the WRONG partition type (spec 1 instead of spec 0)
@@ -1594,16 +1593,21 @@ mod tests {
             .build()
             .unwrap();
 
-        let json =
-            serialize_data_file_to_json(file, &partition_type, FormatVersion::V2).unwrap();
+        let json = serialize_data_file_to_json(file, &partition_type, FormatVersion::V2).unwrap();
 
         // Verify we can extract the spec_id
         let extracted_spec_id = extract_spec_id_from_data_file_json(&json, 0).unwrap();
-        assert_eq!(extracted_spec_id, 42, "Should extract correct spec_id from JSON");
+        assert_eq!(
+            extracted_spec_id, 42,
+            "Should extract correct spec_id from JSON"
+        );
 
         // Test fallback when spec_id is missing (legacy JSON)
         let legacy_json = r#"{"content":0,"file_path":"test.parquet","file_format":"PARQUET","partition":{},"record_count":100,"file_size_in_bytes":1024}"#;
         let fallback_spec_id = extract_spec_id_from_data_file_json(legacy_json, 99).unwrap();
-        assert_eq!(fallback_spec_id, 99, "Should use default when spec_id is missing");
+        assert_eq!(
+            fallback_spec_id, 99,
+            "Should use default when spec_id is missing"
+        );
     }
 }

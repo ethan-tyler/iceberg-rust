@@ -59,9 +59,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::delete_scan::{DELETE_FILE_PATH_COL, DELETE_POS_COL};
-use crate::partition_utils::{
-    FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
-};
+use crate::partition_utils::{FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map};
 use crate::to_datafusion_error;
 
 /// Column name for serialized delete files in output
@@ -494,10 +492,14 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
         // Build spec_id -> PartitionSpec lookup for partition evolution support.
         // Currently DELETE only supports unpartitioned tables, but this prepares
         // for future support and maintains consistency with UPDATE.
-        let partition_specs: std::collections::HashMap<i32, std::sync::Arc<iceberg::spec::PartitionSpec>> =
-            table.metadata().partition_specs_iter()
-                .map(|spec| (spec.spec_id(), spec.clone()))
-                .collect();
+        let partition_specs: std::collections::HashMap<
+            i32,
+            std::sync::Arc<iceberg::spec::PartitionSpec>,
+        > = table
+            .metadata()
+            .partition_specs_iter()
+            .map(|spec| (spec.spec_id(), spec.clone()))
+            .collect();
         let current_schema = table.metadata().current_schema().clone();
         let result_schema = self.result_schema.clone();
 
@@ -613,8 +615,7 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
             // Iceberg guarantees field IDs are stable across schema evolution.
             let delete_files_json: Vec<String> = delete_files
                 .into_iter()
-                .map(|df| {
-                    let spec_id = df.partition_spec_id_or_default();
+                .map(|(spec_id, data_file)| {
                     let ptype = partition_specs
                         .get(&spec_id)
                         .ok_or_else(|| {
@@ -631,8 +632,14 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                         .map_err(to_datafusion_error)?
                         .partition_type(&current_schema)
                         .map_err(to_datafusion_error)?;
-                    serialize_data_file_to_json(df, &ptype, format_version)
-                        .map_err(to_datafusion_error)
+                    let file_json = serialize_data_file_to_json(data_file, &ptype, format_version)
+                        .map_err(to_datafusion_error)?;
+                    serde_json::to_string(&SerializedFileWithSpec { spec_id, file_json })
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to serialize delete file payload: {e}"
+                            ))
+                        })
                 })
                 .collect::<DFResult<Vec<String>>>()?;
 
@@ -662,8 +669,16 @@ mod tests {
     #[test]
     fn test_make_result_batch() {
         let batch = IcebergDeleteWriteExec::make_result_batch(vec![
-            r#"{"file_path": "delete1.parquet"}"#.to_string(),
-            r#"{"file_path": "delete2.parquet"}"#.to_string(),
+            serde_json::to_string(&SerializedFileWithSpec {
+                spec_id: 0,
+                file_json: r#"{"file_path": "delete1.parquet"}"#.to_string(),
+            })
+            .unwrap(),
+            serde_json::to_string(&SerializedFileWithSpec {
+                spec_id: 0,
+                file_json: r#"{"file_path": "delete2.parquet"}"#.to_string(),
+            })
+            .unwrap(),
         ])
         .unwrap();
 

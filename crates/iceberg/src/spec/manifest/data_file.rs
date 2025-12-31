@@ -443,7 +443,9 @@ impl std::fmt::Display for DataFileFormat {
 
 #[cfg(test)]
 mod test {
-    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, DEFAULT_PARTITION_SPEC_ID};
+    use crate::spec::{
+        DEFAULT_PARTITION_SPEC_ID, DataContentType, DataFileBuilder, DataFileFormat,
+    };
 
     #[test]
     fn test_data_content_type_default() {
@@ -468,8 +470,14 @@ mod test {
             .unwrap();
 
         // partition_spec_id() should return Some(0) as default
-        assert_eq!(data_file.partition_spec_id(), Some(DEFAULT_PARTITION_SPEC_ID));
-        assert_eq!(data_file.partition_spec_id_or_default(), DEFAULT_PARTITION_SPEC_ID);
+        assert_eq!(
+            data_file.partition_spec_id(),
+            Some(DEFAULT_PARTITION_SPEC_ID)
+        );
+        assert_eq!(
+            data_file.partition_spec_id_or_default(),
+            DEFAULT_PARTITION_SPEC_ID
+        );
     }
 
     #[test]

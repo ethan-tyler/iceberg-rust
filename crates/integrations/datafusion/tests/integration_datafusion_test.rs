@@ -172,6 +172,10 @@ async fn test_provider_list_table_names() -> Result<()> {
             "my_table",
             "my_table$snapshots",
             "my_table$manifests",
+            "my_table$history",
+            "my_table$refs",
+            "my_table$files",
+            "my_table$properties",
         ]
     "#]]
     .assert_debug_eq(&result);
@@ -976,9 +980,8 @@ async fn setup_delete_test_table(
 
     // Insert test data: 5 rows
     ctx.sql(&format!(
-        "INSERT INTO catalog.{}.delete_table VALUES \
+        "INSERT INTO catalog.{namespace_name}.delete_table VALUES \
          (1, 'alice'), (2, 'bob'), (3, 'charlie'), (4, 'diana'), (5, 'eve')",
-        namespace_name
     ))
     .await
     .unwrap()
@@ -996,12 +999,8 @@ async fn test_delete_with_predicate() -> Result<()> {
     let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_predicate").await?;
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "delete_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "delete_table").await?;
 
     // Delete rows where foo1 > 3 (should delete diana and eve)
     let deleted_count = provider
@@ -1032,18 +1031,11 @@ async fn test_delete_full_table() -> Result<()> {
     let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_full").await?;
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "delete_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "delete_table").await?;
 
     // Delete all rows (no predicate)
-    let deleted_count = provider
-        .delete(&ctx.state(), None)
-        .await
-        .unwrap();
+    let deleted_count = provider.delete(&ctx.state(), None).await.unwrap();
 
     assert_eq!(deleted_count, 5, "Expected 5 rows deleted");
 
@@ -1070,12 +1062,8 @@ async fn test_delete_no_match() -> Result<()> {
     let (catalog, namespace, ctx) = setup_delete_test_table("test_delete_nomatch").await?;
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "delete_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "delete_table").await?;
 
     // Delete rows that don't exist
     let deleted_count = provider
@@ -1108,12 +1096,8 @@ async fn test_select_after_delete() -> Result<()> {
     let (catalog, namespace, ctx) = setup_delete_test_table("test_select_after_delete").await?;
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "delete_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "delete_table").await?;
 
     // Delete specific row (bob)
     let deleted_count = provider
@@ -1143,10 +1127,7 @@ async fn test_select_after_delete() -> Result<()> {
         .collect();
 
     assert_eq!(names, vec!["alice", "charlie", "diana", "eve"]);
-    assert!(
-        !names.contains(&"bob".to_string()),
-        "bob should be deleted"
-    );
+    assert!(!names.contains(&"bob".to_string()), "bob should be deleted");
 
     Ok(())
 }
@@ -1219,13 +1200,15 @@ async fn test_delete_partitioned_table() -> Result<()> {
         .delete(&ctx.state(), Some(col("category").eq(lit("electronics"))))
         .await;
 
-    assert!(result.is_err(), "Expected NotImplemented error for partitioned table DELETE");
+    assert!(
+        result.is_err(),
+        "Expected NotImplemented error for partitioned table DELETE"
+    );
     let err = result.unwrap_err();
     let err_msg = err.to_string();
     assert!(
         err_msg.contains("partitioned tables is not yet supported"),
-        "Expected error message about partitioned tables, got: {}",
-        err_msg
+        "Expected error message about partitioned tables, got: {err_msg}",
     );
 
     // Verify data is still intact (delete did not occur)
@@ -1240,7 +1223,10 @@ async fn test_delete_partitioned_table() -> Result<()> {
         .downcast_ref::<datafusion::arrow::array::Int64Array>()
         .unwrap()
         .value(0);
-    assert_eq!(count, 4, "All 4 rows should still exist since delete failed");
+    assert_eq!(
+        count, 4,
+        "All 4 rows should still exist since delete failed"
+    );
 
     Ok(())
 }
@@ -1263,12 +1249,8 @@ async fn test_delete_empty_table() -> Result<()> {
     ctx.register_catalog("catalog", catalog);
 
     // Create provider for programmatic delete
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "empty_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "empty_table").await?;
 
     // DELETE from empty table
     let deleted_count = provider
@@ -1306,9 +1288,8 @@ async fn setup_update_test_table(
 
     // Insert test data: 5 rows
     ctx.sql(&format!(
-        "INSERT INTO catalog.{}.update_table VALUES \
+        "INSERT INTO catalog.{namespace_name}.update_table VALUES \
          (1, 'alice'), (2, 'bob'), (3, 'charlie'), (4, 'diana'), (5, 'eve')",
-        namespace_name
     ))
     .await
     .unwrap()
@@ -1326,12 +1307,8 @@ async fn test_update_with_predicate() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_update_predicate").await?;
 
     // Create provider for programmatic update
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update rows where foo1 > 3 (diana and eve) to have foo2 = 'updated'
     let updated_count = provider
@@ -1378,12 +1355,8 @@ async fn test_update_with_predicate() -> Result<()> {
 async fn test_update_full_table() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_update_full").await?;
 
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update all rows to have foo2 = 'all_updated'
     let updated_count = provider
@@ -1417,7 +1390,10 @@ async fn test_update_full_table() -> Result<()> {
         })
         .collect();
 
-    assert!(names.iter().all(|n| n == "all_updated"), "All rows should be 'all_updated'");
+    assert!(
+        names.iter().all(|n| n == "all_updated"),
+        "All rows should be 'all_updated'"
+    );
     assert_eq!(names.len(), 5);
 
     Ok(())
@@ -1460,12 +1436,9 @@ async fn test_update_multiple_columns() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "multi_update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "multi_update_table")
+            .await?;
 
     // Update both name and status where id = 1
     let updated_count = provider
@@ -1483,7 +1456,9 @@ async fn test_update_multiple_columns() -> Result<()> {
 
     // Verify the updates
     let df = ctx
-        .sql("SELECT id, name, status FROM catalog.test_update_multi.multi_update_table ORDER BY id")
+        .sql(
+            "SELECT id, name, status FROM catalog.test_update_multi.multi_update_table ORDER BY id",
+        )
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
@@ -1556,12 +1531,9 @@ async fn test_update_with_expression() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "expr_update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "expr_update_table")
+            .await?;
 
     // Update: value = value + 100 where value > 15
     let updated_count = provider
@@ -1574,7 +1546,10 @@ async fn test_update_with_expression() -> Result<()> {
         .await
         .unwrap();
 
-    assert_eq!(updated_count, 2, "Expected 2 rows updated (value 20 and 30)");
+    assert_eq!(
+        updated_count, 2,
+        "Expected 2 rows updated (value 20 and 30)"
+    );
 
     // Verify the updates
     let df = ctx
@@ -1607,12 +1582,8 @@ async fn test_update_with_expression() -> Result<()> {
 async fn test_update_no_match() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_update_no_match").await?;
 
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update with predicate that matches nothing
     let updated_count = provider
@@ -1620,7 +1591,7 @@ async fn test_update_no_match() -> Result<()> {
         .await
         .unwrap()
         .set("foo2", lit("never_seen"))
-        .filter(col("foo1").gt(lit(100)))  // No rows have foo1 > 100
+        .filter(col("foo1").gt(lit(100))) // No rows have foo1 > 100
         .execute(&ctx.state())
         .await
         .unwrap();
@@ -1650,12 +1621,8 @@ async fn test_update_no_match() -> Result<()> {
 async fn test_select_after_update() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_select_after_update").await?;
 
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update bob's name to 'robert'
     let updated_count = provider
@@ -1691,7 +1658,10 @@ async fn test_select_after_update() -> Result<()> {
         .collect();
 
     assert_eq!(names, vec!["alice", "robert", "charlie", "diana", "eve"]);
-    assert!(!names.contains(&"bob".to_string()), "bob should be replaced with robert");
+    assert!(
+        !names.contains(&"bob".to_string()),
+        "bob should be replaced with robert"
+    );
 
     Ok(())
 }
@@ -1811,12 +1781,8 @@ async fn test_update_partitioned_table() -> Result<()> {
 async fn test_update_self_reference() -> Result<()> {
     let (catalog, namespace, ctx) = setup_update_test_table("test_update_self_ref").await?;
 
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        "update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "update_table").await?;
 
     // Update foo2 = foo2 (self-reference, effectively no change in values)
     let updated_count = provider
@@ -1829,7 +1795,10 @@ async fn test_update_self_reference() -> Result<()> {
         .await
         .unwrap();
 
-    assert_eq!(updated_count, 1, "Expected 1 row updated (even though value is same)");
+    assert_eq!(
+        updated_count, 1,
+        "Expected 1 row updated (even though value is same)"
+    );
 
     // Verify data is unchanged
     let df = ctx
@@ -1845,7 +1814,10 @@ async fn test_update_self_reference() -> Result<()> {
         .unwrap()
         .value(0);
 
-    assert_eq!(name, "alice", "Value should remain 'alice' after self-reference update");
+    assert_eq!(
+        name, "alice",
+        "Value should remain 'alice' after self-reference update"
+    );
 
     Ok(())
 }
@@ -1867,12 +1839,9 @@ async fn test_update_empty_table() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "empty_update_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "empty_update_table")
+            .await?;
 
     // UPDATE on empty table
     let updated_count = provider
@@ -1928,12 +1897,8 @@ async fn test_update_cross_column_swap() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "swap_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "swap_table").await?;
 
     // Swap: SET first = second, second = first
     // If evaluated incorrectly (first updated, then second reads updated first),
@@ -1973,8 +1938,14 @@ async fn test_update_cross_column_swap() -> Result<()> {
         .value(0);
 
     // After swap: first should be 'B' (original second), second should be 'A' (original first)
-    assert_eq!(first_val, "B", "first should be swapped to original second value");
-    assert_eq!(second_val, "A", "second should be swapped to original first value");
+    assert_eq!(
+        first_val, "B",
+        "first should be swapped to original second value"
+    );
+    assert_eq!(
+        second_val, "A",
+        "second should be swapped to original first value"
+    );
 
     Ok(())
 }
@@ -2034,12 +2005,9 @@ async fn test_update_partitioned_cross_partition() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "cross_partition_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "cross_partition_table")
+            .await?;
 
     // Update rows across multiple partitions (value > 150 touches US(id=2), EU(id=4), ASIA(id=5))
     let update_count = provider
@@ -2052,7 +2020,10 @@ async fn test_update_partitioned_cross_partition() -> Result<()> {
         .await
         .expect("UPDATE across partitions should succeed");
 
-    assert_eq!(update_count, 3, "Should have updated 3 rows across partitions");
+    assert_eq!(
+        update_count, 3,
+        "Should have updated 3 rows across partitions"
+    );
 
     // Re-register catalog to pick up changes
     let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
@@ -2160,12 +2131,9 @@ async fn test_update_partitioned_year_transform() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "year_partitioned_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "year_partitioned_table")
+            .await?;
 
     // Update all rows to 'processed'
     let update_count = provider
@@ -2275,12 +2243,9 @@ async fn test_update_partitioned_multiple_in_single_insert() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "multi_part_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "multi_part_table")
+            .await?;
 
     // Update all category 'A' rows (spans two different data files)
     let update_count = provider
@@ -2377,12 +2342,8 @@ async fn test_update_partitioned_full_table() -> Result<()> {
     .await
     .unwrap();
 
-    let provider = IcebergTableProvider::try_new(
-        client.clone(),
-        namespace.clone(),
-        "full_part_table",
-    )
-    .await?;
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "full_part_table").await?;
 
     // Full table UPDATE (no filter) - all partitions affected
     let update_count = provider
@@ -2419,8 +2380,476 @@ async fn test_update_partitioned_full_table() -> Result<()> {
         .unwrap();
 
     for i in 0..4 {
-        assert!(processed_array.value(i), "Row {} should have processed=true", i + 1);
+        assert!(
+            processed_array.value(i),
+            "Row {} should have processed=true",
+            i + 1
+        );
     }
+
+    Ok(())
+}
+
+// ============================================================================
+// DYNAMIC PARTITION PRUNING TESTS
+// ============================================================================
+
+/// Test that queries on non-partitioned tables work correctly.
+/// This verifies no regression when dynamic partition pruning is not applicable.
+#[tokio::test]
+async fn test_non_partitioned_table_no_regression() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_non_partitioned".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create a non-partitioned table (no partition spec)
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let creation = TableCreation::builder()
+        .location(temp_path())
+        .name("non_partitioned_table".to_string())
+        .schema(schema)
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert some data
+    ctx.sql(
+        "INSERT INTO catalog.test_non_partitioned.non_partitioned_table VALUES \
+         (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Query with a filter (should work without partition pruning)
+    let result = ctx
+        .sql(
+            "SELECT id, value FROM catalog.test_non_partitioned.non_partitioned_table \
+             WHERE id > 1 ORDER BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify results: should have 2 rows (id=2 and id=3)
+    let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Expected 2 rows where id > 1");
+
+    let batch = &result[0];
+    let id_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let value_array = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+
+    assert_eq!(id_array.value(0), 2);
+    assert_eq!(value_array.value(0), "b");
+    assert_eq!(id_array.value(1), 3);
+    assert_eq!(value_array.value(1), "c");
+
+    // Query all data (no filter)
+    let result = ctx
+        .sql("SELECT COUNT(*) as cnt FROM catalog.test_non_partitioned.non_partitioned_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let count = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 3, "Expected 3 total rows");
+
+    Ok(())
+}
+
+
+/// Test partition pruning on a partitioned table.
+/// Verifies that filters can be applied to partition pruning.
+///
+/// This test creates a partitioned table and queries with an IN-list filter
+/// on the partition column, demonstrating partition pruning behavior.
+#[tokio::test]
+async fn test_partition_pruning_with_in_list() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_partition_pruning".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create partitioned table
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "amount", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "region", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .location(temp_path())
+        .name("partitioned_fact".to_string())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data across 4 different partitions
+    ctx.sql(
+        "INSERT INTO catalog.test_partition_pruning.partitioned_fact VALUES \
+         (1, 'US', 100), (2, 'US', 200), \
+         (3, 'EU', 150), (4, 'EU', 250), \
+         (5, 'APAC', 300), (6, 'APAC', 350), \
+         (7, 'LATAM', 400), (8, 'LATAM', 450)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Query with IN-list filter on partition column (simulates DPP behavior)
+    // Only US and EU partitions should be scanned (not APAC or LATAM)
+    let result = ctx
+        .sql(
+            "SELECT id, region, amount \
+             FROM catalog.test_partition_pruning.partitioned_fact \
+             WHERE region IN ('US', 'EU') \
+             ORDER BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify correct results (only US and EU data - 4 rows)
+    let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 4, "Expected 4 rows for US and EU regions");
+
+    let batch = &result[0];
+    let id_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let region_array = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+
+    // Verify the results
+    assert_eq!(id_array.value(0), 1);
+    assert_eq!(region_array.value(0), "US");
+
+    assert_eq!(id_array.value(1), 2);
+    assert_eq!(region_array.value(1), "US");
+
+    assert_eq!(id_array.value(2), 3);
+    assert_eq!(region_array.value(2), "EU");
+
+    assert_eq!(id_array.value(3), 4);
+    assert_eq!(region_array.value(3), "EU");
+
+    // Verify the EXPLAIN shows IcebergTableScan with the predicate pushed down
+    let explain = ctx
+        .sql(
+            "EXPLAIN SELECT id FROM catalog.test_partition_pruning.partitioned_fact \
+             WHERE region IN ('US', 'EU')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Check that EXPLAIN output mentions IcebergTableScan with predicate
+    let explain_str = format!("{explain:?}");
+    assert!(
+        explain_str.contains("IcebergTableScan"),
+        "EXPLAIN should show IcebergTableScan"
+    );
+
+    Ok(())
+}
+
+/// Test dynamic partition pruning with a hash join.
+/// Verifies that runtime filters from joins are applied to partition pruning.
+///
+/// This test creates:
+/// - A partitioned "fact" table with data across multiple partitions
+/// - A small "dimension" table with filter values
+/// - Executes a join that should trigger dynamic partition pruning
+#[tokio::test]
+async fn test_dynamic_partition_pruning_with_join() -> Result<()> {
+    use datafusion::physical_plan::metrics::MetricValue;
+    use iceberg_datafusion::physical_plan::IcebergTableScan;
+
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_dpp_join".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create partitioned fact table
+    let fact_schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "partition_id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(3, "amount", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "partition_id", Transform::Identity)?
+        .build();
+
+    let fact_creation = TableCreation::builder()
+        .location(temp_path())
+        .name("fact_table".to_string())
+        .schema(fact_schema)
+        .partition_spec(partition_spec)
+        .build();
+
+    iceberg_catalog
+        .create_table(&namespace, fact_creation)
+        .await?;
+
+    // Create dimension table (non-partitioned)
+    let dim_schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "partition_id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "partition_name", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+
+    let dim_creation = TableCreation::builder()
+        .location(temp_path())
+        .name("dim_table".to_string())
+        .schema(dim_schema)
+        .build();
+
+    iceberg_catalog
+        .create_table(&namespace, dim_creation)
+        .await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new_with_config(
+        datafusion::execution::context::SessionConfig::new().with_target_partitions(1),
+    );
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert data into fact table across 4 different partitions
+    ctx.sql(
+        "INSERT INTO catalog.test_dpp_join.fact_table VALUES \
+         (1, 1, 100), (2, 1, 200), \
+         (3, 2, 150), (4, 2, 250), \
+         (5, 3, 300), (6, 3, 350), \
+         (7, 4, 400), (8, 4, 450)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Insert data into dimension table (only 2 of 4 partitions)
+    ctx.sql(
+        "INSERT INTO catalog.test_dpp_join.dim_table VALUES \
+         (1, 'one'), (2, 'two')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    fn planned_tasks_for_iceberg_scans(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> usize {
+        let mut total = 0;
+        let mut stack = vec![Arc::clone(plan)];
+        while let Some(node) = stack.pop() {
+            if node.name() == "IcebergTableScan" && let Some(metrics) = node.metrics() {
+                for metric in metrics.iter() {
+                    if let MetricValue::Count { name, count } = metric.value()
+                        && name == "planned_tasks"
+                    {
+                        total += count.value();
+                    }
+                }
+            }
+
+            for child in node.children() {
+                stack.push(Arc::clone(child));
+            }
+        }
+
+        total
+    }
+
+    fn planned_tasks_for_fact_scan(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> usize {
+        let mut total = 0;
+        let mut stack = vec![Arc::clone(plan)];
+        while let Some(node) = stack.pop() {
+            if let Some(scan) = node.as_any().downcast_ref::<IcebergTableScan>()
+                && scan
+                    .projection()
+                    .is_some_and(|cols| cols.iter().any(|c| c == "amount"))
+                && let Some(metrics) = node.metrics()
+            {
+                for metric in metrics.iter() {
+                    if let MetricValue::Count { name, count } = metric.value()
+                        && name == "planned_tasks"
+                    {
+                        total += count.value();
+                    }
+                }
+            }
+
+            for child in node.children() {
+                stack.push(Arc::clone(child));
+            }
+        }
+
+        total
+    }
+
+    // Baseline scan (no join): should touch all partitions/files.
+    let baseline_df = ctx
+        .sql("SELECT id FROM catalog.test_dpp_join.fact_table ORDER BY id")
+        .await
+        .unwrap();
+    let baseline_task_ctx = Arc::new(baseline_df.task_ctx());
+    let baseline_plan = baseline_df.create_physical_plan().await.unwrap();
+    datafusion::physical_plan::collect(
+        Arc::clone(&baseline_plan),
+        baseline_task_ctx,
+    )
+    .await
+    .unwrap();
+    let baseline_tasks = planned_tasks_for_iceberg_scans(&baseline_plan);
+    assert!(
+        baseline_tasks >= 4,
+        "Expected at least 4 planned scan tasks (one per partition), got {baseline_tasks}"
+    );
+
+    // Execute a join - this should benefit from dynamic partition pruning
+    let join_df = ctx
+        .sql(
+            "SELECT f.id, f.partition_id, f.amount, d.partition_name \
+             FROM catalog.test_dpp_join.dim_table d \
+             JOIN catalog.test_dpp_join.fact_table f ON f.partition_id = d.partition_id \
+             ORDER BY f.id",
+        )
+        .await
+        .unwrap();
+    let join_task_ctx = Arc::new(join_df.task_ctx());
+    let join_plan = join_df.clone().create_physical_plan().await.unwrap();
+    let result = datafusion::physical_plan::collect(
+        Arc::clone(&join_plan),
+        join_task_ctx,
+    )
+    .await
+    .unwrap();
+    let join_fact_tasks = planned_tasks_for_fact_scan(&join_plan);
+    assert!(
+        join_fact_tasks < baseline_tasks,
+        "Expected fewer planned scan tasks with join runtime filters (baseline={baseline_tasks}, join_fact={join_fact_tasks})"
+    );
+
+    // Verify correct results (only partition_id 1 and 2 data - 4 rows)
+    let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 4,
+        "Expected 4 rows from join (partition_id 1 and 2 only)"
+    );
+
+    let batch = &result[0];
+    let id_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let partition_id_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap();
+    let partition_name_array = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+
+    // Verify the join results
+    assert_eq!(id_array.value(0), 1);
+    assert_eq!(partition_id_array.value(0), 1);
+    assert_eq!(partition_name_array.value(0), "one");
+
+    assert_eq!(id_array.value(1), 2);
+    assert_eq!(partition_id_array.value(1), 1);
+    assert_eq!(partition_name_array.value(1), "one");
+
+    assert_eq!(id_array.value(2), 3);
+    assert_eq!(partition_id_array.value(2), 2);
+    assert_eq!(partition_name_array.value(2), "two");
+
+    assert_eq!(id_array.value(3), 4);
+    assert_eq!(partition_id_array.value(3), 2);
+    assert_eq!(partition_name_array.value(3), "two");
+
+    // Verify the physical plan uses a hash join and the scan receives a dynamic filter.
+    let records = join_df
+        .explain(false, false)
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    let plan_str = record
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(plan_str.len(), 2);
+    assert!(
+        plan_str.value(1).contains("HashJoinExec"),
+        "Expected a hash join physical plan"
+    );
+    assert!(
+        plan_str.value(1).contains("dynamic_filter:[enabled]"),
+        "Expected IcebergTableScan to show an enabled dynamic filter"
+    );
 
     Ok(())
 }

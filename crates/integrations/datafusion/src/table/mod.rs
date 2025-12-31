@@ -29,6 +29,7 @@ pub mod metadata_table;
 pub mod table_provider_factory;
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -40,7 +41,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::{DmlCapabilities, InsertOp};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use iceberg::arrow::schema_to_arrow_schema;
@@ -64,6 +65,8 @@ use crate::physical_plan::update_commit::IcebergUpdateCommitExec;
 use crate::physical_plan::write::IcebergWriteExec;
 use crate::update::UpdateBuilder;
 
+const ARROW_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+
 /// Catalog-backed table provider with automatic metadata refresh.
 ///
 /// This provider loads fresh table metadata from the catalog on every scan and write
@@ -80,6 +83,10 @@ pub struct IcebergTableProvider {
     table_ident: TableIdent,
     /// A reference-counted arrow `Schema` (cached at construction)
     schema: ArrowSchemaRef,
+    /// Iceberg field IDs used as partition sources across all partition specs.
+    ///
+    /// Used for filter pushdown classification and is safe to cache because field IDs are stable.
+    partition_source_ids: HashSet<i32>,
 }
 
 impl IcebergTableProvider {
@@ -97,11 +104,17 @@ impl IcebergTableProvider {
         // Load table once to get initial schema
         let table = catalog.load_table(&table_ident).await?;
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let partition_source_ids = table
+            .metadata()
+            .partition_specs_iter()
+            .flat_map(|spec| spec.partition_source_ids())
+            .collect();
 
         Ok(IcebergTableProvider {
             catalog,
             table_ident,
             schema,
+            partition_source_ids,
         })
     }
 
@@ -146,6 +159,16 @@ impl IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
+        if !table.metadata().default_partition_spec().is_unpartitioned() {
+            return Err(DataFusionError::NotImplemented(
+                "DELETE on partitioned tables is not yet supported".to_string(),
+            ));
+        }
+
+        let current_schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema()).map_err(to_datafusion_error)?,
+        );
+
         // Capture baseline snapshot ID for concurrency validation
         let baseline_snapshot_id = table.metadata().current_snapshot_id();
 
@@ -157,6 +180,7 @@ impl IcebergTableProvider {
             table.clone(),
             None, // Use current snapshot
             &filters,
+            current_schema,
         ));
 
         // Step 2: Write position delete files
@@ -310,8 +334,11 @@ impl TableProvider for IcebergTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        Ok(classify_pushdown_filters(
+            &self.schema,
+            &self.partition_source_ids,
+            filters,
+        ))
     }
 
     async fn insert_into(
@@ -423,19 +450,27 @@ impl TableProvider for IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
+        if !table.metadata().default_partition_spec().is_unpartitioned() {
+            return Err(DataFusionError::NotImplemented(
+                "DELETE on partitioned tables is not yet supported".to_string(),
+            ));
+        }
+
         // Capture baseline snapshot ID for concurrency validation.
         // If another transaction commits between our scan and commit,
         // we'll detect it and fail rather than apply stale position deletes.
         let baseline_snapshot_id = table.metadata().current_snapshot_id();
 
-        // Note: IcebergDeleteScanExec uses the table's current schema internally,
-        // so schema evolution is handled correctly within the scan operator.
+        let current_schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema()).map_err(to_datafusion_error)?,
+        );
 
         // Step 1: Scan for rows to delete
         let delete_scan = Arc::new(IcebergDeleteScanExec::new(
             table.clone(),
             None, // Use current snapshot
             &filters,
+            current_schema,
         ));
 
         // Step 2: Write position delete files
@@ -496,11 +531,6 @@ impl TableProvider for IcebergTableProvider {
             }
         }
 
-        // Capture baseline snapshot ID for concurrency validation.
-        // If another transaction commits between our scan and commit,
-        // we'll detect it and fail rather than apply stale position deletes.
-        let baseline_snapshot_id = table.metadata().current_snapshot_id();
-
         // Build the UPDATE execution plan with fresh schema
         let update_exec = Arc::new(IcebergUpdateExec::new(
             table.clone(),
@@ -518,7 +548,6 @@ impl TableProvider for IcebergTableProvider {
             self.catalog.clone(),
             coalesce.clone(),
             coalesce.schema(),
-            baseline_snapshot_id,
         )))
     }
 }
@@ -539,6 +568,8 @@ pub struct IcebergStaticTableProvider {
     snapshot_id: Option<i64>,
     /// A reference-counted arrow `Schema`
     schema: ArrowSchemaRef,
+    /// Iceberg field IDs used as partition sources across all partition specs.
+    partition_source_ids: HashSet<i32>,
 }
 
 impl IcebergStaticTableProvider {
@@ -547,10 +578,16 @@ impl IcebergStaticTableProvider {
     /// Uses the table's current snapshot for all queries. Does not support write operations.
     pub async fn try_new_from_table(table: Table) -> Result<Self> {
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let partition_source_ids = table
+            .metadata()
+            .partition_specs_iter()
+            .flat_map(|spec| spec.partition_source_ids())
+            .collect();
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: None,
             schema,
+            partition_source_ids,
         })
     }
 
@@ -573,10 +610,16 @@ impl IcebergStaticTableProvider {
             })?;
         let table_schema = snapshot.schema(table.metadata())?;
         let schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
+        let partition_source_ids = table
+            .metadata()
+            .partition_specs_iter()
+            .flat_map(|spec| spec.partition_source_ids())
+            .collect();
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: Some(snapshot_id),
             schema,
+            partition_source_ids,
         })
     }
 }
@@ -616,8 +659,11 @@ impl TableProvider for IcebergStaticTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        Ok(classify_pushdown_filters(
+            &self.schema,
+            &self.partition_source_ids,
+            filters,
+        ))
     }
 
     async fn insert_into(
@@ -635,13 +681,138 @@ impl TableProvider for IcebergStaticTableProvider {
     }
 }
 
+fn classify_pushdown_filters(
+    schema: &ArrowSchemaRef,
+    partition_source_ids: &HashSet<i32>,
+    filters: &[&Expr],
+) -> Vec<TableProviderFilterPushDown> {
+    filters
+        .iter()
+        .map(|expr| classify_pushdown_filter(schema, partition_source_ids, expr))
+        .collect()
+}
+
+fn classify_pushdown_filter(
+    schema: &ArrowSchemaRef,
+    partition_source_ids: &HashSet<i32>,
+    filter: &Expr,
+) -> TableProviderFilterPushDown {
+    let referenced_field_ids = referenced_field_ids(schema, filter);
+    if referenced_field_ids.is_empty() {
+        return TableProviderFilterPushDown::Unsupported;
+    }
+
+    let only_partition_columns = referenced_field_ids
+        .iter()
+        .all(|id| partition_source_ids.contains(id));
+
+    if only_partition_columns && is_iceberg_filter_exact(filter) {
+        TableProviderFilterPushDown::Exact
+    } else {
+        // Conservatively classify as `Inexact` to keep behavior stable: the scan can still
+        // use the filter for pruning and/or internal row filtering, and DataFusion will
+        // retain the original filter for correctness.
+        TableProviderFilterPushDown::Inexact
+    }
+}
+
+fn referenced_field_ids(schema: &ArrowSchemaRef, expr: &Expr) -> Vec<i32> {
+    let mut names = HashSet::<String>::new();
+    collect_column_names(expr, &mut names);
+
+    names
+        .into_iter()
+        .filter_map(|name| field_id_for_column_name(schema, &name))
+        .collect()
+}
+
+fn collect_column_names(expr: &Expr, names: &mut HashSet<String>) {
+    match expr {
+        Expr::Column(col) => {
+            names.insert(col.name().to_string());
+        }
+        Expr::BinaryExpr(binary) => {
+            collect_column_names(&binary.left, names);
+            collect_column_names(&binary.right, names);
+        }
+        Expr::Not(inner) => collect_column_names(inner, names),
+        Expr::InList(inlist) => {
+            collect_column_names(&inlist.expr, names);
+            for item in &inlist.list {
+                collect_column_names(item, names);
+            }
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => collect_column_names(inner, names),
+        Expr::Cast(cast) => collect_column_names(&cast.expr, names),
+        _ => {}
+    }
+}
+
+fn field_id_for_column_name(schema: &ArrowSchemaRef, name: &str) -> Option<i32> {
+    let field = schema.field_with_name(name).ok()?;
+    let id = field
+        .metadata()
+        .get(ARROW_FIELD_ID_META_KEY)?
+        .parse::<i32>()
+        .ok()?;
+    Some(id)
+}
+
+fn is_iceberg_filter_exact(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And | Operator::Or => {
+                is_iceberg_filter_exact(&binary.left) && is_iceberg_filter_exact(&binary.right)
+            }
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => {
+                (is_column_expr(&binary.left) && is_literal_expr(&binary.right))
+                    || (is_column_expr(&binary.right) && is_literal_expr(&binary.left))
+            }
+            _ => false,
+        },
+        Expr::InList(inlist) => {
+            is_column_expr(&inlist.expr) && inlist.list.iter().all(is_literal_expr)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => is_column_expr(inner),
+        Expr::Not(inner) => is_iceberg_filter_exact(inner),
+        Expr::Cast(cast) => {
+            // Be conservative: some casts (e.g. to DATE) are not semantics-preserving for
+            // predicate evaluation when translated to Iceberg expressions.
+            if cast.data_type == datafusion::arrow::datatypes::DataType::Date32
+                || cast.data_type == datafusion::arrow::datatypes::DataType::Date64
+            {
+                return false;
+            }
+            is_iceberg_filter_exact(&cast.expr)
+        }
+        _ => false,
+    }
+}
+
+fn is_column_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) => true,
+        Expr::Cast(cast) => is_column_expr(&cast.expr),
+        _ => false,
+    }
+}
+
+fn is_literal_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_, _))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use datafusion::common::Column;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionContext, col, lit};
     use iceberg::io::FileIO;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -808,6 +979,26 @@ mod tests {
         assert!(physical_plan.is_ok());
     }
 
+    #[tokio::test]
+    async fn test_static_provider_supports_filters_pushdown_partition_columns() {
+        let table = get_test_table_from_metadata_file().await;
+        let provider = IcebergStaticTableProvider::try_new_from_table(table)
+            .await
+            .unwrap();
+
+        let x_eq_5 = col("x").eq(lit(5_i64));
+        let y_eq_5 = col("y").eq(lit(5_i64));
+
+        let results = provider
+            .supports_filters_pushdown(&[&x_eq_5, &y_eq_5])
+            .unwrap();
+
+        assert_eq!(results, vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Inexact,
+        ]);
+    }
+
     // Tests for IcebergTableProvider
 
     #[tokio::test]
@@ -825,6 +1016,29 @@ mod tests {
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[tokio::test]
+    async fn test_catalog_backed_provider_supports_filters_pushdown_non_partitioned_defaults_inexact()
+     {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .unwrap();
+
+        let id_eq_1 = col("id").eq(lit(1_i32));
+        let name_eq_test = col("name").eq(lit("test"));
+
+        let results = provider
+            .supports_filters_pushdown(&[&id_eq_1, &name_eq_test])
+            .unwrap();
+
+        assert_eq!(results, vec![
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Inexact,
+        ]);
     }
 
     #[tokio::test]

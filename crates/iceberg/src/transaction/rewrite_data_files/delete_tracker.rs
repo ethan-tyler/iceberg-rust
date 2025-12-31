@@ -284,7 +284,7 @@ mod tests {
                 lower_bounds: std::collections::HashMap::new(),
                 upper_bounds: std::collections::HashMap::new(),
                 key_metadata: None,
-                split_offsets: vec![],
+                split_offsets: None,
                 equality_ids: None,
                 sort_order_id: None,
                 partition_spec_id: 1,

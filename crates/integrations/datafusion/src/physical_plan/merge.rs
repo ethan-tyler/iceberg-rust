@@ -1177,7 +1177,7 @@ async fn execute_merge(
     let delete_files_json: Vec<String> = delete_files
         .into_iter()
         .map(|df| {
-            let spec_id = df.partition_spec_id();
+            let spec_id = df.partition_spec_id_or_default();
             let partition_type = partition_types.get(&spec_id).ok_or_else(|| {
                 DataFusionError::Internal(format!(
                     "Missing partition type for partition spec {spec_id}"

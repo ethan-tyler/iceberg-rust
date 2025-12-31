@@ -59,12 +59,16 @@ use datafusion::physical_expr::planner::create_physical_expr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataFileFormat, PartitionKey, Struct, TableProperties, serialize_data_file_to_json};
+use iceberg::spec::{
+    DataFileFormat, PartitionKey, Struct, TableProperties, serialize_data_file_to_json,
+};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
@@ -79,6 +83,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use super::record_batch::coerce_batch_schema;
 use crate::position_delete_task_writer::PositionDeleteTaskWriter;
 use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
@@ -182,10 +187,11 @@ impl IcebergUpdateExec {
         let count_array =
             Arc::new(datafusion::arrow::array::UInt64Array::from(vec![count])) as ArrayRef;
 
-        RecordBatch::try_new(
-            Self::make_output_schema(),
-            vec![data_files_array, delete_files_array, count_array],
-        )
+        RecordBatch::try_new(Self::make_output_schema(), vec![
+            data_files_array,
+            delete_files_array,
+            count_array,
+        ])
         .map_err(|e| {
             DataFusionError::ArrowError(
                 Box::new(e),
@@ -210,7 +216,7 @@ impl DisplayAs for IcebergUpdateExec {
         let assignments_display: Vec<String> = self
             .assignments
             .iter()
-            .map(|(col, expr)| format!("{} = {}", col, expr))
+            .map(|(col, expr)| format!("{col} = {expr}"))
             .collect();
 
         match t {
@@ -278,7 +284,10 @@ impl ExecutionPlan for IcebergUpdateExec {
         })
         .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }
 
@@ -405,10 +414,14 @@ async fn execute_update(
     // Build spec_id -> PartitionSpec lookup for partition evolution support.
     // This allows us to serialize each file's partition data using its correct partition type,
     // even when the table has evolved partition specs.
-    let partition_specs: std::collections::HashMap<i32, std::sync::Arc<iceberg::spec::PartitionSpec>> =
-        table.metadata().partition_specs_iter()
-            .map(|spec| (spec.spec_id(), spec.clone()))
-            .collect();
+    let partition_specs: std::collections::HashMap<
+        i32,
+        std::sync::Arc<iceberg::spec::PartitionSpec>,
+    > = table
+        .metadata()
+        .partition_specs_iter()
+        .map(|spec| (spec.spec_id(), spec.clone()))
+        .collect();
 
     let mut delete_task_writer = PositionDeleteTaskWriter::try_new(
         delete_file_builder,
@@ -463,9 +476,8 @@ async fn execute_update(
 
         // Read batches from this file - stream to prevent OOM
         let reader = iceberg::arrow::ArrowReaderBuilder::new(file_io.clone()).build();
-        let task_stream =
-            Box::pin(futures::stream::iter(vec![Ok(task_without_predicate)]))
-                as iceberg::scan::FileScanTaskStream;
+        let task_stream = Box::pin(futures::stream::iter(vec![Ok(task_without_predicate)]))
+            as iceberg::scan::FileScanTaskStream;
         let mut batch_stream = reader
             .read(task_stream)
             .map_err(to_datafusion_error)?
@@ -478,6 +490,7 @@ async fn execute_update(
             None => continue, // Empty file
         };
 
+        let first_batch = coerce_batch_schema(first_batch, &schema)?;
         let batch_schema = first_batch.schema();
         let (physical_filter, physical_assignments) =
             build_physical_expressions(&filter_exprs, &assignments, batch_schema.clone())?;
@@ -527,7 +540,7 @@ async fn execute_update(
 
         // Stream remaining batches from file
         while let Some(batch_result) = batch_stream.next().await {
-            let batch = batch_result?;
+            let batch = coerce_batch_schema(batch_result?, &schema)?;
             let batch_size = batch.num_rows();
 
             // Find matching rows
@@ -639,15 +652,17 @@ async fn execute_update(
     IcebergUpdateExec::make_result_batch(data_files_json, delete_files_json, total_count)
 }
 
+type UpdatePhysicalExpressions = (
+    Option<Arc<dyn PhysicalExpr>>,
+    HashMap<String, Arc<dyn PhysicalExpr>>,
+);
+
 /// Builds physical expressions for filter and SET assignments.
 fn build_physical_expressions(
     filter_exprs: &[Expr],
     assignments: &[(String, Expr)],
     batch_schema: ArrowSchemaRef,
-) -> DFResult<(
-    Option<Arc<dyn PhysicalExpr>>,
-    HashMap<String, Arc<dyn PhysicalExpr>>,
-)> {
+) -> DFResult<UpdatePhysicalExpressions> {
     let df_schema = DFSchema::try_from(batch_schema.as_ref().clone())?;
     let ctx = SessionContext::new();
     let execution_props = ctx.state().execution_props().clone();
@@ -661,7 +676,11 @@ fn build_physical_expressions(
             .cloned()
             .reduce(|a, b| a.and(b))
             .unwrap();
-        Some(create_physical_expr(&combined, &df_schema, &execution_props)?)
+        Some(create_physical_expr(
+            &combined,
+            &df_schema,
+            &execution_props,
+        )?)
     };
 
     // Build physical assignment expressions
@@ -744,8 +763,7 @@ fn transform_batch(
             // Keep original column value
             let original_col = batch.column_by_name(column_name).ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "Column '{}' not found in source batch",
-                    column_name
+                    "Column '{column_name}' not found in source batch"
                 ))
             })?;
             columns.push(original_col.clone());

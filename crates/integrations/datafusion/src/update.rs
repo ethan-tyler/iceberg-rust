@@ -282,9 +282,6 @@ impl UpdateBuilder {
         // Validate first (includes check for partition column updates)
         self.validate()?;
 
-        // Capture baseline snapshot ID for conflict detection during commit
-        let baseline_snapshot_id = self.table.metadata().current_snapshot_id();
-
         // Build the update execution plan chain
         let filters: Vec<Expr> = self.filter.into_iter().collect();
 
@@ -305,7 +302,6 @@ impl UpdateBuilder {
             self.catalog,
             coalesce.clone(),
             coalesce.schema(),
-            baseline_snapshot_id,
         ));
 
         // Execute the plan

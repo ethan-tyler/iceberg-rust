@@ -23,9 +23,12 @@ pub mod delete;
 pub mod merge;
 pub mod update;
 
+pub(crate) mod dynamic_filter;
+
 mod error;
 pub use error::*;
 
+pub mod expr;
 pub(crate) mod partition_utils;
 pub mod physical_plan;
 mod schema;

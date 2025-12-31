@@ -958,9 +958,9 @@ mod tests {
         let update_all = MatchedAction::UpdateAll;
         let delete = MatchedAction::Delete;
 
-        assert!(format!("{:?}", update).contains("Update"));
-        assert!(format!("{:?}", update_all).contains("UpdateAll"));
-        assert!(format!("{:?}", delete).contains("Delete"));
+        assert!(format!("{update:?}").contains("Update"));
+        assert!(format!("{update_all:?}").contains("UpdateAll"));
+        assert!(format!("{delete:?}").contains("Delete"));
     }
 
     #[test]
@@ -969,8 +969,8 @@ mod tests {
             NotMatchedAction::Insert(vec![("col".to_string(), datafusion::prelude::lit(1))]);
         let insert_all = NotMatchedAction::InsertAll;
 
-        assert!(format!("{:?}", insert).contains("Insert"));
-        assert!(format!("{:?}", insert_all).contains("InsertAll"));
+        assert!(format!("{insert:?}").contains("Insert"));
+        assert!(format!("{insert_all:?}").contains("InsertAll"));
     }
 
     #[test]
@@ -981,7 +981,7 @@ mod tests {
         )]);
         let delete = NotMatchedBySourceAction::Delete;
 
-        assert!(format!("{:?}", update).contains("Update"));
-        assert!(format!("{:?}", delete).contains("Delete"));
+        assert!(format!("{update:?}").contains("Update"));
+        assert!(format!("{delete:?}").contains("Delete"));
     }
 }

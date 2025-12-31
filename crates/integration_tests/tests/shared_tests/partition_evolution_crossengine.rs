@@ -62,7 +62,7 @@ async fn test_crossengine_delete_with_partition_evolution() {
 
     let metadata = table.metadata();
     assert!(
-        metadata.partition_specs().len() >= 2,
+        metadata.partition_specs_iter().count() >= 2,
         "Table should have at least 2 partition specs (evolved)"
     );
     assert!(
@@ -71,11 +71,12 @@ async fn test_crossengine_delete_with_partition_evolution() {
     );
 
     let ctx = SessionContext::new();
+    let namespace = iceberg::NamespaceIdent::new("default".to_string());
 
     // Create provider for DML operations
     let provider = IcebergTableProvider::try_new(
         client.clone(),
-        vec!["default".to_string()].into(),
+        namespace.clone(),
         "test_partition_evolution_delete",
     )
     .await
@@ -115,7 +116,7 @@ async fn test_crossengine_delete_with_partition_evolution() {
     // Reload table and verify
     let provider_after = IcebergTableProvider::try_new(
         client.clone(),
-        vec!["default".to_string()].into(),
+        namespace,
         "test_partition_evolution_delete",
     )
     .await
@@ -168,16 +169,17 @@ async fn test_crossengine_update_with_partition_evolution() {
 
     let metadata = table.metadata();
     assert!(
-        metadata.partition_specs().len() >= 2,
+        metadata.partition_specs_iter().count() >= 2,
         "Table should have at least 2 partition specs (evolved)"
     );
 
     let ctx = SessionContext::new();
+    let namespace = iceberg::NamespaceIdent::new("default".to_string());
 
     // Create provider for DML operations
     let provider = IcebergTableProvider::try_new(
         client.clone(),
-        vec!["default".to_string()].into(),
+        namespace.clone(),
         "test_partition_evolution_update",
     )
     .await
@@ -194,15 +196,12 @@ async fn test_crossengine_update_with_partition_evolution() {
         .await
         .expect("UPDATE across partition specs should succeed");
 
-    assert_eq!(
-        update_result.rows_updated, 3,
-        "Should update 3 rows (id 3, 4, 5)"
-    );
+    assert_eq!(update_result, 3, "Should update 3 rows (id 3, 4, 5)");
 
     // Reload and verify
     let provider_after = IcebergTableProvider::try_new(
         client.clone(),
-        vec!["default".to_string()].into(),
+        namespace,
         "test_partition_evolution_update",
     )
     .await
@@ -261,11 +260,12 @@ async fn test_crossengine_merge_with_partition_evolution() {
 
     let metadata = table.metadata();
     assert!(
-        metadata.partition_specs().len() >= 2,
+        metadata.partition_specs_iter().count() >= 2,
         "Table should have at least 2 partition specs (evolved)"
     );
 
     let ctx = SessionContext::new();
+    let namespace = iceberg::NamespaceIdent::new("default".to_string());
 
     // Create source data for MERGE
     let source_schema = Arc::new(Schema::new(vec![
@@ -289,7 +289,7 @@ async fn test_crossengine_merge_with_partition_evolution() {
     // Create provider for DML operations
     let provider = IcebergTableProvider::try_new(
         client.clone(),
-        vec!["default".to_string()].into(),
+        namespace.clone(),
         "test_partition_evolution_merge",
     )
     .await
@@ -316,7 +316,7 @@ async fn test_crossengine_merge_with_partition_evolution() {
     // Reload and verify
     let provider_after = IcebergTableProvider::try_new(
         client.clone(),
-        vec!["default".to_string()].into(),
+        namespace,
         "test_partition_evolution_merge",
     )
     .await

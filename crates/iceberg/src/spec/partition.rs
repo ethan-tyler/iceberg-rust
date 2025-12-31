@@ -82,6 +82,16 @@ impl PartitionSpec {
         &self.fields
     }
 
+    /// Returns source field IDs referenced by this partition spec.
+    ///
+    /// This iterator excludes `void` transform fields, which do not produce partition values.
+    pub fn partition_source_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.fields
+            .iter()
+            .filter(|field| field.transform != Transform::Void)
+            .map(|field| field.source_id)
+    }
+
     /// Spec id of the partition spec
     pub fn spec_id(&self) -> i32 {
         self.spec_id
@@ -850,6 +860,29 @@ mod tests {
             partition_spec.is_unpartitioned(),
             "Partition spec with all void field should be unpartitioned"
         );
+    }
+
+    #[test]
+    fn test_partition_source_ids_excludes_void() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let spec = PartitionSpec::builder(schema)
+            .with_spec_id(1)
+            .add_partition_field("id", "id_void", Transform::Void)
+            .unwrap()
+            .add_partition_field("name", "name_bucket", Transform::Bucket(16))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let source_ids: Vec<i32> = spec.partition_source_ids().collect();
+        assert_eq!(source_ids, vec![2]);
     }
 
     #[test]
