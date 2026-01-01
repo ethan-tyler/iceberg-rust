@@ -464,6 +464,43 @@ for table in ["parity_delete_rust", "parity_delete_spark"]:
         (5, 'epsilon', 500);
     """)
 
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.parity_delete_empty_rust (
+    id     integer,
+    name   string,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.delete.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.parity_delete_empty_spark (
+    id     integer,
+    name   string,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.delete.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+for table in ["parity_delete_empty_rust", "parity_delete_empty_spark"]:
+    spark.sql(f"""
+    INSERT INTO rest.default.{table}
+    VALUES
+        (1, 'alpha', 100),
+        (2, 'beta', 200),
+        (3, 'gamma', 300),
+        (4, 'delta', 400),
+        (5, 'epsilon', 500);
+    """)
+
 # Pair 2: Compaction semantic parity test (multiple small files)
 spark.sql("""
 CREATE OR REPLACE TABLE rest.default.parity_compact_rust (
@@ -703,6 +740,113 @@ for table in ["parity_partition_rust", "parity_partition_spark"]:
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (1, 'A', 10)")
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (2, 'B', 20)")
     spark.sql(f"INSERT INTO rest.default.{table} VALUES (3, NULL, 30)")
+
+# Pair 9: Three-valued logic parity test
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.parity_three_valued_rust (
+    id     integer,
+    name   string,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.delete.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.parity_three_valued_spark (
+    id     integer,
+    name   string,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.delete.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+for table in ["parity_three_valued_rust", "parity_three_valued_spark"]:
+    spark.sql(f"""
+    INSERT INTO rest.default.{table}
+    VALUES
+        (1, 'alpha', 100),
+        (2, NULL, 200),
+        (3, 'gamma', NULL),
+        (4, NULL, NULL);
+    """)
+
+# Pair 10: Zero-length binary parity test
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.parity_binary_rust (
+    id      integer,
+    payload binary
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.delete.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.parity_binary_spark (
+    id      integer,
+    payload binary
+)
+USING iceberg
+TBLPROPERTIES (
+    'write.delete.mode'='merge-on-read',
+    'format-version'='2'
+);
+""")
+
+for table in ["parity_binary_rust", "parity_binary_spark"]:
+    spark.sql(f"""
+    INSERT INTO rest.default.{table}
+    VALUES
+        (1, CAST('' AS BINARY)),
+        (2, CAST('abc' AS BINARY));
+    """)
+
+# Pair 11: Schema error rejection parity tests
+schema_tables = [
+    "parity_schema_rust",
+    "parity_schema_spark",
+    "parity_schema_add_existing_rust",
+    "parity_schema_add_existing_spark",
+    "parity_schema_rename_existing_rust",
+    "parity_schema_rename_existing_spark",
+    "parity_schema_drop_missing_rust",
+    "parity_schema_drop_missing_spark",
+    "parity_schema_rename_missing_rust",
+    "parity_schema_rename_missing_spark",
+    "parity_schema_incompatible_rust",
+    "parity_schema_incompatible_spark",
+]
+
+for table in schema_tables:
+    spark.sql(f"""
+    CREATE OR REPLACE TABLE rest.default.{table} (
+        id     integer,
+        name   string,
+        value  integer
+    )
+    USING iceberg
+    TBLPROPERTIES (
+        'format-version'='2'
+    );
+    """)
+
+for table in schema_tables:
+    spark.sql(f"""
+    INSERT INTO rest.default.{table}
+    VALUES
+        (1, 'alpha', 100),
+        (2, 'beta', 200);
+    """)
 
 # =============================================================================
 # WP3.1 Equality Delete Interop Tests (Spark -> Rust)

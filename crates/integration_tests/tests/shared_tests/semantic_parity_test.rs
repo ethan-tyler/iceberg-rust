@@ -52,24 +52,33 @@ use std::sync::Arc;
 use chrono::Utc;
 use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::datasource::MemTable;
+use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::*;
-use iceberg::spec::{DataContentType, ManifestStatus, StructType};
+use datafusion::scalar::ScalarValue;
+use iceberg::spec::{DataContentType, ManifestStatus, PrimitiveType, StructType, Type};
 use iceberg::transaction::{
     ApplyTransactionAction, RewriteDataFilesOptions, RewriteStrategy, Transaction,
 };
-use iceberg::{Catalog, CatalogBuilder, TableIdent};
+use iceberg::{Catalog, CatalogBuilder, ErrorKind, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_datafusion::IcebergTableProvider;
 use iceberg_datafusion::compaction::{CompactionOptions, compact_table};
 use iceberg_integration_tests::spark_validator::{
     ManifestEntriesResult, ManifestEntryInfo, SnapshotSummaryFields, SnapshotSummaryResult,
-    spark_execute_dml_with_container, spark_execute_sql_with_container,
+    SparkValidationError, spark_execute_dml_with_container, spark_execute_sql_with_container,
     spark_manifest_entries_with_container, spark_snapshot_summary_with_container,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::get_shared_containers;
+
+const EXPECTED_DIVERGENCE_FIELDS: &[&str] = &[
+    "snapshot-id",
+    "committed-at",
+    "added-files-size",
+    "removed-files-size",
+    "total-files-size",
+];
 
 /// Comparison result for a single field.
 #[derive(Debug)]
@@ -176,6 +185,7 @@ impl ManifestParityResult {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct RustManifestEntryInfo {
     status: i32,
@@ -185,6 +195,7 @@ struct RustManifestEntryInfo {
     data_file: RustDataFileInfo,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct RustDataFileInfo {
     content: i32,
@@ -380,6 +391,107 @@ fn compare_field(
     }
 }
 
+fn assert_parity_expected_divergences(result: &ParityResult) {
+    let mut unexpected = Vec::new();
+    let mut unexpected_divergence_reasons = Vec::new();
+
+    for comparison in &result.field_comparisons {
+        if comparison.divergence_reason.is_some()
+            && !EXPECTED_DIVERGENCE_FIELDS.contains(&comparison.field_name.as_str())
+        {
+            unexpected_divergence_reasons.push(format!(
+                "{}: {}",
+                comparison.field_name,
+                comparison.divergence_reason.as_deref().unwrap_or("missing reason")
+            ));
+        }
+
+        if !comparison.matches && comparison.divergence_reason.is_none() {
+            unexpected.push(format!(
+                "{}: Rust={:?}, Spark={:?}",
+                comparison.field_name, comparison.rust_value, comparison.spark_value
+            ));
+        }
+    }
+
+    assert!(
+        unexpected_divergence_reasons.is_empty(),
+        "Unexpected divergence reasons for {}:\n{}",
+        result.operation,
+        unexpected_divergence_reasons.join("\n")
+    );
+
+    assert!(
+        unexpected.is_empty(),
+        "Unexpected divergences for {}:\n{}\n\n{}",
+        result.operation,
+        unexpected.join("\n"),
+        result.summary()
+    );
+}
+
+fn assert_error_contains(message: &str, expected_fragments: &[&str], context: &str) {
+    let message_lower = message.to_lowercase();
+    let matches = expected_fragments.iter().any(|fragment| {
+        let fragment_lower = fragment.to_lowercase();
+        message_lower.contains(&fragment_lower)
+    });
+
+    assert!(
+        matches,
+        "{context} error did not contain expected fragment(s) {:?}. Error: {}",
+        expected_fragments,
+        message
+    );
+}
+
+fn assert_rust_schema_rejection(err: &iceberg::Error, expected_fragments: &[&str]) {
+    assert_eq!(
+        err.kind(),
+        ErrorKind::DataInvalid,
+        "Rust schema update error kind mismatch: {err}"
+    );
+    assert_error_contains(err.message(), expected_fragments, "Rust schema update");
+}
+
+fn assert_spark_schema_rejection(err: &SparkValidationError, expected_fragments: &[&str]) {
+    assert_error_contains(&err.message, expected_fragments, "Spark schema update");
+}
+
+fn is_zero_or_none(value: Option<&String>) -> bool {
+    match value {
+        None => true,
+        Some(value) => {
+            let trimmed = value.trim();
+            trimmed == "0" || trimmed == "0.0"
+        }
+    }
+}
+
+fn summary_is_noop(summary: &SnapshotSummaryResult) -> bool {
+    let Some(fields) = summary.summary.as_ref() else {
+        return false;
+    };
+
+    let zero_fields = [
+        fields.added_data_files.as_ref(),
+        fields.deleted_data_files.as_ref(),
+        fields.added_records.as_ref(),
+        fields.deleted_records.as_ref(),
+        fields.added_delete_files.as_ref(),
+        fields.removed_delete_files.as_ref(),
+        fields.added_position_deletes.as_ref(),
+        fields.removed_position_deletes.as_ref(),
+        fields.added_equality_deletes.as_ref(),
+        fields.removed_equality_deletes.as_ref(),
+        fields.added_files_size.as_ref(),
+        fields.removed_files_size.as_ref(),
+        fields.changed_partition_count.as_ref(),
+    ];
+
+    zero_fields.into_iter().all(is_zero_or_none)
+}
+
 fn manifest_status_to_i32(status: ManifestStatus) -> i32 {
     match status {
         ManifestStatus::Existing => 0,
@@ -523,8 +635,8 @@ fn compare_manifest_entries(
         .iter()
         .map(|entry| entry.status.unwrap_or(-1))
         .collect();
-    let rust_statuses_str = format!("{rust_statuses:?}");
-    let spark_statuses_str = format!("{spark_statuses:?}");
+    let rust_statuses_str = format!("{:?}", rust_statuses);
+    let spark_statuses_str = format!("{:?}", spark_statuses);
     comparisons.push(compare_field(
         "status-sequence",
         Some(&rust_statuses_str),
@@ -543,8 +655,8 @@ fn compare_manifest_entries(
                 .unwrap_or(-1)
         })
         .collect();
-    let rust_contents_str = format!("{rust_contents:?}");
-    let spark_contents_str = format!("{spark_contents:?}");
+    let rust_contents_str = format!("{:?}", rust_contents);
+    let spark_contents_str = format!("{:?}", spark_contents);
     comparisons.push(compare_field(
         "content-sequence",
         Some(&rust_contents_str),
@@ -554,8 +666,8 @@ fn compare_manifest_entries(
 
     let rust_partition_counts = partition_multiset_from_rust(rust_entries);
     let spark_partition_counts = partition_multiset_from_spark(spark_entry_list);
-    let rust_partitions_str = format!("{rust_partition_counts:?}");
-    let spark_partitions_str = format!("{spark_partition_counts:?}");
+    let rust_partitions_str = format!("{:?}", rust_partition_counts);
+    let spark_partitions_str = format!("{:?}", spark_partition_counts);
     comparisons.push(compare_field(
         "partition-values",
         Some(&rust_partitions_str),
@@ -736,6 +848,8 @@ async fn test_semantic_parity_delete() {
             .await
             .unwrap();
 
+
+
     let deleted_count = rust_provider
         .delete(&ctx.state(), Some(col("value").gt(lit(300))))
         .await
@@ -779,17 +893,7 @@ async fn test_semantic_parity_delete() {
         }
     }
 
-    // For initial implementation, we log divergences rather than fail.
-    // This test documents current behavior for the findings report.
-    // Once we understand expected divergences, we can tighten assertions.
-    println!(
-        "\nSemantic parity result: {}",
-        if parity_result.semantic_parity {
-            "PASS"
-        } else {
-            "DIVERGENCE (see above)"
-        }
-    );
+    assert_parity_expected_divergences(&parity_result);
 }
 
 /// Test snapshot summary extraction from Spark-created tables.
@@ -913,14 +1017,14 @@ async fn test_edge_case_empty_delete() {
 
     // Get initial snapshot count
     let table_before = client
-        .load_table(&TableIdent::from_strs(["default", "parity_delete_rust"]).unwrap())
+        .load_table(&TableIdent::from_strs(["default", "parity_delete_empty_rust"]).unwrap())
         .await
         .unwrap();
     let initial_snapshot_count = table_before.metadata().snapshots().count();
 
     // Perform DELETE that matches nothing (value > 10000, but max is 500)
     let rust_provider =
-        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_delete_rust")
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_delete_empty_rust")
             .await
             .unwrap();
 
@@ -933,19 +1037,19 @@ async fn test_edge_case_empty_delete() {
 
     // Check if a new snapshot was created
     let table_after = client
-        .load_table(&TableIdent::from_strs(["default", "parity_delete_rust"]).unwrap())
+        .load_table(&TableIdent::from_strs(["default", "parity_delete_empty_rust"]).unwrap())
         .await
         .unwrap();
     let final_snapshot_count = table_after.metadata().snapshots().count();
 
     let spark_before =
-        spark_snapshot_summary_with_container(&spark_container, "parity_delete_spark", None)
+        spark_snapshot_summary_with_container(&spark_container, "parity_delete_empty_spark", None)
             .await
             .expect("Spark snapshot summary should succeed");
 
     let spark_after = spark_execute_dml_with_container(
         &spark_container,
-        "parity_delete_spark",
+        "parity_delete_empty_spark",
         "delete",
         Some("value > 10000"),
         None,
@@ -953,20 +1057,37 @@ async fn test_edge_case_empty_delete() {
     .await
     .expect("Spark DELETE with no matches should succeed");
 
+    let rust_created_snapshot = final_snapshot_count > initial_snapshot_count;
+    let rust_noop_snapshot = if rust_created_snapshot {
+        summary_is_noop(&extract_rust_snapshot_summary(&table_after))
+    } else {
+        false
+    };
+
+    let spark_snapshot_changed = spark_before.snapshot_id != spark_after.snapshot_id;
+    let spark_noop_snapshot = if spark_snapshot_changed {
+        summary_is_noop(&spark_after)
+    } else {
+        false
+    };
+
     println!("\nEmpty DELETE behavior:");
     println!("  Initial snapshots: {}", initial_snapshot_count);
     println!("  Final snapshots: {}", final_snapshot_count);
-    println!(
-        "  New snapshot created: {}",
-        final_snapshot_count > initial_snapshot_count
-    );
-    println!(
-        "  Spark snapshot changed: {}",
-        spark_before.snapshot_id != spark_after.snapshot_id
-    );
+    println!("  New snapshot created: {}", rust_created_snapshot);
+    println!("  Rust snapshot is no-op: {}", rust_noop_snapshot);
+    println!("  Spark snapshot changed: {}", spark_snapshot_changed);
+    println!("  Spark snapshot is no-op: {}", spark_noop_snapshot);
 
-    // Document the behavior - some implementations create a no-op snapshot,
-    // others skip creating a snapshot entirely. Both are valid.
+    assert!(
+        (!rust_created_snapshot || rust_noop_snapshot)
+            && (!spark_snapshot_changed || spark_noop_snapshot),
+        "Empty DELETE should be a no-op (no new snapshot or a no-op snapshot). rust_created_snapshot={}, rust_noop_snapshot={}, spark_snapshot_changed={}, spark_noop_snapshot={}",
+        rust_created_snapshot,
+        rust_noop_snapshot,
+        spark_snapshot_changed,
+        spark_noop_snapshot
+    );
 }
 
 /// Test NULL handling semantic parity.
@@ -1036,14 +1157,78 @@ async fn test_semantic_parity_null_handling() {
         }
     }
 
-    println!(
-        "\nNULL handling parity result: {}",
-        if parity_result.semantic_parity {
-            "PASS"
-        } else {
-            "DIVERGENCE (see above)"
-        }
+    assert_parity_expected_divergences(&parity_result);
+}
+
+/// Test three-valued logic parity: predicates with NULL comparisons.
+#[tokio::test]
+async fn test_semantic_parity_three_valued_logic() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let ctx = SessionContext::new();
+    let namespace = iceberg::NamespaceIdent::new("default".to_string());
+    let spark_container = fixture.spark_container_name();
+
+    let rust_provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "parity_three_valued_rust",
+    )
+    .await
+    .unwrap();
+
+    let predicate = col("name")
+        .eq(lit("alpha"))
+        .or(col("name").not_eq(lit("alpha")));
+    let deleted_count = rust_provider
+        .delete(&ctx.state(), Some(predicate))
+        .await
+        .expect("Rust DELETE with three-valued logic should succeed");
+
+    assert_eq!(deleted_count, 2, "Rust should delete 2 non-null rows");
+
+    let rust_table = client
+        .load_table(&TableIdent::from_strs(["default", "parity_three_valued_rust"]).unwrap())
+        .await
+        .unwrap();
+
+    let rust_summary = extract_rust_snapshot_summary(&rust_table);
+
+    let spark_summary = spark_execute_dml_with_container(
+        &spark_container,
+        "parity_three_valued_spark",
+        "delete",
+        Some("name = 'alpha' OR name <> 'alpha'"),
+        None,
+    )
+    .await
+    .expect("Spark DELETE with three-valued logic should succeed");
+
+    let parity_result = compare_snapshot_summaries(
+        "DELETE (three-valued logic)",
+        &rust_summary,
+        &spark_summary,
     );
+
+    println!("\n{}\n", parity_result.summary());
+
+    let divergences = parity_result.divergences();
+    if !divergences.is_empty() {
+        println!("THREE-VALUED LOGIC DIVERGENCES:");
+        for d in &divergences {
+            println!(
+                "  - {}: Rust={:?}, Spark={:?}",
+                d.field_name, d.rust_value, d.spark_value
+            );
+        }
+    }
+
+    assert_parity_expected_divergences(&parity_result);
 }
 
 /// Test UPDATE semantic parity: compare Rust UPDATE vs Spark UPDATE metadata.
@@ -1108,6 +1293,8 @@ async fn test_semantic_parity_update() {
             );
         }
     }
+
+    assert_parity_expected_divergences(&parity_result);
 }
 
 /// Test MERGE semantic parity: compare Rust MERGE vs Spark MERGE metadata.
@@ -1186,7 +1373,6 @@ async fn test_semantic_parity_merge() {
  WHEN NOT MATCHED THEN INSERT *
  "#;
 
-
     let spark_summary =
         spark_execute_sql_with_container(&spark_container, "parity_merge_spark", merge_sql)
             .await
@@ -1205,6 +1391,8 @@ async fn test_semantic_parity_merge() {
             );
         }
     }
+
+    assert_parity_expected_divergences(&parity_result);
 }
 
 /// Test compaction semantic parity: compare Rust compaction vs Spark rewrite_data_files metadata.
@@ -1257,6 +1445,8 @@ async fn test_semantic_parity_compaction() {
             );
         }
     }
+
+    assert_parity_expected_divergences(&parity_result);
 }
 
 /// Test expire snapshots semantic parity: compare Rust expire_snapshots vs Spark expire_snapshots metadata.
@@ -1305,6 +1495,8 @@ async fn test_semantic_parity_expire_snapshots() {
             );
         }
     }
+
+    assert_parity_expected_divergences(&parity_result);
 }
 
 /// Test boundary value parity: min/max integers and empty strings.
@@ -1370,6 +1562,80 @@ async fn test_semantic_parity_boundary_values() {
             );
         }
     }
+
+    assert_parity_expected_divergences(&parity_result);
+}
+
+/// Test zero-length binary semantic parity.
+#[tokio::test]
+async fn test_semantic_parity_zero_length_binary() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let ctx = SessionContext::new();
+    let namespace = iceberg::NamespaceIdent::new("default".to_string());
+    let spark_container = fixture.spark_container_name();
+
+    let rust_provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_binary_rust")
+            .await
+            .unwrap();
+
+    let payload_type = rust_provider
+        .schema()
+        .field_with_name("payload")
+        .expect("payload field should exist")
+        .data_type()
+        .clone();
+
+    let empty_binary = match payload_type {
+        DataType::Binary => ScalarValue::Binary(Some(Vec::new())),
+        DataType::LargeBinary => ScalarValue::LargeBinary(Some(Vec::new())),
+        other => panic!("Unexpected payload type for parity_binary_rust: {other:?}"),
+    };
+    let deleted_count = rust_provider
+        .delete(&ctx.state(), Some(col("payload").eq(lit(empty_binary))))
+        .await
+        .expect("Rust DELETE with empty binary should succeed");
+
+    assert_eq!(deleted_count, 1, "Rust should delete 1 empty binary row");
+
+    let rust_table = client
+        .load_table(&TableIdent::from_strs(["default", "parity_binary_rust"]).unwrap())
+        .await
+        .unwrap();
+    let rust_summary = extract_rust_snapshot_summary(&rust_table);
+
+    let spark_summary = spark_execute_dml_with_container(
+        &spark_container,
+        "parity_binary_spark",
+        "delete",
+        Some("payload = CAST('' AS BINARY)"),
+        None,
+    )
+    .await
+    .expect("Spark DELETE with empty binary should succeed");
+
+    let parity_result =
+        compare_snapshot_summaries("DELETE (zero-length binary)", &rust_summary, &spark_summary);
+
+    println!("\n{}\n", parity_result.summary());
+    let divergences = parity_result.divergences();
+    if !divergences.is_empty() {
+        println!("ZERO-LENGTH BINARY DIVERGENCES:");
+        for d in &divergences {
+            println!(
+                "  - {}: Rust={:?}, Spark={:?}",
+                d.field_name, d.rust_value, d.spark_value
+            );
+        }
+    }
+
+    assert_parity_expected_divergences(&parity_result);
 }
 
 /// Test empty partition behavior and manifest entry parity after DELETE.
@@ -1429,6 +1695,8 @@ async fn test_semantic_parity_empty_partition_delete() {
         }
     }
 
+    assert_parity_expected_divergences(&parity_result);
+
     let rust_entries = extract_rust_manifest_entries(&rust_table)
         .await
         .expect("Rust manifest entry extraction should succeed");
@@ -1440,4 +1708,242 @@ async fn test_semantic_parity_empty_partition_delete() {
     let manifest_parity =
         compare_manifest_entries("DELETE (empty partition)", &rust_entries, &spark_entries);
     println!("\n{}\n", manifest_parity.summary());
+
+    assert!(
+        manifest_parity.semantic_parity,
+        "Manifest parity failed for {}",
+        manifest_parity.operation
+    );
+}
+
+/// Error rejection parity: adding an existing column should fail.
+#[tokio::test]
+async fn test_error_rejection_add_existing_column() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table = client
+        .load_table(&TableIdent::from_strs(["default", "parity_schema_add_existing_rust"]).unwrap())
+        .await
+        .unwrap();
+
+    let tx = Transaction::new(&table);
+    let apply_result = tx
+        .update_schema()
+        .add_column("id", Type::Primitive(PrimitiveType::Int))
+        .apply(tx);
+
+    let rust_err = match apply_result {
+        Ok(tx) => tx
+            .commit(client.as_ref())
+            .await
+            .expect_err("Rust should reject adding existing column"),
+        Err(err) => err,
+    };
+    assert_rust_schema_rejection(&rust_err, &["already exists"]);
+
+    let spark_container = fixture.spark_container_name();
+    let spark_result = spark_execute_sql_with_container(
+        &spark_container,
+        "parity_schema_add_existing_spark",
+        "ALTER TABLE {table} ADD COLUMNS (id INT)",
+    )
+    .await;
+    let spark_err = spark_result.expect_err("Spark should reject adding existing column");
+    assert_spark_schema_rejection(
+        &spark_err,
+        &["column_already_exists", "already exists", "duplicate column"],
+    );
+}
+
+/// Error rejection parity: renaming to an existing column should fail.
+#[tokio::test]
+async fn test_error_rejection_rename_to_existing_column() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table = client
+        .load_table(&TableIdent::from_strs(["default", "parity_schema_rename_existing_rust"]).unwrap())
+        .await
+        .unwrap();
+
+    let tx = Transaction::new(&table);
+    let apply_result = tx
+        .update_schema()
+        .rename_column("id", "name")
+        .apply(tx);
+
+    let rust_err = match apply_result {
+        Ok(tx) => tx
+            .commit(client.as_ref())
+            .await
+            .expect_err("Rust should reject renaming to an existing column"),
+        Err(err) => err,
+    };
+    assert_rust_schema_rejection(&rust_err, &["already exists"]);
+
+    let spark_container = fixture.spark_container_name();
+    let spark_result = spark_execute_sql_with_container(
+        &spark_container,
+        "parity_schema_rename_existing_spark",
+        "ALTER TABLE {table} RENAME COLUMN id TO name",
+    )
+    .await;
+    let spark_err = spark_result.expect_err("Spark should reject renaming to an existing column");
+    assert_spark_schema_rejection(
+        &spark_err,
+        &["column_already_exists", "already exists", "duplicate column"],
+    );
+}
+
+#[tokio::test]
+async fn test_error_rejection_drop_missing_column() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table = client
+        .load_table(&TableIdent::from_strs(["default", "parity_schema_drop_missing_rust"]).unwrap())
+        .await
+        .unwrap();
+
+    let tx = Transaction::new(&table);
+    let apply_result = tx.update_schema().drop_column("missing_column").apply(tx);
+
+    let rust_err = match apply_result {
+        Ok(tx) => tx
+            .commit(client.as_ref())
+            .await
+            .expect_err("Rust should reject dropping a missing column"),
+        Err(err) => err,
+    };
+    assert_rust_schema_rejection(&rust_err, &["does not exist", "not exist"]);
+
+    let spark_container = fixture.spark_container_name();
+    let spark_result = spark_execute_sql_with_container(
+        &spark_container,
+        "parity_schema_drop_missing_spark",
+        "ALTER TABLE {table} DROP COLUMN missing_column",
+    )
+    .await;
+    let spark_err = spark_result.expect_err("Spark should reject dropping a missing column");
+    assert_spark_schema_rejection(
+        &spark_err,
+        &["missing field", "does not exist", "not found", "cannot resolve"],
+    );
+}
+
+#[tokio::test]
+async fn test_error_rejection_rename_missing_column() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table = client
+        .load_table(&TableIdent::from_strs(["default", "parity_schema_rename_missing_rust"]).unwrap())
+        .await
+        .unwrap();
+
+    let tx = Transaction::new(&table);
+    let apply_result = tx
+        .update_schema()
+        .rename_column("missing_column", "new_name")
+        .apply(tx);
+
+    let rust_err = match apply_result {
+        Ok(tx) => tx
+            .commit(client.as_ref())
+            .await
+            .expect_err("Rust should reject renaming a missing column"),
+        Err(err) => err,
+    };
+    assert_rust_schema_rejection(&rust_err, &["does not exist", "not exist"]);
+
+    let spark_container = fixture.spark_container_name();
+    let spark_result = spark_execute_sql_with_container(
+        &spark_container,
+        "parity_schema_rename_missing_spark",
+        "ALTER TABLE {table} RENAME COLUMN missing_column TO new_name",
+    )
+    .await;
+    let spark_err = spark_result.expect_err("Spark should reject renaming a missing column");
+    assert_spark_schema_rejection(
+        &spark_err,
+        &["missing field", "does not exist", "not found", "cannot resolve"],
+    );
+}
+
+#[tokio::test]
+async fn test_error_rejection_incompatible_type_promotion() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let ctx = SessionContext::new();
+    let namespace = iceberg::NamespaceIdent::new("default".to_string());
+
+    let provider =
+        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_schema_incompatible_rust")
+            .await
+            .unwrap();
+
+    let rust_result = provider
+        .update()
+        .await
+        .unwrap()
+        .set("value", lit("not-a-number"))
+        .filter(col("id").eq(lit(1)))
+        .execute(&ctx.state())
+        .await;
+
+    let rust_err = rust_result.expect_err("Rust should reject incompatible type update");
+    let rust_message = rust_err.to_string();
+    assert_error_contains(
+        &rust_message,
+        &[
+            "column types must match schema types",
+            "expected int32",
+            "found utf8",
+            "transformed batch",
+            "schema evolution cast",
+        ],
+        "Rust update",
+    );
+
+    let spark_container = fixture.spark_container_name();
+    let spark_result = spark_execute_sql_with_container(
+        &spark_container,
+        "parity_schema_incompatible_spark",
+        "UPDATE {table} SET value = 'not-a-number' WHERE id = 1",
+    )
+    .await;
+    let spark_err = spark_result.expect_err("Spark should reject incompatible type update");
+    assert_error_contains(
+        &spark_err.message,
+        &[
+            "cannot safely cast",
+            "cannot cast",
+            "cannot parse",
+            "number format",
+            "for input string",
+        ],
+        "Spark update",
+    );
 }

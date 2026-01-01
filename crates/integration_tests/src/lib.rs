@@ -18,6 +18,7 @@
 pub mod spark_validator;
 
 use std::collections::HashMap;
+use std::env;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -28,7 +29,17 @@ use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_test_utils::docker::{DockerCompose, skip_if_docker_unavailable};
 use iceberg_test_utils::{normalize_test_name, set_up};
 
-const REST_CATALOG_PORT: u16 = 8181;
+const DEFAULT_REST_CATALOG_PORT: u16 = 8181;
+const DEFAULT_MINIO_PORT: u16 = 9000;
+const REST_CATALOG_PORT_ENV: &str = "ICEBERG_TEST_REST_PORT";
+const MINIO_PORT_ENV: &str = "ICEBERG_TEST_MINIO_PORT";
+
+fn env_port(var: &str, default: u16) -> u16 {
+    env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(default)
+}
 
 pub struct TestFixture {
     pub _docker_compose: DockerCompose,
@@ -40,8 +51,6 @@ impl TestFixture {
         self._docker_compose.container_name("spark-iceberg")
     }
 }
-
-const MINIO_PORT: u16 = 9000;
 
 pub fn set_test_fixture(func: &str) -> TestFixture {
     set_up();
@@ -55,16 +64,19 @@ pub fn set_test_fixture(func: &str) -> TestFixture {
     docker_compose.down();
     docker_compose.up();
 
+    let rest_port = env_port(REST_CATALOG_PORT_ENV, DEFAULT_REST_CATALOG_PORT);
+    let minio_port = env_port(MINIO_PORT_ENV, DEFAULT_MINIO_PORT);
+
     // Use localhost with port mappings for macOS compatibility.
     // Container IPs aren't accessible from host on macOS (Docker runs in VM).
     let catalog_config = HashMap::from([
         (
             REST_CATALOG_PROP_URI.to_string(),
-            format!("http://localhost:{REST_CATALOG_PORT}"),
+            format!("http://localhost:{rest_port}"),
         ),
         (
             S3_ENDPOINT.to_string(),
-            format!("http://localhost:{MINIO_PORT}"),
+            format!("http://localhost:{minio_port}"),
         ),
         (S3_ACCESS_KEY_ID.to_string(), "admin".to_string()),
         (S3_SECRET_ACCESS_KEY.to_string(), "password".to_string()),

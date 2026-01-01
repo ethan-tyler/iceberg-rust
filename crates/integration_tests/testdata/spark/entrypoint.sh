@@ -30,4 +30,9 @@ echo "Finished provisioning"
 touch /tmp/ready
 
 echo "Print logs"
-tail -f $SPARK_HOME/logs/*
+if compgen -G "${SPARK_HOME}/logs/*" > /dev/null; then
+    tail -f "${SPARK_HOME}"/logs/*
+else
+    echo "No Spark logs found in ${SPARK_HOME}/logs"
+    tail -f /dev/null
+fi

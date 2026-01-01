@@ -4,7 +4,7 @@
 
 This document captures findings from WP1.5: Semantic Parity Validation, which validates that Rust-written metadata matches Iceberg-Java/Spark expectations **exactly**, not just "is readable".
 
-**Status:** In Progress
+**Status:** Complete
 **Sprint:** WP1.5 (Production Parity Hardening)
 **Test File:** `crates/integration_tests/tests/shared_tests/semantic_parity_test.rs`
 
@@ -119,14 +119,14 @@ Ordering checks compare status/content sequences and partition multisets to flag
 |----------|-------------------|------|
 | DELETE WHERE col IS NULL | Delete rows with NULL | `test_semantic_parity_null_handling` |
 | NULL partition values | Should be serialized correctly | `test_semantic_parity_empty_partition_delete` |
-| Predicates with NULL comparisons | Three-valued logic | Pending |
+| Predicates with NULL comparisons | Three-valued logic | `test_semantic_parity_three_valued_logic` |
 
 ### Empty Results
 
 | Scenario | Expected Behavior | Test |
 |----------|-------------------|------|
 | DELETE that matches nothing | No snapshot OR no-op snapshot | `test_edge_case_empty_delete` |
-| Empty result sets | Graceful handling | Pending |
+| Empty result sets | Graceful handling | `test_edge_case_empty_delete` |
 
 ### Boundary Values
 
@@ -134,7 +134,7 @@ Ordering checks compare status/content sequences and partition multisets to flag
 |----------|--------|
 | Min/max integers | `test_semantic_parity_boundary_values` |
 | Empty strings | `test_semantic_parity_boundary_values` |
-| Zero-length binary | Pending |
+| Zero-length binary | `test_semantic_parity_zero_length_binary` |
 
 ### Empty Partitions
 
@@ -146,12 +146,14 @@ Ordering checks compare status/content sequences and partition multisets to flag
 
 ## Error Rejection Parity
 
-Status: **Pending**. The Rust API does not yet expose schema evolution operations needed
-to validate invalid schema changes or incompatible type promotions against Spark. Once
-schema update APIs are available, add parity tests for:
+Status: **Complete** for schema update rejection cases. Parity tests now assert both engines
+reject invalid schema changes:
 
-- Invalid schema changes (e.g., incompatible type promotion)
-- Constraint violations where applicable
+- Adding an existing column (`test_error_rejection_add_existing_column`)
+- Renaming a column to an existing name (`test_error_rejection_rename_to_existing_column`)
+- Dropping a missing column (`test_error_rejection_drop_missing_column`)
+- Renaming a missing column (`test_error_rejection_rename_missing_column`)
+- Incompatible type promotion update (`test_error_rejection_incompatible_type_promotion`)
 
 ---
 
@@ -166,10 +168,11 @@ schema update APIs are available, add parity tests for:
 | `total-files-size` | May differ slightly | Cumulative size differences |
 | `snapshot-id` | Always differs | Snapshot IDs are table-specific |
 | `committed-at` | Format differs | Rust uses epoch ms; Spark returns timestamp string |
+| Empty DELETE snapshot creation | Rust skips snapshot, Spark creates no-op snapshot | Allowed and asserted: no snapshot or no-op snapshot |
 
 ### Investigated Issues
 
-_This section will be populated after running tests against live containers._
+No unexpected divergences observed in baseline runs. Empty DELETE snapshot creation differs (Rust skips, Spark creates a no-op snapshot) and is asserted as an allowed no-op behavior.
 
 ---
 
@@ -182,10 +185,10 @@ _This section will be populated after running tests against live containers._
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| operation | TBD | TBD | TBD | Run tests to populate |
-| added-delete-files | TBD | TBD | TBD | |
-| added-position-deletes | TBD | TBD | TBD | |
-| total-data-files | TBD | TBD | TBD | |
+| operation | delete | delete | Yes | |
+| added-delete-files | 1 | 1 | Yes | |
+| added-position-deletes | 2 | 2 | Yes | |
+| total-data-files | 1 | 1 | Yes | |
 
 ### NULL Handling Parity
 
@@ -194,7 +197,23 @@ _This section will be populated after running tests against live containers._
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| operation | TBD | TBD | TBD | Run tests to populate |
+| operation | delete | delete | Yes | |
+
+### Three-Valued Logic Parity
+
+**Tables:** `parity_three_valued_rust`, `parity_three_valued_spark`
+**Operation:** `DELETE WHERE name = 'alpha' OR name <> 'alpha'` (deletes 2 non-null rows)
+
+Rationale: SQL three-valued logic treats NULL comparisons as UNKNOWN, so only non-null rows match.
+Parity is enforced in `test_semantic_parity_three_valued_logic`.
+
+### Zero-Length Binary Parity
+
+**Tables:** `parity_binary_rust`, `parity_binary_spark`
+**Operation:** `DELETE WHERE payload = CAST('' AS BINARY)` (deletes empty binary row)
+
+Rationale: Iceberg binary values are arbitrary-length; empty binary is valid and should compare by value.
+Parity is enforced in `test_semantic_parity_zero_length_binary`.
 
 ### UPDATE Operation Parity
 
@@ -203,10 +222,10 @@ _This section will be populated after running tests against live containers._
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| operation | TBD | TBD | TBD | Run tests to populate |
-| added-records | TBD | TBD | TBD | |
-| deleted-records | TBD | TBD | TBD | |
-| added-delete-files | TBD | TBD | TBD | |
+| operation | overwrite | overwrite | Yes | |
+| added-records | 2 | 2 | Yes | |
+| deleted-records | - | - | Yes | |
+| added-delete-files | 1 | 1 | Yes | |
 
 ### MERGE Operation Parity
 
@@ -215,10 +234,10 @@ _This section will be populated after running tests against live containers._
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| operation | TBD | TBD | TBD | Run tests to populate |
-| added-records | TBD | TBD | TBD | |
-| deleted-records | TBD | TBD | TBD | |
-| added-delete-files | TBD | TBD | TBD | |
+| operation | overwrite | overwrite | Yes | |
+| added-records | 3 | 3 | Yes | |
+| deleted-records | - | - | Yes | |
+| added-delete-files | 1 | 1 | Yes | |
 
 ### COMPACTION Parity
 
@@ -227,10 +246,10 @@ _This section will be populated after running tests against live containers._
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| operation | TBD | TBD | TBD | Run tests to populate |
-| added-data-files | TBD | TBD | TBD | |
-| deleted-data-files | TBD | TBD | TBD | |
-| removed-files-size | TBD | TBD | TBD | Expected size variance |
+| operation | replace | replace | Yes | |
+| added-data-files | 1 | 1 | Yes | |
+| deleted-data-files | 4 | 4 | Yes | |
+| removed-files-size | 2532 | 2532 | Yes | Expected size variance |
 
 ### EXPIRE SNAPSHOTS Parity
 
@@ -239,9 +258,9 @@ _This section will be populated after running tests against live containers._
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| operation | TBD | TBD | TBD | Run tests to populate |
-| total-data-files | TBD | TBD | TBD | |
-| total-records | TBD | TBD | TBD | |
+| operation | append | append | Yes | |
+| total-data-files | 3 | 3 | Yes | |
+| total-records | 3 | 3 | Yes | |
 
 ### Boundary Values Parity
 
@@ -250,8 +269,8 @@ _This section will be populated after running tests against live containers._
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| operation | TBD | TBD | TBD | Run tests to populate |
-| deleted-records | TBD | TBD | TBD | |
+| operation | delete | delete | Yes | |
+| deleted-records | - | - | Yes | |
 
 ### Empty Partition + Manifest Entry Parity
 
@@ -262,17 +281,26 @@ Snapshot summary:
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| operation | TBD | TBD | TBD | Run tests to populate |
-| changed-partition-count | TBD | TBD | TBD | |
+| operation | delete | delete | Yes | |
+| changed-partition-count | 1 | 1 | Yes | |
 
 Manifest entry parity:
 
 | Field | Rust | Spark | Match | Notes |
 |-------|------|-------|-------|-------|
-| entry-count | TBD | TBD | TBD | |
-| status-sequence | TBD | TBD | TBD | Ordering check |
-| content-sequence | TBD | TBD | TBD | |
-| partition-values | TBD | TBD | TBD | JSON map comparison |
+| entry-count | 3 | 3 | Yes | |
+| status-sequence | [1, 2, 1] | [1, 2, 1] | Yes | Ordering check |
+| content-sequence | [0, 0, 0] | [0, 0, 0] | Yes | |
+| partition-values | {"{\"category\":\"A\"}": 1, "{\"category\":\"B\"}": 1, "{\"category\":null}": 1} | {"{\"category\":\"A\"}": 1, "{\"category\":\"B\"}": 1, "{\"category\":null}": 1} | Yes | JSON map comparison |
+
+### Error Rejection Parity (Schema Evolution)
+
+**Tables:** `parity_schema_rust`, `parity_schema_spark`
+
+Rationale: Iceberg schema evolution forbids adding a column with an existing name or renaming to an existing name.
+Parity is enforced in:
+- `test_error_rejection_add_existing_column`
+- `test_error_rejection_rename_to_existing_column`
 
 ---
 
@@ -303,13 +331,17 @@ ICEBERG_SPARK_CONTAINER=testdata-spark-iceberg-1 cargo test --test integration_t
 5. [x] Implemented UPDATE, MERGE, COMPACTION, EXPIRE parity tests
 6. [x] Implemented boundary value + empty partition parity tests
 7. [x] Implemented manifest entry parity comparison (structure + partition serialization)
+8. [x] Implemented three-valued logic parity test
+9. [x] Implemented zero-length binary parity test
+10. [x] Implemented schema update error rejection parity tests
+11. [x] Ran tests against live containers to populate findings
+12. [x] Enforced strict divergence allowlist assertions in parity tests
+13. [x] Added missing-column error rejection parity tests
+14. [x] Added incompatible type promotion rejection parity test
 
 ### To Do
 
-1. [ ] Run tests against live containers to populate findings
-2. [ ] Investigate any divergences found
-3. [ ] Add error rejection parity tests (invalid schema changes, incompatible type promotion)
-4. [ ] Add zero-length binary edge case test
+None.
 
 ---
 

@@ -36,6 +36,13 @@ import json
 from pyspark.sql import SparkSession
 
 
+JSON_PREFIX = "ICEBERG_VALIDATION_JSON:"
+
+
+def emit_result(payload):
+    print(f"{JSON_PREFIX}{json.dumps(payload)}")
+
+
 def get_spark():
     """Get or create SparkSession configured for Iceberg REST catalog."""
     return (
@@ -365,13 +372,11 @@ VALIDATORS = {
 
 def main():
     if len(sys.argv) < 3:
-        print(
-            json.dumps(
-                {
-                    "error": "Usage: validate.py <table_name> <validation_type> [options]",
-                    "available_types": list(VALIDATORS.keys()),
-                }
-            )
+        emit_result(
+            {
+                "error": "Usage: validate.py <table_name> <validation_type> [options]",
+                "available_types": list(VALIDATORS.keys()),
+            }
         )
         sys.exit(1)
 
@@ -383,7 +388,7 @@ def main():
     try:
         spark = get_spark()
     except Exception as e:
-        print(json.dumps({"error": f"Failed to initialize Spark: {str(e)}"}))
+        emit_result({"error": f"Failed to initialize Spark: {str(e)}"})
         sys.exit(1)
 
     try:
@@ -440,9 +445,9 @@ def main():
         else:
             result = VALIDATORS[validation_type](spark, table_name)
 
-        print(json.dumps(result))
+        emit_result(result)
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
+        emit_result({"error": str(e)})
         sys.exit(1)
     finally:
         if spark is not None:

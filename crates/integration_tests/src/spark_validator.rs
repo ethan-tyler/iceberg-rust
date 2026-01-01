@@ -38,6 +38,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -249,6 +250,7 @@ static SPARK_SUBMIT_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 const DEFAULT_SPARK_VALIDATE_TIMEOUT_SECS: u64 = 120;
 const SPARK_VALIDATE_TIMEOUT_ENV: &str = "ICEBERG_SPARK_VALIDATE_TIMEOUT_SECS";
 const SPARK_CONTAINER_ENV: &str = "ICEBERG_SPARK_CONTAINER";
+const VALIDATION_JSON_PREFIX: &str = "ICEBERG_VALIDATION_JSON:";
 
 fn validation_timeout() -> Duration {
     std::env::var(SPARK_VALIDATE_TIMEOUT_ENV)
@@ -271,27 +273,88 @@ async fn run_spark_submit(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let child = cmd.spawn().map_err(|e| SparkValidationError {
+    let mut child = cmd.spawn().map_err(|e| SparkValidationError {
         message: format!("Failed to execute docker exec: {e}"),
     })?;
 
-    // wait_with_output() consumes child, so if timeout expires the process may be orphaned.
-    // This is acceptable for test infrastructure - the container will clean up eventually.
-    match timeout(timeout_duration, child.wait_with_output()).await {
-        Ok(result) => result.map_err(|e| SparkValidationError {
-            message: format!("Failed to read spark-submit output: {e}"),
-        }),
-        Err(_) => Err(SparkValidationError {
-            message: format!(
-                "spark-submit timed out after {}s (container: {})",
-                timeout_duration.as_secs(),
-                container_name
-            ),
-        }),
+    let mut stdout = child.stdout.take().ok_or_else(|| SparkValidationError {
+        message: "Failed to capture spark-submit stdout".to_string(),
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| SparkValidationError {
+        message: "Failed to capture spark-submit stderr".to_string(),
+    })?;
+
+    let stdout_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await.map(|_| buf)
+    });
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).await.map(|_| buf)
+    });
+
+    match timeout(timeout_duration, child.wait()).await {
+        Ok(status) => {
+            let status = status.map_err(|e| SparkValidationError {
+                message: format!("Failed to wait on spark-submit: {e}"),
+            })?;
+            let stdout = stdout_handle
+                .await
+                .map_err(|e| SparkValidationError {
+                    message: format!("Failed to join spark-submit stdout: {e}"),
+                })?
+                .map_err(|e| SparkValidationError {
+                    message: format!("Failed to read spark-submit stdout: {e}"),
+                })?;
+            let stderr = stderr_handle
+                .await
+                .map_err(|e| SparkValidationError {
+                    message: format!("Failed to join spark-submit stderr: {e}"),
+                })?
+                .map_err(|e| SparkValidationError {
+                    message: format!("Failed to read spark-submit stderr: {e}"),
+                })?;
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_handle.abort();
+            stderr_handle.abort();
+            Err(SparkValidationError {
+                message: format!(
+                    "spark-submit timed out after {}s (container: {})",
+                    timeout_duration.as_secs(),
+                    container_name
+                ),
+            })
+        }
     }
 }
 
+fn prefixed_json(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix(VALIDATION_JSON_PREFIX)
+                .map(|json| json.trim())
+        })
+        .last()
+}
+
 fn parse_validation_output(stdout: &str) -> Result<ValidationResult, SparkValidationError> {
+    if let Some(json) = prefixed_json(stdout) {
+        return serde_json::from_str::<ValidationResult>(json).map_err(|e| SparkValidationError {
+            message: format!("Failed to parse Spark output JSON: {e}. Payload: {json}"),
+        });
+    }
+
     for line in stdout.lines().rev() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('{') {
@@ -555,6 +618,20 @@ pub async fn spark_snapshot_summary_with_container(
 fn parse_snapshot_summary_output(
     stdout: &str,
 ) -> Result<SnapshotSummaryResult, SparkValidationError> {
+    if let Some(json) = prefixed_json(stdout) {
+        let result = serde_json::from_str::<SnapshotSummaryResult>(json).map_err(|e| {
+            SparkValidationError {
+                message: format!("Failed to parse Spark output JSON: {e}. Payload: {json}"),
+            }
+        })?;
+        if let Some(ref error) = result.error {
+            return Err(SparkValidationError {
+                message: format!("Spark snapshot summary failed: {error}"),
+            });
+        }
+        return Ok(result);
+    }
+
     for line in stdout.lines().rev() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('{') {
@@ -618,6 +695,20 @@ pub async fn spark_manifest_entries_with_container(
 fn parse_manifest_entries_output(
     stdout: &str,
 ) -> Result<ManifestEntriesResult, SparkValidationError> {
+    if let Some(json) = prefixed_json(stdout) {
+        let result = serde_json::from_str::<ManifestEntriesResult>(json).map_err(|e| {
+            SparkValidationError {
+                message: format!("Failed to parse Spark output JSON: {e}. Payload: {json}"),
+            }
+        })?;
+        if let Some(ref error) = result.error {
+            return Err(SparkValidationError {
+                message: format!("Spark manifest entries failed: {error}"),
+            });
+        }
+        return Ok(result);
+    }
+
     for line in stdout.lines().rev() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('{') {

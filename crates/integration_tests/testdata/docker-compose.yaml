@@ -35,7 +35,7 @@ services:
     networks:
       rest_bridge:
     ports:
-      - 8181:8181
+      - ${ICEBERG_TEST_REST_PORT:-8181}:8181
     expose:
       - 8181
 
@@ -50,8 +50,8 @@ services:
     networks:
       rest_bridge:
     ports:
-      - 9000:9000
-      - 9001:9001
+      - ${ICEBERG_TEST_MINIO_PORT:-9000}:9000
+      - ${ICEBERG_TEST_MINIO_CONSOLE_PORT:-9001}:9001
     expose:
       - 9001
       - 9000
