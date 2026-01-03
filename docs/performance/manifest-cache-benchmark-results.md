@@ -2,11 +2,11 @@
 
 ## Summary
 
-Manifest caching provides large planning wins for small and medium profiles with the current 32MB default. The large profile thrashes at 32MB and 128MB, but a 256MB override yields a 100% hit rate and improves warm-cache planning latency.
+Manifest caching provides large planning wins for small and medium profiles with a 32MB baseline. The large profile thrashes at 32MB and 128MB, but a 160MB+ budget yields a 100% hit rate and improves warm-cache planning latency. The default is now 160MB.
 
 ## Setup
 
-- Commit: `a0faf9d32712aa9ebb1bafa70ac3b38e52751803`
+- Commit: `b1735ad0dea564dbd58d4a204051cc7757e46de4`
 - Rust: `rustc 1.89.0-nightly (be19eda0d 2025-06-22)`
 - Host: `Darwin 25.0.0 arm64` (Mac-7310.lan)
 - Commands:
@@ -17,7 +17,8 @@ Manifest caching provides large planning wins for small and medium profiles with
   - 192MB override: `ICEBERG_MANIFEST_CACHE_MAX_BYTES=201326592 cargo bench --bench scan_planning_benchmark -p iceberg -- --sample-size 10 --measurement-time 10 "scan_planning_plan_files_large/warm_cache"`
   - 224MB override: `ICEBERG_MANIFEST_CACHE_MAX_BYTES=234881024 cargo bench --bench scan_planning_benchmark -p iceberg -- --sample-size 10 --measurement-time 10 "scan_planning_plan_files_large/warm_cache"`
   - 256MB override: `ICEBERG_MANIFEST_CACHE_MAX_BYTES=268435456 cargo bench --bench scan_planning_benchmark -p iceberg -- --sample-size 10 --measurement-time 10 "scan_planning_plan_files_large/warm_cache"`
-- Cache defaults: enabled, 32MB max, 5min TTL
+- Cache defaults at measurement time: enabled, 32MB max, 5min TTL
+- Current cache defaults: enabled, 160MB max, 5min TTL
 - Profiles:
   - Small: 10 manifests x 10 entries (100 files), 200 iterations
   - Medium: 100 manifests x 100 entries (10,000 files), 100 iterations
@@ -58,7 +59,7 @@ Each iteration runs `TableScan::plan_files()` and consumes all tasks. Latencies 
 | warm_cache | 603209 | 608826 | 0.000 | 0 | 50050 | 50050 | 222 | 33527328 | 33554432 |
 
 Notes:
-- The large profile shows zero warm-cache hits with the default 32MB budget, indicating capacity thrash; warm-cache latency is effectively the same as cold/disabled.
+- The large profile shows zero warm-cache hits with a 32MB budget (pre-160MB default), indicating capacity thrash; warm-cache latency is effectively the same as cold/disabled.
 - Criterion large warm-cache (32MB, sample-size 10, measurement-time 15s): `time: [607.13 ms 608.30 ms 609.50 ms]`.
 
 ## 128MB Override Results
@@ -235,7 +236,7 @@ Iceberg Rust uses different property names and defaults than Iceberg Java:
 | Property | Iceberg Java | Iceberg Rust |
 | --- | --- | --- |
 | Enable cache | `io.manifest.cache-enabled` = false | `iceberg.io.manifest.cache-enabled` = true |
-| Max size | `io.manifest.cache.max-total-bytes` = 100MB | `iceberg.io.manifest.cache.max-total-bytes` = 32MB |
+| Max size | `io.manifest.cache.max-total-bytes` = 100MB | `iceberg.io.manifest.cache.max-total-bytes` = 160MB |
 | TTL | `io.manifest.cache.expiration-interval-ms` = 60s | `iceberg.io.manifest.cache.expiration-interval-ms` = 300s |
 
 The recommended Rust defaults above are based on the benchmarks in this document.
