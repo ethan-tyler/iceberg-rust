@@ -2925,8 +2925,7 @@ async fn test_time_travel_snapshot_id() -> Result<()> {
 
     // Query historical snapshot using @v<snapshot_id> syntax - should return 1 row
     let historical_sql = format!(
-        "SELECT * FROM \"catalog\".\"test_time_travel_snapshot\".\"tt_table@v{}\" ORDER BY foo1",
-        snapshot1_id
+        "SELECT * FROM \"catalog\".\"test_time_travel_snapshot\".\"tt_table@v{snapshot1_id}\" ORDER BY foo1"
     );
     let historical_df = ctx.sql(&historical_sql).await.unwrap();
     let historical_batches = historical_df.collect().await.unwrap();
@@ -3023,8 +3022,7 @@ async fn test_time_travel_timestamp() -> Result<()> {
 
     // Query using timestamp that matches snapshot 1 exactly
     let ts_sql = format!(
-        "SELECT * FROM \"catalog\".\"test_time_travel_ts\".\"ts_table@ts{}\" ORDER BY foo1",
-        snapshot1_ts
+        "SELECT * FROM \"catalog\".\"test_time_travel_ts\".\"ts_table@ts{snapshot1_ts}\" ORDER BY foo1"
     );
     let ts_df = ctx.sql(&ts_sql).await.unwrap();
     let ts_batches = ts_df.collect().await.unwrap();
@@ -3045,8 +3043,7 @@ async fn test_time_travel_timestamp() -> Result<()> {
 
     // Query using TIMESTAMP AS OF with a string literal - should return 1 row
     let timestamp_sql = format!(
-        "SELECT * FROM catalog.test_time_travel_ts.ts_table TIMESTAMP AS OF '{}' ORDER BY foo1",
-        snapshot1_ts_str
+        "SELECT * FROM catalog.test_time_travel_ts.ts_table TIMESTAMP AS OF '{snapshot1_ts_str}' ORDER BY foo1"
     );
     let timestamp_df = ctx.sql(&timestamp_sql).await.unwrap();
     let timestamp_batches = timestamp_df.collect().await.unwrap();
@@ -3055,9 +3052,8 @@ async fn test_time_travel_timestamp() -> Result<()> {
 
     // CTE with time travel
     let cte_sql = format!(
-        "WITH historical AS (SELECT * FROM catalog.test_time_travel_ts.ts_table TIMESTAMP AS OF '{}') \
-         SELECT count(*) FROM historical",
-        snapshot1_ts_str
+        "WITH historical AS (SELECT * FROM catalog.test_time_travel_ts.ts_table TIMESTAMP AS OF '{snapshot1_ts_str}') \
+         SELECT count(*) FROM historical"
     );
     let cte_batches = ctx.sql(&cte_sql).await.unwrap().collect().await.unwrap();
     let cte_count = cte_batches[0]
@@ -3122,11 +3118,10 @@ async fn test_time_travel_in_join() -> Result<()> {
             historical.foo2 as old_foo2,
             current.foo2 as new_foo2
         FROM catalog.test_time_travel_join.join_table AS current
-        JOIN "catalog"."test_time_travel_join"."join_table@v{}" AS historical
+        JOIN "catalog"."test_time_travel_join"."join_table@v{snapshot1_id}" AS historical
             ON current.foo1 = historical.foo1
         WHERE current.foo2 = 'new_value'
         ORDER BY current.foo1"#,
-        snapshot1_id
     );
 
     let join_df = ctx.sql(&join_sql).await.unwrap();
@@ -3209,8 +3204,7 @@ async fn test_time_travel_invalid_snapshot_id() -> Result<()> {
     let error_msg = result.unwrap_err().to_string();
     assert!(
         error_msg.contains("99999") && error_msg.contains("not found"),
-        "Error message should mention the invalid snapshot ID: {}",
-        error_msg
+        "Error message should mention the invalid snapshot ID: {error_msg}"
     );
 
     // Try VERSION AS OF with an invalid snapshot ID
@@ -3224,8 +3218,7 @@ async fn test_time_travel_invalid_snapshot_id() -> Result<()> {
     let version_error_msg = version_result.unwrap_err().to_string();
     assert!(
         version_error_msg.contains("99999") && version_error_msg.contains("not found"),
-        "VERSION AS OF error message should mention the invalid snapshot ID: {}",
-        version_error_msg
+        "VERSION AS OF error message should mention the invalid snapshot ID: {version_error_msg}"
     );
 
     Ok(())
@@ -3267,8 +3260,7 @@ async fn test_time_travel_timestamp_too_early() -> Result<()> {
     let error_msg = result.unwrap_err().to_string();
     assert!(
         error_msg.contains("No snapshot found"),
-        "Error message should indicate no snapshot was found: {}",
-        error_msg
+        "Error message should indicate no snapshot was found: {error_msg}"
     );
 
     // Try TIMESTAMP AS OF with a timestamp before any snapshot
@@ -3281,8 +3273,7 @@ async fn test_time_travel_timestamp_too_early() -> Result<()> {
     let ts_error_msg = ts_result.unwrap_err().to_string();
     assert!(
         ts_error_msg.contains("No snapshot found"),
-        "TIMESTAMP AS OF error message should indicate no snapshot was found: {}",
-        ts_error_msg
+        "TIMESTAMP AS OF error message should indicate no snapshot was found: {ts_error_msg}"
     );
 
     Ok(())

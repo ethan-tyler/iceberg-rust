@@ -182,21 +182,21 @@ impl BenchFixture {
         });
 
         let mut table_metadata = serde_json::from_str::<TableMetadata>(&metadata_json).unwrap();
-        if let Ok(value) = env::var("ICEBERG_MANIFEST_CACHE_MAX_BYTES") {
-            if let Ok(cache_bytes) = value.parse::<u64>() {
-                let mut properties = HashMap::new();
-                properties.insert(
-                    MANIFEST_CACHE_MAX_TOTAL_BYTES.to_string(),
-                    cache_bytes.to_string(),
-                );
-                table_metadata = table_metadata
-                    .into_builder(None)
-                    .set_properties(properties)
-                    .unwrap()
-                    .build()
-                    .unwrap()
-                    .metadata;
-            }
+        if let Ok(value) = env::var("ICEBERG_MANIFEST_CACHE_MAX_BYTES")
+            && let Ok(cache_bytes) = value.parse::<u64>()
+        {
+            let mut properties = HashMap::new();
+            properties.insert(
+                MANIFEST_CACHE_MAX_TOTAL_BYTES.to_string(),
+                cache_bytes.to_string(),
+            );
+            table_metadata = table_metadata
+                .into_builder(None)
+                .set_properties(properties)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
         }
 
         let metadata = std::sync::Arc::new(table_metadata);
@@ -360,7 +360,11 @@ fn bench_scan_planning(c: &mut Criterion) {
     ];
 
     for profile in &profiles {
-        let fixture = BenchFixture::new(&runtime, profile.manifest_count, profile.entries_per_manifest);
+        let fixture = BenchFixture::new(
+            &runtime,
+            profile.manifest_count,
+            profile.entries_per_manifest,
+        );
 
         let warm_cache_table = fixture.build_table(false, None, None);
         let cold_cache_table = fixture.build_table(false, None, None);
@@ -385,8 +389,7 @@ fn bench_scan_planning(c: &mut Criterion) {
             print_measurement(profile, "warm_cache", &warm_metrics);
         });
 
-        let mut group =
-            c.benchmark_group(format!("scan_planning_plan_files_{}", profile.name));
+        let mut group = c.benchmark_group(format!("scan_planning_plan_files_{}", profile.name));
 
         group.bench_function("disabled_cache", |b| {
             b.to_async(&runtime).iter(|| async {

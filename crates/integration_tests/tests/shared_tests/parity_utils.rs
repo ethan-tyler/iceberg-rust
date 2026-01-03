@@ -17,14 +17,13 @@
 
 use std::collections::BTreeMap;
 
-use iceberg::spec::{DataContentType, ManifestStatus, Struct, StructType};
 use iceberg::ErrorKind;
-use serde_json::{Map as JsonMap, Value as JsonValue};
-
+use iceberg::spec::{DataContentType, ManifestStatus, Struct, StructType};
 use iceberg_integration_tests::spark_validator::{
     ManifestEntriesResult, ManifestEntryInfo, SnapshotSummaryFields, SnapshotSummaryResult,
     SparkValidationError,
 };
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 const EXPECTED_DIVERGENCE_FIELDS: &[&str] = &[
     "snapshot-id",
@@ -80,7 +79,11 @@ impl ParityResult {
         lines.push(String::new());
         lines.push(format!(
             "**Semantic Parity:** {}",
-            if self.semantic_parity { "PASS" } else { "**FAIL**" }
+            if self.semantic_parity {
+                "PASS"
+            } else {
+                "**FAIL**"
+            }
         ));
 
         lines.join("\n")
@@ -117,7 +120,11 @@ impl ManifestParityResult {
         lines.push(String::new());
         lines.push(format!(
             "**Semantic Parity:** {}",
-            if self.semantic_parity { "PASS" } else { "**FAIL**" }
+            if self.semantic_parity {
+                "PASS"
+            } else {
+                "**FAIL**"
+            }
         ));
 
         lines.join("\n")
@@ -297,9 +304,7 @@ pub(crate) fn compare_snapshot_summaries(
 }
 
 fn get_field<F>(fields: Option<&SnapshotSummaryFields>, getter: F) -> Option<String>
-where
-    F: Fn(&SnapshotSummaryFields) -> &Option<String>,
-{
+where F: Fn(&SnapshotSummaryFields) -> &Option<String> {
     fields.and_then(|f| getter(f).clone())
 }
 
@@ -330,7 +335,10 @@ pub(crate) fn assert_parity_expected_divergences(result: &ParityResult) {
             unexpected_divergence_reasons.push(format!(
                 "{}: {}",
                 comparison.field_name,
-                comparison.divergence_reason.as_deref().unwrap_or("missing reason")
+                comparison
+                    .divergence_reason
+                    .as_deref()
+                    .unwrap_or("missing reason")
             ));
         }
 
@@ -367,9 +375,7 @@ pub(crate) fn assert_error_contains(message: &str, expected_fragments: &[&str], 
 
     assert!(
         matches,
-        "{context} error did not contain expected fragment(s) {:?}. Error: {}",
-        expected_fragments,
-        message
+        "{context} error did not contain expected fragment(s) {expected_fragments:?}. Error: {message}"
     );
 }
 
@@ -560,8 +566,8 @@ pub(crate) fn compare_manifest_entries(
         .iter()
         .map(|entry| entry.status.unwrap_or(-1))
         .collect();
-    let rust_statuses_str = format!("{:?}", rust_statuses);
-    let spark_statuses_str = format!("{:?}", spark_statuses);
+    let rust_statuses_str = format!("{rust_statuses:?}");
+    let spark_statuses_str = format!("{spark_statuses:?}");
     comparisons.push(compare_field(
         "status-sequence",
         Some(&rust_statuses_str),
@@ -569,7 +575,10 @@ pub(crate) fn compare_manifest_entries(
         None,
     ));
 
-    let rust_contents: Vec<i32> = rust_sorted.iter().map(|entry| entry.data_file.content).collect();
+    let rust_contents: Vec<i32> = rust_sorted
+        .iter()
+        .map(|entry| entry.data_file.content)
+        .collect();
     let spark_contents: Vec<i32> = spark_sorted
         .iter()
         .map(|entry| {
@@ -580,8 +589,8 @@ pub(crate) fn compare_manifest_entries(
                 .unwrap_or(-1)
         })
         .collect();
-    let rust_contents_str = format!("{:?}", rust_contents);
-    let spark_contents_str = format!("{:?}", spark_contents);
+    let rust_contents_str = format!("{rust_contents:?}");
+    let spark_contents_str = format!("{spark_contents:?}");
     comparisons.push(compare_field(
         "content-sequence",
         Some(&rust_contents_str),
@@ -591,8 +600,8 @@ pub(crate) fn compare_manifest_entries(
 
     let rust_partition_counts = partition_multiset_from_rust(rust_entries);
     let spark_partition_counts = partition_multiset_from_spark(spark_entry_list);
-    let rust_partitions_str = format!("{:?}", rust_partition_counts);
-    let spark_partitions_str = format!("{:?}", spark_partition_counts);
+    let rust_partitions_str = format!("{rust_partition_counts:?}");
+    let spark_partitions_str = format!("{spark_partition_counts:?}");
     comparisons.push(compare_field(
         "partition-values",
         Some(&rust_partitions_str),

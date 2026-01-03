@@ -34,7 +34,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::DataFusionError;
@@ -45,6 +44,7 @@ use datafusion::logical_expr::dml::{DmlCapabilities, InsertOp};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use futures::StreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::expr::Predicate;
 use iceberg::inspect::MetadataTableType;
@@ -57,9 +57,9 @@ use crate::error::to_datafusion_error;
 use crate::merge::MergeBuilder;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::delete_commit::IcebergDeleteCommitExec;
-use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use crate::physical_plan::delete_scan::IcebergDeleteScanExec;
 use crate::physical_plan::delete_write::IcebergDeleteWriteExec;
+use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use crate::physical_plan::overwrite_commit::IcebergOverwriteCommitExec;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
@@ -168,16 +168,14 @@ impl IcebergTableProvider {
                 .map_err(to_datafusion_error)?,
         );
 
-        if let Some(filter) = predicate.as_ref() {
-            if self.is_partition_only_exact_filter(&current_schema, filter) {
-                if let Some(iceberg_predicate) =
-                    convert_filters_to_predicate(std::slice::from_ref(filter))
-                {
-                    return self
-                        .delete_by_partition_filter(&table, iceberg_predicate)
-                        .await;
-                }
-            }
+        if let Some(filter) = predicate.as_ref()
+            && self.is_partition_only_exact_filter(&current_schema, filter)
+            && let Some(iceberg_predicate) =
+                convert_filters_to_predicate(std::slice::from_ref(filter))
+        {
+            return self
+                .delete_by_partition_filter(&table, iceberg_predicate)
+                .await;
         }
 
         // Capture baseline snapshot ID for concurrency validation

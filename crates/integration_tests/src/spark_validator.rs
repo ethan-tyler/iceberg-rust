@@ -210,6 +210,57 @@ pub struct DataFileInfo {
     pub file_size_in_bytes: Option<i64>,
 }
 
+/// Result from $partitions metadata table validation.
+#[derive(Debug, Deserialize)]
+pub struct PartitionsTableResult {
+    pub error: Option<String>,
+    pub partition_count: Option<i64>,
+    pub schema_fields: Option<Vec<String>>,
+    pub partitions: Option<Vec<PartitionInfo>>,
+}
+
+/// Individual partition info from $partitions table.
+#[derive(Debug, Deserialize)]
+pub struct PartitionInfo {
+    pub partition: Option<serde_json::Value>,
+    pub spec_id: Option<i32>,
+    pub record_count: Option<i64>,
+    pub file_count: Option<i64>,
+    pub total_data_file_size_in_bytes: Option<i64>,
+    pub position_delete_record_count: Option<i64>,
+    pub position_delete_file_count: Option<i64>,
+    pub equality_delete_record_count: Option<i64>,
+    pub equality_delete_file_count: Option<i64>,
+}
+
+/// Result from $entries metadata table validation.
+#[derive(Debug, Deserialize)]
+pub struct EntriesTableResult {
+    pub error: Option<String>,
+    pub entry_count: Option<i64>,
+    pub schema_fields: Option<Vec<String>>,
+    pub entries: Option<Vec<EntryInfo>>,
+}
+
+/// Individual entry info from $entries table.
+#[derive(Debug, Deserialize)]
+pub struct EntryInfo {
+    pub status: Option<i32>,
+    pub snapshot_id: Option<i64>,
+    pub sequence_number: Option<i64>,
+    pub file_sequence_number: Option<i64>,
+    pub data_file: Option<EntryDataFileInfo>,
+}
+
+/// Data file info from $entries table entry.
+#[derive(Debug, Deserialize)]
+pub struct EntryDataFileInfo {
+    pub content: Option<i32>,
+    pub file_path: Option<String>,
+    pub record_count: Option<i64>,
+    pub partition: Option<serde_json::Value>,
+}
+
 /// Type of validation to perform.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationType {
@@ -345,7 +396,7 @@ fn prefixed_json(stdout: &str) -> Option<&str> {
                 .strip_prefix(VALIDATION_JSON_PREFIX)
                 .map(|json| json.trim())
         })
-        .last()
+        .next_back()
 }
 
 fn parse_validation_output(stdout: &str) -> Result<ValidationResult, SparkValidationError> {
@@ -824,4 +875,135 @@ pub async fn spark_execute_sql_with_container(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_snapshot_summary_output(&stdout)
+}
+
+pub async fn spark_partitions_table(
+    table_name: &str,
+) -> Result<PartitionsTableResult, SparkValidationError> {
+    let container_name = get_spark_container_name()?;
+    spark_partitions_table_with_container(&container_name, table_name).await
+}
+
+pub async fn spark_partitions_table_with_container(
+    container_name: &str,
+    table_name: &str,
+) -> Result<PartitionsTableResult, SparkValidationError> {
+    let args = spark_submit_args(container_name, table_name, "partitions_table", &[]);
+    let output = run_spark_submit(container_name, args).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(SparkValidationError {
+            message: format!("spark-submit failed.\nstdout: {stdout}\nstderr: {stderr}"),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_partitions_table_output(&stdout)
+}
+
+fn parse_partitions_table_output(
+    stdout: &str,
+) -> Result<PartitionsTableResult, SparkValidationError> {
+    if let Some(json) = prefixed_json(stdout) {
+        let result = serde_json::from_str::<PartitionsTableResult>(json).map_err(|e| {
+            SparkValidationError {
+                message: format!("Failed to parse Spark output JSON: {e}. Payload: {json}"),
+            }
+        })?;
+        if let Some(ref error) = result.error {
+            return Err(SparkValidationError {
+                message: format!("Spark partitions table failed: {error}"),
+            });
+        }
+        return Ok(result);
+    }
+
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+
+        if let Ok(result) = serde_json::from_str::<PartitionsTableResult>(trimmed) {
+            if let Some(ref error) = result.error {
+                return Err(SparkValidationError {
+                    message: format!("Spark partitions table failed: {error}"),
+                });
+            }
+            return Ok(result);
+        }
+    }
+
+    Err(SparkValidationError {
+        message: format!("No JSON output found in Spark output: {stdout}"),
+    })
+}
+
+pub async fn spark_entries_table(
+    table_name: &str,
+    limit: Option<i64>,
+) -> Result<EntriesTableResult, SparkValidationError> {
+    let container_name = get_spark_container_name()?;
+    spark_entries_table_with_container(&container_name, table_name, limit).await
+}
+
+pub async fn spark_entries_table_with_container(
+    container_name: &str,
+    table_name: &str,
+    limit: Option<i64>,
+) -> Result<EntriesTableResult, SparkValidationError> {
+    let extra_args = match limit {
+        Some(l) => vec![l.to_string()],
+        None => vec![],
+    };
+    let args = spark_submit_args(container_name, table_name, "entries_table", &extra_args);
+    let output = run_spark_submit(container_name, args).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(SparkValidationError {
+            message: format!("spark-submit failed.\nstdout: {stdout}\nstderr: {stderr}"),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_entries_table_output(&stdout)
+}
+
+fn parse_entries_table_output(stdout: &str) -> Result<EntriesTableResult, SparkValidationError> {
+    if let Some(json) = prefixed_json(stdout) {
+        let result =
+            serde_json::from_str::<EntriesTableResult>(json).map_err(|e| SparkValidationError {
+                message: format!("Failed to parse Spark output JSON: {e}. Payload: {json}"),
+            })?;
+        if let Some(ref error) = result.error {
+            return Err(SparkValidationError {
+                message: format!("Spark entries table failed: {error}"),
+            });
+        }
+        return Ok(result);
+    }
+
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+
+        if let Ok(result) = serde_json::from_str::<EntriesTableResult>(trimmed) {
+            if let Some(ref error) = result.error {
+                return Err(SparkValidationError {
+                    message: format!("Spark entries table failed: {error}"),
+                });
+            }
+            return Ok(result);
+        }
+    }
+
+    Err(SparkValidationError {
+        message: format!("No JSON output found in Spark output: {stdout}"),
+    })
 }

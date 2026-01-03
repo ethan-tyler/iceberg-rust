@@ -32,6 +32,7 @@ use crate::{Error, ErrorKind, Result};
 enum EqDelState {
     Loading(Arc<Notify>),
     Loaded(Predicate),
+    Failed,
 }
 
 #[derive(Debug, Default)]
@@ -94,6 +95,7 @@ impl DeleteFilter {
                 Some(EqDelState::Loaded(predicate)) => {
                     return Some(predicate.clone());
                 }
+                Some(EqDelState::Failed) => return None,
             }
         };
 
@@ -101,7 +103,7 @@ impl DeleteFilter {
 
         match self.state.read().unwrap().equality_deletes.get(file_path) {
             Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
-            _ => unreachable!("Cannot be any other state than loaded"),
+            _ => None,
         }
     }
 
@@ -141,8 +143,8 @@ impl DeleteFilter {
             return Ok(None);
         }
 
-        // TODO: handle case-insensitive case
-        let bound_predicate = combined_predicate.bind(file_scan_task.schema.clone(), false)?;
+        let bound_predicate = combined_predicate
+            .bind(file_scan_task.schema.clone(), file_scan_task.case_sensitive)?;
         Ok(Some(bound_predicate))
     }
 
@@ -180,12 +182,21 @@ impl DeleteFilter {
         let state = self.state.clone();
         let delete_file_path = delete_file_path.to_string();
         crate::runtime::spawn(async move {
-            let eq_del = eq_del.await.unwrap();
+            let result = eq_del.await;
             {
                 let mut state = state.write().unwrap();
-                state
-                    .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                match result {
+                    Ok(predicate) => {
+                        state
+                            .equality_deletes
+                            .insert(delete_file_path, EqDelState::Loaded(predicate));
+                    }
+                    Err(_) => {
+                        state
+                            .equality_deletes
+                            .insert(delete_file_path, EqDelState::Failed);
+                    }
+                }
             }
             notify.notify_waiters();
         });
@@ -201,6 +212,7 @@ pub(crate) mod tests {
     use std::fs::File;
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::Schema as ArrowSchema;
@@ -208,6 +220,7 @@ pub(crate) mod tests {
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
+    use tokio::time::timeout;
 
     use super::*;
     use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -253,6 +266,24 @@ pub(crate) mod tests {
             .get_delete_vector(&file_scan_tasks[1])
             .unwrap();
         assert_eq!(result.lock().unwrap().len(), 8); // no pos dels for file 3
+    }
+
+    #[tokio::test]
+    async fn test_equality_delete_load_failure_notifies() {
+        let delete_filter = DeleteFilter::default();
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Predicate>();
+        drop(sender);
+
+        delete_filter.insert_equality_delete("delete-file.parquet", receiver);
+
+        let result = timeout(
+            Duration::from_secs(1),
+            delete_filter.get_equality_delete_predicate_for_delete_file_path("delete-file.parquet"),
+        )
+        .await
+        .expect("wait should complete");
+
+        assert!(result.is_none());
     }
 
     pub(crate) fn setup(table_location: &Path) -> Vec<FileScanTask> {
@@ -340,6 +371,7 @@ pub(crate) mod tests {
                 schema: data_file_schema.clone(),
                 project_field_ids: vec![],
                 predicate: None,
+                case_sensitive: true,
                 deletes: vec![pos_del_1, pos_del_2.clone()],
                 partition: None,
                 partition_spec_id: None,
@@ -355,6 +387,7 @@ pub(crate) mod tests {
                 schema: data_file_schema.clone(),
                 project_field_ids: vec![],
                 predicate: None,
+                case_sensitive: true,
                 deletes: vec![pos_del_3],
                 partition: None,
                 partition_spec_id: None,
@@ -381,5 +414,76 @@ pub(crate) mod tests {
             ),
         ];
         Arc::new(arrow_schema::Schema::new(fields))
+    }
+
+    #[tokio::test]
+    async fn test_case_insensitive_equality_delete_binding() {
+        use crate::expr::Reference;
+        use crate::spec::{Datum, NestedField, PrimitiveType, Type};
+
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .unwrap(),
+        );
+
+        let delete_predicate = Reference::new("ID").equal_to(Datum::int(42));
+        let delete_filter = DeleteFilter::default();
+
+        {
+            let mut state = delete_filter.state.write().unwrap();
+            state.equality_deletes.insert(
+                "delete-file.parquet".to_string(),
+                EqDelState::Loaded(delete_predicate),
+            );
+        }
+
+        let build_task = |case_sensitive| FileScanTask {
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: "data-file.parquet".to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: table_schema.clone(),
+            project_field_ids: vec![1],
+            predicate: None,
+            case_sensitive,
+            deletes: vec![FileScanTaskDeleteFile {
+                file_path: "delete-file.parquet".to_string(),
+                file_type: DataContentType::EqualityDeletes,
+                partition_spec_id: 0,
+                equality_ids: Some(vec![1]),
+            }],
+            partition: None,
+            partition_spec_id: None,
+            partition_spec: None,
+            name_mapping: None,
+        };
+
+        let result = delete_filter
+            .build_equality_delete_predicate(&build_task(true))
+            .await;
+        assert!(
+            result.is_err(),
+            "Case-sensitive binding with mismatched case should fail"
+        );
+
+        let predicate = delete_filter
+            .build_equality_delete_predicate(&build_task(false))
+            .await
+            .expect("Case-insensitive binding should succeed")
+            .expect("Predicate should be returned");
+        let field_id = match predicate {
+            BoundPredicate::Binary(expr) => expr.term().field().id,
+            BoundPredicate::Unary(expr) => expr.term().field().id,
+            BoundPredicate::Set(expr) => expr.term().field().id,
+            _ => panic!("Unexpected predicate shape"),
+        };
+        assert_eq!(field_id, 1);
     }
 }

@@ -606,6 +606,7 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
             partition_spec_id: Some(file_group.partition_spec_id),
             partition_spec: Some(partition_spec.clone()),
             name_mapping: None,
+            case_sensitive: true,
         };
 
         tasks.push(task);

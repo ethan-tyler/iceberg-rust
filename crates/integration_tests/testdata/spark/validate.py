@@ -253,6 +253,91 @@ def validate_snapshot_summary(spark, table_name, snapshot_id=None):
         return {"error": f"Failed to extract snapshot summary: {str(e)}"}
 
 
+def validate_partitions_table(spark, table_name):
+    """
+    Extract $partitions metadata table for parity comparison.
+
+    Returns partition summary info matching the Iceberg $partitions metadata table structure.
+    """
+    try:
+        partitions_df = spark.table(f"{table_ref(table_name)}.partitions")
+        count = partitions_df.count()
+        schema_fields = [f.name for f in partitions_df.schema.fields]
+
+        partitions = []
+        for row in partitions_df.collect():
+            row_dict = row.asDict(recursive=True)
+            partition_info = {
+                "partition": row_dict.get("partition"),
+                "spec_id": row_dict.get("spec_id"),
+                "record_count": row_dict.get("record_count"),
+                "file_count": row_dict.get("file_count"),
+                "total_data_file_size_in_bytes": row_dict.get(
+                    "total_data_file_size_in_bytes"
+                ),
+                "position_delete_record_count": row_dict.get(
+                    "position_delete_record_count"
+                ),
+                "position_delete_file_count": row_dict.get(
+                    "position_delete_file_count"
+                ),
+                "equality_delete_record_count": row_dict.get(
+                    "equality_delete_record_count"
+                ),
+                "equality_delete_file_count": row_dict.get(
+                    "equality_delete_file_count"
+                ),
+            }
+            partitions.append(partition_info)
+
+        return {
+            "partition_count": count,
+            "schema_fields": schema_fields,
+            "partitions": partitions,
+        }
+    except Exception as e:
+        return {"error": f"Failed to read partitions table: {str(e)}"}
+
+
+def validate_entries_table(spark, table_name, limit=100):
+    """
+    Extract $entries metadata table for parity comparison.
+
+    Returns entry info matching the Iceberg $entries metadata table structure.
+    """
+    try:
+        entries_df = spark.table(f"{table_ref(table_name)}.entries")
+        count = entries_df.count()
+        schema_fields = [f.name for f in entries_df.schema.fields]
+
+        entries = []
+        for row in entries_df.limit(limit).collect():
+            row_dict = row.asDict(recursive=True)
+            entry_info = {
+                "status": row_dict.get("status"),
+                "snapshot_id": row_dict.get("snapshot_id"),
+                "sequence_number": row_dict.get("sequence_number"),
+                "file_sequence_number": row_dict.get("file_sequence_number"),
+            }
+            data_file = row_dict.get("data_file")
+            if data_file:
+                entry_info["data_file"] = {
+                    "content": data_file.get("content"),
+                    "file_path": data_file.get("file_path"),
+                    "record_count": data_file.get("record_count"),
+                    "partition": data_file.get("partition"),
+                }
+            entries.append(entry_info)
+
+        return {
+            "entry_count": count,
+            "schema_fields": schema_fields,
+            "entries": entries,
+        }
+    except Exception as e:
+        return {"error": f"Failed to read entries table: {str(e)}"}
+
+
 def validate_manifest_entries(spark, table_name, limit=100):
     """
     Extract manifest entry details for structure comparison.
@@ -365,6 +450,8 @@ VALIDATORS = {
     "distinct": validate_distinct_count,
     "snapshot_summary": validate_snapshot_summary,
     "manifest_entries": validate_manifest_entries,
+    "partitions_table": validate_partitions_table,
+    "entries_table": validate_entries_table,
     "spark_dml": validate_spark_dml,
     "execute_sql": validate_execute_sql,
 }
@@ -442,6 +529,11 @@ def main():
             else:
                 sql_template = sys.argv[3]
                 result = validate_execute_sql(spark, table_name, sql_template)
+        elif validation_type == "partitions_table":
+            result = validate_partitions_table(spark, table_name)
+        elif validation_type == "entries_table":
+            limit = int(sys.argv[3]) if len(sys.argv) > 3 else 100
+            result = validate_entries_table(spark, table_name, limit)
         else:
             result = VALIDATORS[validation_type](spark, table_name)
 

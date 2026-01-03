@@ -129,18 +129,24 @@ async fn test_evolved_schema() {
 
     let mut actual_bar = vec![
         OrderedFloat(
-            coerce_column(batches[0].column_by_name("bar").unwrap(), &DataType::Float64)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(0),
+            coerce_column(
+                batches[0].column_by_name("bar").unwrap(),
+                &DataType::Float64,
+            )
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0),
         ),
         OrderedFloat(
-            coerce_column(batches[1].column_by_name("bar").unwrap(), &DataType::Float64)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(0),
+            coerce_column(
+                batches[1].column_by_name("bar").unwrap(),
+                &DataType::Float64,
+            )
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0),
         ),
     ];
 

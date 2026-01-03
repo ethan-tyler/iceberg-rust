@@ -41,12 +41,32 @@ use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_datafusion::IcebergTableProvider;
 use iceberg_datafusion::compaction::{CompactionOptions, compact_table};
 use iceberg_integration_tests::spark_validator::{
-    ValidationType, spark_validate_distinct_with_container, spark_validate_query_with_container,
+    ValidationType, spark_entries_table_with_container, spark_partitions_table_with_container,
+    spark_validate_distinct_with_container, spark_validate_query_with_container,
     spark_validate_with_container,
 };
 use uuid::Uuid;
 
 use crate::get_shared_containers;
+
+async fn assert_spark_full_validation(spark_container: &str, table: &str, expected_count: i64) {
+    let full_result = spark_validate_with_container(spark_container, table, ValidationType::Full)
+        .await
+        .expect("Spark full validation should succeed");
+    assert_eq!(
+        full_result.count,
+        Some(expected_count),
+        "Spark full count should match"
+    );
+    assert!(
+        full_result.checksum.is_some(),
+        "Spark checksum should be computed"
+    );
+    assert!(
+        full_result.bounds.is_some(),
+        "Spark bounds should be computed"
+    );
+}
 
 /// Test DELETE on a Spark-created table with evolved partition spec.
 ///
@@ -194,6 +214,8 @@ async fn test_crossengine_delete_with_partition_evolution() {
         metadata_result.manifest_count.unwrap_or(0) > 0,
         "Spark should report manifests"
     );
+
+    assert_spark_full_validation(&spark_container, "test_partition_evolution_delete", 3).await;
 }
 
 /// Test UPDATE on a Spark-created table with evolved partition spec.
@@ -322,6 +344,8 @@ async fn test_crossengine_update_with_partition_evolution() {
         metadata_result.manifest_count.unwrap_or(0) > 0,
         "Spark should report manifests"
     );
+
+    assert_spark_full_validation(&spark_container, "test_partition_evolution_update", 5).await;
 }
 
 /// Test MERGE on a Spark-created table with evolved partition spec.
@@ -483,6 +507,8 @@ async fn test_crossengine_merge_with_partition_evolution() {
         metadata_result.manifest_count.unwrap_or(0) > 0,
         "Spark should report manifests"
     );
+
+    assert_spark_full_validation(&spark_container, "test_partition_evolution_merge", 6).await;
 }
 
 // =============================================================================
@@ -601,6 +627,8 @@ async fn test_crossengine_delete_with_null_semantics() {
         metadata_result.snapshot_count.unwrap_or(0) > 0,
         "Spark should report snapshots"
     );
+
+    assert_spark_full_validation(&spark_container, "test_delete_null_semantics", 4).await;
 }
 
 // =============================================================================
@@ -693,6 +721,8 @@ async fn test_crossengine_compaction_binpack() {
         metadata_result.manifest_count.unwrap_or(0) > 0,
         "Spark should report manifests"
     );
+
+    assert_spark_full_validation(&spark_container, "test_compaction", 5).await;
 }
 
 /// Test rewrite manifests on a Spark-created table.
@@ -780,6 +810,23 @@ async fn test_crossengine_rewrite_manifests() {
         metadata_result.manifest_count.unwrap_or(0) > 0,
         "Spark should report manifests"
     );
+
+    let full_result = spark_validate_with_container(
+        &spark_container,
+        "test_rewrite_manifests",
+        ValidationType::Full,
+    )
+    .await
+    .expect("Spark full validation should succeed");
+    assert_eq!(full_result.count, Some(3), "Spark full count should match");
+    assert!(
+        full_result.checksum.is_some(),
+        "Spark checksum should be computed"
+    );
+    assert!(
+        full_result.bounds.is_some(),
+        "Spark bounds should be computed"
+    );
 }
 
 /// Test expire snapshots on a Spark-created table.
@@ -864,6 +911,8 @@ async fn test_crossengine_expire_snapshots() {
         metadata_result.manifest_count.unwrap_or(0) > 0,
         "Spark should report manifests"
     );
+
+    assert_spark_full_validation(&spark_container, "test_expire_snapshots", 4).await;
 }
 
 /// Test expire snapshots with file deletion.
@@ -969,8 +1018,7 @@ async fn test_crossengine_expire_snapshots_with_file_deletion() {
                 .unwrap_or(true);
             assert!(
                 !exists,
-                "Manifest list {} should have been deleted",
-                manifest_list_path
+                "Manifest list {manifest_list_path} should have been deleted"
             );
         }
     }
@@ -1022,6 +1070,303 @@ async fn test_crossengine_expire_snapshots_with_file_deletion() {
         metadata_result.manifest_count.unwrap_or(0) > 0,
         "Spark should report manifests"
     );
+
+    assert_spark_full_validation(&spark_container, "test_expire_snapshots_file_deletion", 4).await;
+}
+
+/// Test expire snapshots dry-run fidelity (no changes or deletions).
+///
+/// Setup (by Spark provision.py):
+/// - Table `test_expire_snapshots_dry_run` with 4 snapshots
+///
+/// Test:
+/// 1. Plan expiration + cleanup
+/// 2. Execute dry-run expiration
+/// 3. Verify snapshot count unchanged and cleanup plan files still exist
+#[tokio::test]
+async fn test_crossengine_expire_snapshots_dry_run_fidelity() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table_ident = TableIdent::from_strs(["default", "test_expire_snapshots_dry_run"]).unwrap();
+    let table = client.load_table(&table_ident).await.unwrap();
+
+    let table = table
+        .update_properties()
+        .set("history.expire.max-snapshot-age-ms", "1")
+        .set("history.expire.min-snapshots-to-keep", "1")
+        .commit(client.as_ref())
+        .await
+        .expect("Updating snapshot retention properties should succeed");
+
+    let pre_snapshot_count = table.metadata().snapshots().count();
+
+    let action = Transaction::new(&table)
+        .expire_snapshots()
+        .use_table_properties(true)
+        .delete_files(true)
+        .dry_run(true);
+
+    let plan = action
+        .plan(&table)
+        .await
+        .expect("Planning expiration should succeed");
+    assert!(
+        !plan.expired_snapshot_ids().is_empty(),
+        "Dry-run test requires at least one expired snapshot"
+    );
+
+    let result = action
+        .execute(&table, client.as_ref())
+        .await
+        .expect("Dry-run expiration should succeed");
+
+    let table_after = client.load_table(&table_ident).await.unwrap();
+    let post_snapshot_count = table_after.metadata().snapshots().count();
+    assert_eq!(
+        post_snapshot_count, pre_snapshot_count,
+        "Dry-run should not expire snapshots"
+    );
+
+    let cleanup_plan = plan.cleanup_plan();
+    assert_eq!(
+        result.deleted_snapshots_count,
+        plan.expired_snapshot_ids().len() as u64,
+        "Dry-run snapshot count should match plan"
+    );
+    assert_eq!(
+        result.deleted_refs_count,
+        plan.expired_ref_names().len() as u64,
+        "Dry-run ref count should match plan"
+    );
+    assert_eq!(
+        result.deleted_manifest_list_files_count,
+        cleanup_plan.manifest_list_files.len() as u64,
+        "Dry-run manifest list count should match plan"
+    );
+    assert_eq!(
+        result.deleted_manifest_files_count,
+        cleanup_plan.manifest_files.len() as u64,
+        "Dry-run manifest count should match plan"
+    );
+    assert_eq!(
+        result.deleted_data_files_count,
+        cleanup_plan.data_files.len() as u64,
+        "Dry-run data file count should match plan"
+    );
+    assert_eq!(
+        result.deleted_position_delete_files_count,
+        cleanup_plan.position_delete_files.len() as u64,
+        "Dry-run position delete count should match plan"
+    );
+    assert_eq!(
+        result.deleted_equality_delete_files_count,
+        cleanup_plan.equality_delete_files.len() as u64,
+        "Dry-run equality delete count should match plan"
+    );
+
+    for path in cleanup_plan
+        .manifest_list_files
+        .iter()
+        .chain(cleanup_plan.manifest_files.iter())
+        .chain(cleanup_plan.data_files.iter())
+        .chain(cleanup_plan.position_delete_files.iter())
+        .chain(cleanup_plan.equality_delete_files.iter())
+    {
+        let exists = table_after.file_io().exists(path).await.unwrap_or(true);
+        assert!(exists, "Dry-run should not delete file {path}");
+    }
+}
+
+/// Test expire snapshots respects branch/tag ref safety.
+///
+/// Setup (by Spark provision.py):
+/// - Table `test_expire_snapshots_ref_safety` with 4 snapshots
+///
+/// Test:
+/// 1. Create a tag on an older snapshot
+/// 2. Expire snapshots using table properties
+/// 3. Verify the tagged snapshot remains
+#[tokio::test]
+async fn test_crossengine_expire_snapshots_ref_safety() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table_ident =
+        TableIdent::from_strs(["default", "test_expire_snapshots_ref_safety"]).unwrap();
+    let table = client.load_table(&table_ident).await.unwrap();
+
+    let metadata = table.metadata();
+    let current_snapshot_id = metadata
+        .current_snapshot_id()
+        .expect("Table should have a current snapshot");
+    let protected_snapshot_id = metadata
+        .snapshots()
+        .filter(|snapshot| snapshot.snapshot_id() != current_snapshot_id)
+        .min_by_key(|snapshot| snapshot.timestamp_ms())
+        .map(|snapshot| snapshot.snapshot_id())
+        .expect("Table should have a non-current snapshot to protect");
+
+    let tag_name = format!("retain-{}", Uuid::new_v4());
+    let table = table
+        .create_tag(&tag_name)
+        .from_snapshot(protected_snapshot_id)
+        .commit(client.as_ref())
+        .await
+        .expect("Creating tag should succeed");
+
+    let table = table
+        .update_properties()
+        .set("history.expire.max-snapshot-age-ms", "1")
+        .set("history.expire.min-snapshots-to-keep", "1")
+        .commit(client.as_ref())
+        .await
+        .expect("Updating snapshot retention properties should succeed");
+
+    let action = Transaction::new(&table)
+        .expire_snapshots()
+        .use_table_properties(true);
+    let result = action
+        .execute(&table, client.as_ref())
+        .await
+        .expect("Expire snapshots should succeed");
+
+    assert!(
+        result.deleted_snapshots_count > 0,
+        "Expire snapshots should remove older snapshots"
+    );
+    assert_eq!(
+        result.deleted_refs_count, 0,
+        "Expire snapshots should not delete protected refs"
+    );
+
+    let table_after = client.load_table(&table_ident).await.unwrap();
+    let tag_ref = table_after
+        .metadata()
+        .refs()
+        .get(&tag_name)
+        .expect("Tag should still exist after expiration");
+    assert_eq!(
+        tag_ref.snapshot_id, protected_snapshot_id,
+        "Tag should still reference the protected snapshot"
+    );
+    assert!(
+        table_after
+            .metadata()
+            .snapshot_by_id(protected_snapshot_id)
+            .is_some(),
+        "Protected snapshot should remain"
+    );
+
+    let spark_container = fixture.spark_container_name();
+    assert_spark_full_validation(&spark_container, "test_expire_snapshots_ref_safety", 4).await;
+}
+
+/// Test remove orphan files dry-run fidelity.
+///
+/// Setup (by Spark provision.py):
+/// - Table `test_remove_orphan_files_dry_run` with 1 row
+///
+/// Test:
+/// 1. Create an orphan file under a dedicated subdirectory
+/// 2. Run dry-run and capture orphan list
+/// 3. Execute delete and verify the same files are removed
+#[tokio::test]
+async fn test_crossengine_remove_orphan_files_dry_run_fidelity() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+
+    let client = Arc::new(rest_catalog);
+    let table_ident =
+        TableIdent::from_strs(["default", "test_remove_orphan_files_dry_run"]).unwrap();
+    let table = client.load_table(&table_ident).await.unwrap();
+
+    let table_location = table
+        .metadata()
+        .location()
+        .trim_end_matches('/')
+        .to_string();
+    let orphan_dir = format!("{}/data/orphans-{}", table_location, Uuid::new_v4());
+    let orphan_path = format!("{}/orphan-{}.parquet", orphan_dir, Uuid::new_v4());
+
+    let orphan_file = table.file_io().new_output(&orphan_path).unwrap();
+    orphan_file
+        .write(Bytes::from_static(b"orphan-data"))
+        .await
+        .expect("Writing orphan file should succeed");
+
+    let dry_run_result = table
+        .remove_orphan_files()
+        .location(orphan_dir.clone())
+        .older_than(Utc::now() + Duration::days(1))
+        .dry_run(true)
+        .execute()
+        .await
+        .expect("Dry-run remove orphan files should succeed");
+
+    assert!(
+        dry_run_result.dry_run,
+        "Dry-run should be reported in result"
+    );
+    assert!(
+        dry_run_result
+            .orphan_files
+            .iter()
+            .any(|f| f.path == orphan_path),
+        "Dry-run should report the orphan file"
+    );
+    assert!(
+        dry_run_result.total_deleted_files() > 0,
+        "Dry-run should report deletable files"
+    );
+
+    let exists_after_dry_run = table.file_io().exists(&orphan_path).await.unwrap();
+    assert!(exists_after_dry_run, "Dry-run should not delete files");
+
+    let delete_result = table
+        .remove_orphan_files()
+        .location(orphan_dir.clone())
+        .older_than(Utc::now() + Duration::days(1))
+        .dry_run(false)
+        .execute()
+        .await
+        .expect("Remove orphan files should succeed");
+
+    assert!(
+        !delete_result.dry_run,
+        "Delete run should not be marked dry-run"
+    );
+
+    let mut dry_paths: Vec<String> = dry_run_result
+        .orphan_files
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
+    let mut delete_paths: Vec<String> = delete_result
+        .orphan_files
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
+    dry_paths.sort();
+    delete_paths.sort();
+    assert_eq!(
+        dry_paths, delete_paths,
+        "Dry-run and delete runs should report the same orphan files"
+    );
+
+    let exists_after_delete = table.file_io().exists(&orphan_path).await.unwrap();
+    assert!(!exists_after_delete, "Orphan file should be removed");
 }
 
 /// Test remove orphan files on a Spark-created table.
@@ -1117,6 +1462,8 @@ async fn test_crossengine_remove_orphan_files() {
         metadata_result.manifest_count.unwrap_or(0) > 0,
         "Spark should report manifests"
     );
+
+    assert_spark_full_validation(&spark_container, "test_remove_orphan_files", 1).await;
 }
 
 // =============================================================================
@@ -1231,6 +1578,8 @@ async fn test_crossengine_equality_delete_int_key() {
         metadata_result.snapshot_count.unwrap_or(0) > 0,
         "Spark should report snapshots"
     );
+
+    assert_spark_full_validation(&spark_container, "test_equality_delete_int", 7).await;
 }
 
 /// Test reading a table with equality deletes on a string column.
@@ -1319,6 +1668,8 @@ async fn test_crossengine_equality_delete_string_key() {
         Some(3),
         "Spark distinct count should match"
     );
+
+    assert_spark_full_validation(&spark_container, "test_equality_delete_string", 3).await;
 }
 
 /// Test reading a table with equality deletes that target NULL values.
@@ -1412,6 +1763,8 @@ async fn test_crossengine_equality_delete_null_handling() {
         Some(3),
         "Spark distinct count should match"
     );
+
+    assert_spark_full_validation(&spark_container, "test_equality_delete_null", 3).await;
 }
 
 /// Test reading a table with multi-column equality deletes.
@@ -1528,6 +1881,193 @@ async fn test_crossengine_equality_delete_multi_column_key() {
         .and_then(|v| v.as_i64())
         .expect("Should have total");
     assert_eq!(total, 2600, "Value sum should match expected total");
+
+    assert_spark_full_validation(&spark_container, "test_equality_delete_multi", 5).await;
+}
+
+#[tokio::test]
+async fn test_crossengine_rust_equality_delete_spark_reads() {
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+    use iceberg::TableCreation;
+    use iceberg::arrow::arrow_schema_to_schema;
+    use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+    use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use iceberg::writer::base_writer::equality_delete_writer::{
+        EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+    };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
+    use iceberg::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+    use parquet::file::properties::WriterProperties;
+
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+    let ns = crate::shared_tests::random_ns().await;
+    let table_name = format!("rust_equality_delete_{}", Uuid::new_v4().simple());
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()
+        .unwrap();
+
+    let table_creation = TableCreation::builder()
+        .name(table_name.clone())
+        .schema(schema)
+        .build();
+
+    let table = rest_catalog
+        .create_table(ns.name(), table_creation)
+        .await
+        .unwrap();
+
+    let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+
+    let data_batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
+        Arc::new(StringArray::from(vec![
+            Some("alpha"),
+            Some("beta"),
+            Some("gamma"),
+            Some("delta"),
+            Some("epsilon"),
+        ])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])) as ArrayRef,
+    ])
+    .unwrap();
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("rust-eq-data-{}", Uuid::new_v4().simple()),
+        None,
+        DataFileFormat::Parquet,
+    );
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::default(),
+        table.metadata().current_schema().clone(),
+    );
+    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+    let mut data_file_writer = data_file_writer_builder.build(None).await.unwrap();
+    data_file_writer.write(data_batch).await.unwrap();
+    let data_files = data_file_writer.close().await.unwrap();
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap();
+    let table = tx.commit(&rest_catalog).await.unwrap();
+
+    let equality_id = table
+        .metadata()
+        .current_schema()
+        .field_by_name("id")
+        .expect("id field should exist")
+        .id;
+    let equality_config = EqualityDeleteWriterConfig::new(
+        vec![equality_id],
+        table.metadata().current_schema().clone(),
+    )
+    .unwrap();
+    let delete_schema =
+        arrow_schema_to_schema(equality_config.projected_arrow_schema_ref()).unwrap();
+    let delete_writer_builder =
+        ParquetWriterBuilder::new(WriterProperties::default(), Arc::new(delete_schema));
+    let delete_location_generator =
+        DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let delete_file_name_generator = DefaultFileNameGenerator::new(
+        format!("rust-eq-delete-{}", Uuid::new_v4().simple()),
+        None,
+        DataFileFormat::Parquet,
+    );
+    let rolling_delete_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        delete_writer_builder,
+        table.file_io().clone(),
+        delete_location_generator,
+        delete_file_name_generator,
+    );
+    let mut delete_writer =
+        EqualityDeleteFileWriterBuilder::new(rolling_delete_writer_builder, equality_config)
+            .build(None)
+            .await
+            .unwrap();
+
+    let delete_batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![2, 4])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some("beta"), Some("delta")])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![20, 40])) as ArrayRef,
+    ])
+    .unwrap();
+
+    delete_writer.write(delete_batch).await.unwrap();
+    let delete_files = delete_writer.close().await.unwrap();
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_equality_delete_files(delete_files)
+        .apply(tx)
+        .unwrap();
+    let _table = tx.commit(&rest_catalog).await.unwrap();
+
+    let table_ref = format!("{}.{}", ns.name(), table_name);
+    let spark_container = fixture.spark_container_name();
+
+    let count_result =
+        spark_validate_with_container(&spark_container, &table_ref, ValidationType::Count)
+            .await
+            .expect("Spark count validation should succeed");
+    assert_eq!(count_result.count, Some(3), "Spark count should match");
+
+    let distinct_result =
+        spark_validate_distinct_with_container(&spark_container, &table_ref, "id")
+            .await
+            .expect("Spark distinct validation should succeed");
+    assert_eq!(
+        distinct_result.distinct_count,
+        Some(3),
+        "Spark distinct count should match"
+    );
+
+    let checksum_result = spark_validate_query_with_container(
+        &spark_container,
+        &table_ref,
+        "SELECT sum(value) as total FROM {table}",
+    )
+    .await
+    .expect("Spark checksum validation should succeed");
+    let rows = checksum_result.rows.expect("Should have rows");
+    let total = rows[0]
+        .get("total")
+        .and_then(|v| v.as_i64())
+        .expect("Should have total");
+    assert_eq!(total, 90, "Value sum should match expected total");
+
+    assert_spark_full_validation(&spark_container, &table_ref, 3).await;
 }
 
 // =============================================================================
@@ -1716,6 +2256,8 @@ async fn test_crossengine_dynamic_overwrite_partitioned() {
         .and_then(|v| v.as_i64())
         .expect("Should have total");
     assert_eq!(total, 4800, "Sum should match expected total");
+
+    assert_spark_full_validation(&spark_container, "test_dynamic_overwrite", 6).await;
 }
 
 /// Test Static Overwrite (filter-based) - replaces partitions matching filter.
@@ -1873,6 +2415,8 @@ async fn test_crossengine_static_overwrite_with_filter() {
         .and_then(|v| v.as_i64())
         .expect("Should have total");
     assert_eq!(total, 11199, "Sum should match expected total");
+
+    assert_spark_full_validation(&spark_container, "test_static_overwrite", 4).await;
 }
 
 /// Test Static Overwrite with empty result (delete-only operation).
@@ -1969,6 +2513,8 @@ async fn test_crossengine_static_overwrite_delete_partition() {
         .and_then(|v| v.as_i64())
         .expect("Should have total");
     assert_eq!(total, 300, "Sum should match expected total");
+
+    assert_spark_full_validation(&spark_container, "test_static_overwrite_empty", 2).await;
 }
 
 /// Test Dynamic Overwrite on unpartitioned table (full table replace).
@@ -2115,4 +2661,473 @@ async fn test_crossengine_dynamic_overwrite_unpartitioned() {
         .and_then(|v| v.as_i64())
         .expect("Should have total");
     assert_eq!(total, 11000, "Sum should match expected total");
+
+    assert_spark_full_validation(&spark_container, "test_dynamic_overwrite_unpartitioned", 2).await;
+}
+
+#[tokio::test]
+async fn test_crossengine_metadata_tables_partitions_entries_parity() {
+    use arrow_array::{
+        Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    };
+    use arrow_schema::DataType;
+    use futures::TryStreamExt;
+    use iceberg::TableCreation;
+    use iceberg::spec::{
+        DataFileFormat, Literal, NestedField, PartitionKey, PrimitiveType, Schema, Struct,
+        Transform, Type, UnboundPartitionSpec,
+    };
+    use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
+    use iceberg::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+    use parquet::file::properties::WriterProperties;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PartitionSummary {
+        category: String,
+        spec_id: i64,
+        record_count: i64,
+        file_count: i64,
+        total_data_file_size_in_bytes: i64,
+        position_delete_record_count: i64,
+        position_delete_file_count: i64,
+        equality_delete_record_count: i64,
+        equality_delete_file_count: i64,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct EntrySummary {
+        category: String,
+        status: i64,
+        content: i64,
+        record_count: i64,
+    }
+
+    fn struct_field_index(array: &StructArray, field_name: &str) -> usize {
+        match array.data_type() {
+            DataType::Struct(fields) => fields
+                .iter()
+                .position(|field| field.name() == field_name)
+                .expect("field missing"),
+            _ => panic!("expected struct"),
+        }
+    }
+
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+    let ns = crate::shared_tests::random_ns().await;
+    let table_name = format!("metadata_tables_parity_{}", Uuid::new_v4().simple());
+
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()
+        .unwrap();
+
+    let unbound_partition_spec = UnboundPartitionSpec::builder()
+        .add_partition_field(2, "category", Transform::Identity)
+        .expect("could not add partition field")
+        .build();
+
+    let partition_spec = unbound_partition_spec
+        .bind(schema.clone())
+        .expect("could not bind to schema");
+
+    let table_creation = TableCreation::builder()
+        .name(table_name.clone())
+        .schema(schema.clone())
+        .partition_spec(partition_spec.clone())
+        .build();
+
+    let table = rest_catalog
+        .create_table(ns.name(), table_creation)
+        .await
+        .unwrap();
+
+    let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let file_name_generator =
+        DefaultFileNameGenerator::new("metadata-parity".to_string(), None, DataFileFormat::Parquet);
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::builder().build(),
+        table.metadata().current_schema().clone(),
+    );
+    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+
+    let mut data_files = Vec::new();
+    for (category, ids, values) in [
+        ("alpha", vec![1, 2], vec![10, 20]),
+        ("beta", vec![3, 4], vec![30, 40]),
+    ] {
+        let partition_key = PartitionKey::new(
+            partition_spec.clone(),
+            table.metadata().current_schema().clone(),
+            Struct::from_iter([Some(Literal::string(category))]),
+        );
+        let mut writer = data_file_writer_builder
+            .build(Some(partition_key))
+            .await
+            .unwrap();
+
+        let categories = vec![category.to_string(); ids.len()];
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(categories)) as ArrayRef,
+            Arc::new(Int32Array::from(values)) as ArrayRef,
+        ])
+        .unwrap();
+
+        writer.write(batch).await.unwrap();
+        data_files.extend(writer.close().await.unwrap());
+    }
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap();
+    let table = tx.commit(&rest_catalog).await.unwrap();
+
+    let partition_batches: Vec<_> = table
+        .inspect()
+        .partitions()
+        .scan()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    let mut rust_partitions = Vec::new();
+    for batch in &partition_batches {
+        let schema = batch.schema();
+        let partition_index = schema
+            .index_of("partition")
+            .expect("partition column missing");
+        let spec_id_index = schema.index_of("spec_id").expect("spec_id column missing");
+        let record_count_index = schema
+            .index_of("record_count")
+            .expect("record_count column missing");
+        let file_count_index = schema
+            .index_of("file_count")
+            .expect("file_count column missing");
+        let total_size_index = schema
+            .index_of("total_data_file_size_in_bytes")
+            .expect("total_data_file_size_in_bytes column missing");
+        let pos_delete_record_index = schema
+            .index_of("position_delete_record_count")
+            .expect("position_delete_record_count column missing");
+        let pos_delete_file_index = schema
+            .index_of("position_delete_file_count")
+            .expect("position_delete_file_count column missing");
+        let eq_delete_record_index = schema
+            .index_of("equality_delete_record_count")
+            .expect("equality_delete_record_count column missing");
+        let eq_delete_file_index = schema
+            .index_of("equality_delete_file_count")
+            .expect("equality_delete_file_count column missing");
+
+        let partition_col = batch
+            .column(partition_index)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("partition should be struct");
+        let category_index = struct_field_index(partition_col, "category");
+        let category_col = partition_col
+            .column(category_index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("partition category should be string");
+
+        let spec_id_col = batch
+            .column(spec_id_index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("spec_id should be int");
+        let record_count_col = batch
+            .column(record_count_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("record_count should be long");
+        let file_count_col = batch
+            .column(file_count_index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("file_count should be int");
+        let total_size_col = batch
+            .column(total_size_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("total_data_file_size_in_bytes should be long");
+        let pos_delete_record_col = batch
+            .column(pos_delete_record_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("position_delete_record_count should be long");
+        let pos_delete_file_col = batch
+            .column(pos_delete_file_index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("position_delete_file_count should be int");
+        let eq_delete_record_col = batch
+            .column(eq_delete_record_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("equality_delete_record_count should be long");
+        let eq_delete_file_col = batch
+            .column(eq_delete_file_index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("equality_delete_file_count should be int");
+
+        for i in 0..batch.num_rows() {
+            assert!(
+                !category_col.is_null(i),
+                "Partition category should be populated"
+            );
+            rust_partitions.push(PartitionSummary {
+                category: category_col.value(i).to_string(),
+                spec_id: spec_id_col.value(i) as i64,
+                record_count: record_count_col.value(i),
+                file_count: file_count_col.value(i) as i64,
+                total_data_file_size_in_bytes: total_size_col.value(i),
+                position_delete_record_count: pos_delete_record_col.value(i),
+                position_delete_file_count: pos_delete_file_col.value(i) as i64,
+                equality_delete_record_count: eq_delete_record_col.value(i),
+                equality_delete_file_count: eq_delete_file_col.value(i) as i64,
+            });
+        }
+    }
+    rust_partitions.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.spec_id.cmp(&b.spec_id))
+    });
+    assert_eq!(rust_partitions.len(), 2);
+    for entry in &rust_partitions {
+        assert_eq!(entry.record_count, 2);
+        assert!(entry.file_count > 0);
+        assert_eq!(entry.position_delete_record_count, 0);
+        assert_eq!(entry.position_delete_file_count, 0);
+        assert_eq!(entry.equality_delete_record_count, 0);
+        assert_eq!(entry.equality_delete_file_count, 0);
+    }
+
+    let spark_container = fixture.spark_container_name();
+    let table_ref = format!("rest.{}.{}", ns.name(), table_name);
+    let partition_result = spark_partitions_table_with_container(&spark_container, &table_ref)
+        .await
+        .expect("Spark partitions table should succeed");
+    let spark_partition_count = partition_result
+        .partition_count
+        .expect("Spark partition count should be present");
+    assert_eq!(spark_partition_count, 2);
+    let partitions = partition_result
+        .partitions
+        .expect("Spark partitions should return rows");
+
+    let mut spark_partitions = Vec::new();
+    for partition in partitions {
+        let partition_values = partition
+            .partition
+            .expect("partition values should be present");
+        let category = partition_values
+            .get("category")
+            .and_then(|value| value.as_str())
+            .expect("partition category should be present")
+            .to_string();
+        let spec_id = partition.spec_id.expect("spec_id should be present") as i64;
+        let record_count = partition
+            .record_count
+            .expect("record_count should be present");
+        let file_count = partition.file_count.expect("file_count should be present");
+        let total_size = partition
+            .total_data_file_size_in_bytes
+            .expect("total_data_file_size_in_bytes should be present");
+        let pos_delete_record = partition
+            .position_delete_record_count
+            .expect("position_delete_record_count should be present");
+        let pos_delete_file = partition
+            .position_delete_file_count
+            .expect("position_delete_file_count should be present");
+        let eq_delete_record = partition
+            .equality_delete_record_count
+            .expect("equality_delete_record_count should be present");
+        let eq_delete_file = partition
+            .equality_delete_file_count
+            .expect("equality_delete_file_count should be present");
+        spark_partitions.push(PartitionSummary {
+            category,
+            spec_id,
+            record_count,
+            file_count,
+            total_data_file_size_in_bytes: total_size,
+            position_delete_record_count: pos_delete_record,
+            position_delete_file_count: pos_delete_file,
+            equality_delete_record_count: eq_delete_record,
+            equality_delete_file_count: eq_delete_file,
+        });
+    }
+    spark_partitions.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.spec_id.cmp(&b.spec_id))
+    });
+    assert_eq!(spark_partitions.len(), rust_partitions.len());
+    for (spark_entry, rust_entry) in spark_partitions.iter().zip(rust_partitions.iter()) {
+        assert_eq!(spark_entry.category, rust_entry.category);
+        assert_eq!(spark_entry.record_count, rust_entry.record_count);
+        assert!(spark_entry.file_count > 0);
+        assert_eq!(spark_entry.position_delete_record_count, 0);
+        assert_eq!(spark_entry.position_delete_file_count, 0);
+        assert_eq!(spark_entry.equality_delete_record_count, 0);
+        assert_eq!(spark_entry.equality_delete_file_count, 0);
+    }
+
+    let entry_batches: Vec<_> = table
+        .inspect()
+        .entries()
+        .scan()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    let mut rust_entries = Vec::new();
+    for batch in &entry_batches {
+        let schema = batch.schema();
+        let status_index = schema.index_of("status").expect("status column missing");
+        let data_file_index = schema
+            .index_of("data_file")
+            .expect("data_file column missing");
+
+        let status_col = batch
+            .column(status_index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("status should be int");
+        let data_file_col = batch
+            .column(data_file_index)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("data_file should be struct");
+        let content_index = struct_field_index(data_file_col, "content");
+        let record_count_index = struct_field_index(data_file_col, "record_count");
+        let partition_index = struct_field_index(data_file_col, "partition");
+
+        let content_col = data_file_col
+            .column(content_index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("content should be int");
+        let record_count_col = data_file_col
+            .column(record_count_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("record_count should be long");
+        let partition_col = data_file_col
+            .column(partition_index)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("partition should be struct");
+        let category_index = struct_field_index(partition_col, "category");
+        let category_col = partition_col
+            .column(category_index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("entry category should be string");
+
+        for i in 0..batch.num_rows() {
+            assert!(
+                !category_col.is_null(i),
+                "Entry partition category should be populated"
+            );
+            rust_entries.push(EntrySummary {
+                category: category_col.value(i).to_string(),
+                status: status_col.value(i) as i64,
+                content: content_col.value(i) as i64,
+                record_count: record_count_col.value(i),
+            });
+        }
+    }
+    rust_entries.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.status.cmp(&b.status))
+            .then_with(|| a.content.cmp(&b.content))
+    });
+    assert_eq!(rust_entries.len(), 2);
+    for entry in &rust_entries {
+        assert_eq!(entry.status, 1);
+        assert_eq!(entry.content, 0);
+        assert_eq!(entry.record_count, 2);
+    }
+
+    let entry_result = spark_entries_table_with_container(&spark_container, &table_ref, None)
+        .await
+        .expect("Spark entries table should succeed");
+    let spark_entry_count = entry_result
+        .entry_count
+        .expect("Spark entry count should be present");
+    assert_eq!(spark_entry_count, 2);
+    let entries = entry_result
+        .entries
+        .expect("Spark entries should return rows");
+
+    let mut spark_entries = Vec::new();
+    for entry in entries {
+        let data_file = entry.data_file.expect("data_file should be present");
+        let partition_values = data_file
+            .partition
+            .expect("partition values should be present");
+        let category = partition_values
+            .get("category")
+            .and_then(|value| value.as_str())
+            .expect("entry category should be present")
+            .to_string();
+        let status = entry.status.expect("status should be present") as i64;
+        let content = data_file.content.expect("content should be present") as i64;
+        let record_count = data_file
+            .record_count
+            .expect("record_count should be present");
+        spark_entries.push(EntrySummary {
+            category,
+            status,
+            content,
+            record_count,
+        });
+    }
+    spark_entries.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.status.cmp(&b.status))
+            .then_with(|| a.content.cmp(&b.content))
+    });
+    assert_eq!(spark_entries, rust_entries);
 }

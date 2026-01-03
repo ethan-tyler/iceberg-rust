@@ -88,14 +88,11 @@ fn resolve_cli_binary() -> PathBuf {
                 target_dir = repo_root.join(target_dir);
             }
 
-            let cli_path = target_dir.join("debug").join(format!(
-                "iceberg-cli{}",
-                std::env::consts::EXE_SUFFIX
-            ));
+            let cli_path = target_dir
+                .join("debug")
+                .join(format!("iceberg-cli{}", std::env::consts::EXE_SUFFIX));
 
-            if !cli_path.exists() {
-                build_cli(&repo_root);
-            }
+            build_cli(&repo_root);
 
             if !cli_path.exists() {
                 panic!("iceberg-cli binary not found at {}", cli_path.display());
@@ -150,14 +147,8 @@ fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> CliResult {
         .spawn()
         .expect("Failed to spawn CLI process");
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .expect("Failed to capture CLI stdout");
-    let mut stderr = child
-        .stderr
-        .take()
-        .expect("Failed to capture CLI stderr");
+    let mut stdout = child.stdout.take().expect("Failed to capture CLI stdout");
+    let mut stderr = child.stderr.take().expect("Failed to capture CLI stderr");
 
     let start = Instant::now();
     loop {
@@ -170,14 +161,9 @@ fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> CliResult {
         }
 
         if start.elapsed() >= timeout {
-            child
-                .kill()
-                .expect("Failed to kill timed-out CLI process");
+            child.kill().expect("Failed to kill timed-out CLI process");
             let _ = child.wait();
-            panic!(
-                "CLI command timed out after {:?}. Command: {}",
-                timeout, command_desc
-            );
+            panic!("CLI command timed out after {timeout:?}. Command: {command_desc}");
         }
 
         std::thread::sleep(CLI_POLL_INTERVAL);

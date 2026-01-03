@@ -105,7 +105,7 @@ impl TableBuilder {
 
     /// Optionally set a non-default metadata cache size in bytes.
     ///
-    /// Default is 32MB. Setting this to 0 disables caching (equivalent to `disable_cache()`).
+    /// Default is 160MB. Setting this to 0 disables caching (equivalent to `disable_cache()`).
     pub fn cache_size_bytes(mut self, cache_size_bytes: u64) -> Self {
         self.cache_size_bytes = Some(cache_size_bytes);
         self
@@ -1611,8 +1611,8 @@ mod tests {
 
         let stats = table.cache_stats();
         assert!(stats.enabled);
-        // Size from table property
-        assert_eq!(stats.max_capacity, DEFAULT_CACHE_SIZE_BYTES);
+        // Size from table property (33554432 = 32MB)
+        assert_eq!(stats.max_capacity, 33554432);
         assert_eq!(
             table.object_cache().time_to_live(),
             Some(Duration::from_millis(600000))
@@ -1637,7 +1637,8 @@ mod tests {
 
         let stats = table.cache_stats();
         assert!(stats.enabled);
-        assert_eq!(stats.max_capacity, DEFAULT_CACHE_SIZE_BYTES);
+        // Size from table property (33554432 = 32MB)
+        assert_eq!(stats.max_capacity, 33554432);
         assert_eq!(
             table.object_cache().time_to_live(),
             Some(Duration::from_secs(60))

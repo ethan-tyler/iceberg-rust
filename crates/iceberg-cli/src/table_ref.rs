@@ -24,7 +24,7 @@ use iceberg::table::{StaticTable, Table};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use url::Url;
 
-use crate::cli::TableRefArgs;
+use crate::cli::{CatalogArgs, TableRefArgs};
 use crate::config;
 
 #[derive(Debug, Clone)]
@@ -47,15 +47,12 @@ pub enum LoadedTable {
     Location(LocationTable),
 }
 
-pub async fn load_table(table_ref: &TableRefArgs) -> anyhow::Result<LoadedTable> {
+pub async fn load_table(
+    table_ref: &TableRefArgs,
+    catalog_args: &CatalogArgs,
+) -> anyhow::Result<LoadedTable> {
     if let Some(table_ident) = table_ref.table.as_deref() {
-        table_ref.require_catalog()?;
-
-        let catalog = config::load_catalog(
-            table_ref.catalog.as_deref(),
-            table_ref.catalog_config.as_deref(),
-        )
-        .await?;
+        let catalog = catalog_args.load_catalog().await?;
 
         let ident = parse_table_ident(table_ident)?;
         let table = catalog
@@ -72,10 +69,11 @@ pub async fn load_table(table_ref: &TableRefArgs) -> anyhow::Result<LoadedTable>
 
     let location = table_ref.location_str()?.to_string();
     let mut props: HashMap<String, String> = HashMap::new();
-    if let Some(config_path) = table_ref.catalog_config.as_deref() {
+    if let Some(config_path) = catalog_args.catalog_config.as_deref() {
         let cfg = config::load_catalog_config_file(config_path)?;
         props = cfg.props;
     }
+    catalog_args.apply_storage_props(&mut props);
 
     let file_io = FileIO::from_path(&location)
         .map_err(anyhow::Error::from)?
@@ -99,14 +97,15 @@ pub async fn load_table(table_ref: &TableRefArgs) -> anyhow::Result<LoadedTable>
 }
 
 pub fn parse_table_ident(table: &str) -> anyhow::Result<TableIdent> {
-    let parts: Vec<&str> = table
-        .split('.')
-        .filter(|s| !s.is_empty())
-        .collect();
+    if table.contains("://") {
+        anyhow::bail!("Unsupported table reference: {table}");
+    }
+
+    let parts: Vec<&str> = table.split('.').filter(|s| !s.is_empty()).collect();
 
     anyhow::ensure!(
         parts.len() >= 2,
-        "invalid --table identifier '{table}' (expected '<namespace>.<name>')"
+        "Invalid table identifier '{table}' (expected 'namespace.table')"
     );
 
     let (namespace_parts, name_part) = parts.split_at(parts.len() - 1);
@@ -118,7 +117,7 @@ pub fn parse_table_ident(table: &str) -> anyhow::Result<TableIdent> {
 }
 
 pub fn derive_ident_from_location(location: &str) -> anyhow::Result<TableIdent> {
-    let parsed = Url::parse(location).with_context(|| format!("invalid --location URI: {location}"))?;
+    let parsed = Url::parse(location).with_context(|| "invalid --location URI")?;
     let name = parsed
         .path_segments()
         .and_then(|mut segs| segs.next_back())
@@ -130,10 +129,13 @@ pub fn derive_ident_from_location(location: &str) -> anyhow::Result<TableIdent> 
     Ok(TableIdent::new(namespace, name))
 }
 
-pub async fn resolve_metadata_location(file_io: &FileIO, table_location: &str) -> anyhow::Result<String> {
+pub async fn resolve_metadata_location(
+    file_io: &FileIO,
+    table_location: &str,
+) -> anyhow::Result<String> {
     let table_location = table_location.trim_end_matches('/');
-    let metadata_dir = format!("{}/metadata", table_location);
-    let version_hint_location = format!("{}/version-hint.text", metadata_dir);
+    let metadata_dir = format!("{table_location}/metadata");
+    let version_hint_location = format!("{metadata_dir}/version-hint.text");
 
     let hinted_version = match file_io.exists(&version_hint_location).await {
         Ok(true) => {
@@ -147,14 +149,21 @@ pub async fn resolve_metadata_location(file_io: &FileIO, table_location: &str) -
             if content.is_empty() {
                 None
             } else {
-                Some(content.parse::<u32>().context("invalid version-hint.text contents")?)
+                Some(
+                    content
+                        .parse::<u32>()
+                        .context("invalid version-hint.text contents")?,
+                )
             }
         }
         _ => None,
     };
 
     let mut candidates: Vec<(u32, String)> = Vec::new();
-    let entries = file_io.list(&metadata_dir).await.map_err(anyhow::Error::from)?;
+    let entries = file_io
+        .list(&metadata_dir)
+        .await
+        .map_err(anyhow::Error::from)?;
     for entry in entries {
         if !entry.path.ends_with(".metadata.json") {
             continue;
@@ -170,10 +179,10 @@ pub async fn resolve_metadata_location(file_io: &FileIO, table_location: &str) -
         "no Iceberg metadata files found under: {metadata_dir}"
     );
 
-    if let Some(target) = hinted_version {
-        if let Some((_, path)) = candidates.iter().find(|(v, _)| *v == target) {
-            return Ok(path.clone());
-        }
+    if let Some(target) = hinted_version
+        && let Some((_, path)) = candidates.iter().find(|(v, _)| *v == target)
+    {
+        return Ok(path.clone());
     }
 
     candidates.sort_by_key(|(v, _)| *v);

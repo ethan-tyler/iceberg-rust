@@ -358,7 +358,6 @@ impl TransactionAction for RowDeltaAction {
 }
 
 /// Operation implementation for RowDelta snapshots.
-///
 struct RowDeltaOperation {
     has_data_files: bool,
     has_delete_files: bool,

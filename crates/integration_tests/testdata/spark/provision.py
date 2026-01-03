@@ -321,6 +321,20 @@ VALUES
     (6, 'zeta', 600);
 """)
 
+# Table for general CLI smoke tests
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_simple_table (
+    id     integer,
+    data   string
+)
+USING iceberg
+TBLPROPERTIES (
+    'format-version'='2'
+);
+""")
+
+spark.sql("INSERT INTO rest.default.test_simple_table VALUES (1, 'alpha')")
+
 # Table for testing compaction (binpack)
 spark.sql("""
 CREATE OR REPLACE TABLE rest.default.test_compaction (
@@ -402,6 +416,42 @@ spark.sql(
     "INSERT INTO rest.default.test_expire_snapshots_file_deletion VALUES (4, 400)"
 )
 
+# Table for testing expire snapshots dry-run fidelity
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_expire_snapshots_dry_run (
+    id     integer,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'format-version'='2'
+);
+""")
+
+# Create multiple snapshots by doing multiple inserts
+spark.sql("INSERT INTO rest.default.test_expire_snapshots_dry_run VALUES (1, 100)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots_dry_run VALUES (2, 200)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots_dry_run VALUES (3, 300)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots_dry_run VALUES (4, 400)")
+
+# Table for testing expire snapshots ref safety
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_expire_snapshots_ref_safety (
+    id     integer,
+    value  integer
+)
+USING iceberg
+TBLPROPERTIES (
+    'format-version'='2'
+);
+""")
+
+# Create multiple snapshots by doing multiple inserts
+spark.sql("INSERT INTO rest.default.test_expire_snapshots_ref_safety VALUES (1, 100)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots_ref_safety VALUES (2, 200)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots_ref_safety VALUES (3, 300)")
+spark.sql("INSERT INTO rest.default.test_expire_snapshots_ref_safety VALUES (4, 400)")
+
 # Table for testing remove orphan files
 spark.sql("""
 CREATE OR REPLACE TABLE rest.default.test_remove_orphan_files (
@@ -415,6 +465,22 @@ TBLPROPERTIES (
 """)
 
 spark.sql("INSERT INTO rest.default.test_remove_orphan_files VALUES (1, 'alpha')")
+
+# Table for testing remove orphan files dry-run fidelity
+spark.sql("""
+CREATE OR REPLACE TABLE rest.default.test_remove_orphan_files_dry_run (
+    id     integer,
+    data   string
+)
+USING iceberg
+TBLPROPERTIES (
+    'format-version'='2'
+);
+""")
+
+spark.sql(
+    "INSERT INTO rest.default.test_remove_orphan_files_dry_run VALUES (1, 'alpha')"
+)
 
 # =============================================================================
 # WP1.5 Semantic Parity Validation Tables

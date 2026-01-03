@@ -48,6 +48,10 @@ where D: serde::Deserializer<'de> {
     ))
 }
 
+fn default_case_sensitive() -> bool {
+    true
+}
+
 /// A task to scan part of file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileScanTask {
@@ -74,6 +78,10 @@ pub struct FileScanTask {
     /// The predicate to filter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predicate: Option<BoundPredicate>,
+
+    /// Whether column matching is case-sensitive for this scan task.
+    #[serde(default = "default_case_sensitive")]
+    pub case_sensitive: bool,
 
     /// The list of delete files that may need to be applied to this data file
     pub deletes: Vec<FileScanTaskDeleteFile>,
@@ -214,6 +222,7 @@ mod tests {
             schema: test_schema(),
             project_field_ids: vec![1],
             predicate: None,
+            case_sensitive: true,
             deletes: vec![],
             partition: None,
             partition_spec_id: None,
@@ -235,6 +244,7 @@ mod tests {
             schema: test_schema(),
             project_field_ids: vec![1],
             predicate: None,
+            case_sensitive: true,
             deletes: vec![],
             partition: None,
             partition_spec_id: Some(5),
@@ -257,6 +267,7 @@ mod tests {
             schema: test_schema(),
             project_field_ids: vec![1],
             predicate: None,
+            case_sensitive: true,
             deletes: vec![],
             partition: None,
             partition_spec_id: Some(0),

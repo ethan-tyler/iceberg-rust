@@ -153,11 +153,7 @@ impl SnapshotSummaryCollector {
     pub fn build(&self) -> HashMap<String, String> {
         let mut properties = self.metrics.to_map();
         let changed_partitions_count = if self.partition_metrics.is_empty() {
-            if self.has_unpartitioned_change {
-                1
-            } else {
-                0
-            }
+            if self.has_unpartitioned_change { 1 } else { 0 }
         } else {
             self.partition_metrics.len() as u64
         };
@@ -366,12 +362,10 @@ pub(crate) fn update_snapshot_summaries(
 
     let mut summary = match previous_summary {
         Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
-            truncate_table_summary(summary, prev_summary)
-                .map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
-                        .with_source(err)
-                })
-                .unwrap()
+            truncate_table_summary(summary, prev_summary).map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
+                    .with_source(err)
+            })?
         }
         _ => summary,
     };
@@ -382,7 +376,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_DATA_FILES,
         ADDED_DATA_FILES,
         DELETED_DATA_FILES,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -390,7 +384,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_DELETE_FILES,
         ADDED_DELETE_FILES,
         REMOVED_DELETE_FILES,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -398,7 +392,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_RECORDS,
         ADDED_RECORDS,
         DELETED_RECORDS,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -406,7 +400,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_FILE_SIZE,
         ADDED_FILE_SIZE,
         REMOVED_FILE_SIZE,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -414,7 +408,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_POSITION_DELETES,
         ADDED_POSITION_DELETES,
         REMOVED_POSITION_DELETES,
-    );
+    )?;
 
     update_totals(
         &mut summary,
@@ -422,7 +416,7 @@ pub(crate) fn update_snapshot_summaries(
         TOTAL_EQUALITY_DELETES,
         ADDED_EQUALITY_DELETES,
         REMOVED_EQUALITY_DELETES,
-    );
+    )?;
     Ok(summary)
 }
 
@@ -499,6 +493,19 @@ fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> R
     Ok(summary)
 }
 
+fn parse_u64_property(summary: &Summary, property: &str) -> Result<Option<u64>> {
+    let Some(value) = summary.additional_properties.get(property) else {
+        return Ok(None);
+    };
+    value.parse::<u64>().map(Some).map_err(|err| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Failed to parse summary property '{property}'"),
+        )
+        .with_source(err)
+    })
+}
+
 #[allow(dead_code)]
 fn update_totals(
     summary: &mut Summary,
@@ -506,32 +513,25 @@ fn update_totals(
     total_property: &str,
     added_property: &str,
     removed_property: &str,
-) {
-    let previous_total = previous_summary.map_or(0, |previous_summary| {
-        previous_summary
-            .additional_properties
-            .get(total_property)
-            .map_or(0, |value| value.parse::<u64>().unwrap())
-    });
+) -> Result<()> {
+    let previous_total = match previous_summary {
+        Some(previous_summary) => {
+            parse_u64_property(previous_summary, total_property)?.unwrap_or(0)
+        }
+        None => 0,
+    };
 
     let mut new_total = previous_total;
-    if let Some(value) = summary
-        .additional_properties
-        .get(added_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
+    if let Some(value) = parse_u64_property(summary, added_property)? {
         new_total += value;
     }
-    if let Some(value) = summary
-        .additional_properties
-        .get(removed_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
+    if let Some(value) = parse_u64_property(summary, removed_property)? {
         new_total -= value;
     }
     summary
         .additional_properties
         .insert(total_property.to_string(), new_total.to_string());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -620,6 +620,33 @@ mod tests {
                 .unwrap(),
             "4"
         );
+    }
+
+    #[test]
+    fn test_update_snapshot_summaries_invalid_totals() {
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([(
+                TOTAL_DATA_FILES.to_string(),
+                "invalid".to_string(),
+            )]),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::new(),
+        };
+        let result = update_snapshot_summaries(summary, Some(&previous_summary), false);
+        assert!(result.is_err());
+
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([(
+                ADDED_DATA_FILES.to_string(),
+                "invalid".to_string(),
+            )]),
+        };
+        let result = update_snapshot_summaries(summary, None, false);
+        assert!(result.is_err());
     }
 
     #[test]

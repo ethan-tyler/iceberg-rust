@@ -29,12 +29,12 @@
 //!
 //! # Configuration
 //!
-//! Cache behavior can be configured via properties (matching Iceberg Java spec):
+//! Cache behavior can be configured via properties (aligned with Iceberg Java semantics; keys differ):
 //!
 //! | Property | Default | Description |
 //! |----------|---------|-------------|
 //! | `iceberg.io.manifest.cache-enabled` | `true` | Enable/disable caching |
-//! | `iceberg.io.manifest.cache.max-total-bytes` | `33554432` (32MB) | Maximum cache size |
+//! | `iceberg.io.manifest.cache.max-total-bytes` | `167772160` (160MB) | Maximum cache size |
 //! | `iceberg.io.manifest.cache.expiration-interval-ms` | `300000` (5min) | TTL for entries |
 //!
 //! # Property Precedence
@@ -44,7 +44,7 @@
 //! 1. **Explicit builder methods** - Direct calls to `TableBuilder::disable_cache()`,
 //!    `TableBuilder::cache_size_bytes()`, or `TableBuilder::cache_ttl()`
 //! 2. **Table metadata properties** - Properties stored in the table's metadata JSON
-//! 3. **Default values** - `DEFAULT_CACHE_SIZE_BYTES` (32MB) and `DEFAULT_CACHE_TTL` (5min)
+//! 3. **Default values** - `DEFAULT_CACHE_SIZE_BYTES` (160MB) and `DEFAULT_CACHE_TTL` (5min)
 //!
 //! This allows fine-grained control: set table-level defaults via metadata properties,
 //! while still allowing runtime overrides via the builder API. For example, disable
@@ -134,7 +134,7 @@ pub const MANIFEST_CACHE_ENABLED: &str = "iceberg.io.manifest.cache-enabled";
 /// Property to set the maximum total cache size in bytes.
 ///
 /// When the cache exceeds this size, least-recently-used entries are evicted.
-/// Default: 33554432 (32MB)
+/// Default: 167772160 (160MB)
 pub const MANIFEST_CACHE_MAX_TOTAL_BYTES: &str = "iceberg.io.manifest.cache.max-total-bytes";
 
 /// Property to set the cache entry expiration interval in milliseconds.
@@ -149,8 +149,8 @@ pub const MANIFEST_CACHE_EXPIRATION_INTERVAL_MS: &str =
 // Default Values
 // ============================================================================
 
-/// Default cache size: 32MB
-pub const DEFAULT_CACHE_SIZE_BYTES: u64 = 32 * 1024 * 1024;
+/// Default cache size: 160MB (tuned for large table workloads)
+pub const DEFAULT_CACHE_SIZE_BYTES: u64 = 160 * 1024 * 1024;
 
 /// Default TTL for cache entries: 5 minutes
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -840,9 +840,7 @@ mod tests {
                         .content(DataContentType::Data)
                         .file_path(format!(
                             "{}/{}_{}.parquet",
-                            &self.table_location,
-                            manifest_idx,
-                            entry_idx
+                            &self.table_location, manifest_idx, entry_idx
                         ))
                         .file_format(DataFileFormat::Parquet)
                         .file_size_in_bytes(100)

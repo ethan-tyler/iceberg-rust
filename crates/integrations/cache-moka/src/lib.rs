@@ -19,9 +19,24 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use iceberg::cache::{ObjectCache, ObjectCacheProvide};
+use iceberg::io::DEFAULT_CACHE_TTL;
 use iceberg::spec::{Manifest, ManifestList};
 
-const DEFAULT_CACHE_SIZE_BYTES: u64 = 32 * 1024 * 1024; // 32MiB
+const DEFAULT_CACHE_SIZE_BYTES: u64 = 160 * 1024 * 1024; // 160MiB
+
+fn estimate_manifest_list_size(manifest_list: &ManifestList) -> u32 {
+    const BASE_SIZE: u32 = 64;
+    const PER_ENTRY_SIZE: u32 = 800;
+
+    BASE_SIZE.saturating_add((manifest_list.entries().len() as u32).saturating_mul(PER_ENTRY_SIZE))
+}
+
+fn estimate_manifest_size(manifest: &Manifest) -> u32 {
+    const BASE_SIZE: u32 = 1024;
+    const PER_ENTRY_SIZE: u32 = 1500;
+
+    BASE_SIZE.saturating_add((manifest.entries().len() as u32).saturating_mul(PER_ENTRY_SIZE))
+}
 
 struct MokaObjectCache<K, V>(moka::sync::Cache<K, V>);
 
@@ -54,8 +69,20 @@ impl Default for MokaObjectCacheProvider {
 impl MokaObjectCacheProvider {
     /// Creates a new `MokaObjectCacheProvider` with default cache sizes.
     pub fn new() -> Self {
-        let manifest_cache = MokaObjectCache(moka::sync::Cache::new(DEFAULT_CACHE_SIZE_BYTES));
-        let manifest_list_cache = MokaObjectCache(moka::sync::Cache::new(DEFAULT_CACHE_SIZE_BYTES));
+        let manifest_cache = MokaObjectCache(
+            moka::sync::Cache::builder()
+                .max_capacity(DEFAULT_CACHE_SIZE_BYTES)
+                .time_to_live(DEFAULT_CACHE_TTL)
+                .weigher(|_, value: &Arc<Manifest>| estimate_manifest_size(value))
+                .build(),
+        );
+        let manifest_list_cache = MokaObjectCache(
+            moka::sync::Cache::builder()
+                .max_capacity(DEFAULT_CACHE_SIZE_BYTES)
+                .time_to_live(DEFAULT_CACHE_TTL)
+                .weigher(|_, value: &Arc<ManifestList>| estimate_manifest_list_size(value))
+                .build(),
+        );
 
         Self {
             manifest_cache,

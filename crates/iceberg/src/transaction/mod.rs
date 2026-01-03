@@ -81,10 +81,10 @@ pub use rewrite_manifests::{
     RewriteManifestsAction, RewriteManifestsOptions, RewriteManifestsPlanner,
     RewriteManifestsResult,
 };
-pub use rewrite_position_delete_files::RewritePositionDeleteFilesAction;
 // Internal-only exports for rewrite_manifests implementation (used by action commit)
 #[allow(unused_imports)]
 pub(crate) use rewrite_manifests::{ManifestRewriter, generate_manifest_path};
+pub use rewrite_position_delete_files::RewritePositionDeleteFilesAction;
 pub use row_delta::RowDeltaAction;
 pub use update_schema::UpdateSchemaAction;
 mod append;

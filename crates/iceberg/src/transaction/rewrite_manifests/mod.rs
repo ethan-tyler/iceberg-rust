@@ -907,7 +907,7 @@ mod integration_tests {
         let mut manifests = Vec::new();
 
         for i in 0..2 {
-            let manifest_path = format!("{}/metadata/manifest-{}.avro", table_location, i);
+            let manifest_path = format!("{table_location}/metadata/manifest-{i}.avro");
             let output = io.new_output(&manifest_path).unwrap();
 
             let mut writer = ManifestWriterBuilder::new(
@@ -921,10 +921,10 @@ mod integration_tests {
 
             // Add test entries using add_file
             writer
-                .add_file(test_data_file(&format!("data/file-{}-a.parquet", i)), 1)
+                .add_file(test_data_file(&format!("data/file-{i}-a.parquet")), 1)
                 .unwrap();
             writer
-                .add_file(test_data_file(&format!("data/file-{}-b.parquet", i)), 1)
+                .add_file(test_data_file(&format!("data/file-{i}-b.parquet")), 1)
                 .unwrap();
 
             let manifest = writer.write_manifest_file().await.unwrap();
@@ -932,7 +932,7 @@ mod integration_tests {
         }
 
         // Write manifest list
-        let manifest_list_path = format!("{}/metadata/snap-1-0-uuid.avro", table_location);
+        let manifest_list_path = format!("{table_location}/metadata/snap-1-0-uuid.avro");
         let mut manifest_list_writer = ManifestListWriter::v2(
             io.new_output(&manifest_list_path).unwrap(),
             1,    // snapshot_id
@@ -993,7 +993,7 @@ mod integration_tests {
 
         let table = Table::builder()
             .metadata(metadata)
-            .metadata_location(format!("{}/metadata/v1.json", table_location))
+            .metadata_location(format!("{table_location}/metadata/v1.json"))
             .identifier(TableIdent::from_strs(["db", "table"]).unwrap())
             .file_io(io.clone())
             .build()
@@ -1041,7 +1041,7 @@ mod integration_tests {
                 assert_eq!(snapshot.parent_snapshot_id(), Some(1));
                 assert_eq!(snapshot.summary().operation, Operation::Replace);
             }
-            other => panic!("Expected AddSnapshot, got {:?}", other),
+            other => panic!("Expected AddSnapshot, got {other:?}"),
         }
 
         // Second update should be SetSnapshotRef for main
@@ -1053,7 +1053,7 @@ mod integration_tests {
                 assert_eq!(ref_name, MAIN_BRANCH);
                 assert!(reference.is_branch());
             }
-            other => panic!("Expected SetSnapshotRef, got {:?}", other),
+            other => panic!("Expected SetSnapshotRef, got {other:?}"),
         }
 
         // Verify requirements

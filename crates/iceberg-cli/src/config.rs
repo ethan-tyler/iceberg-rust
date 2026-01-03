@@ -22,12 +22,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use iceberg::Catalog;
 use iceberg_catalog_loader::CatalogLoader;
-use serde_derive::Deserialize;
 use url::Url;
 
 const REST_CATALOG_PROP_URI_KEY: &str = "uri";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct CatalogConfigFile {
     /// Optional catalog name (used only for logging/debugging).
     pub name: Option<String>,
@@ -48,7 +47,7 @@ pub struct ParsedCatalogUri {
 }
 
 pub fn parse_catalog_uri(uri: &str) -> anyhow::Result<ParsedCatalogUri> {
-    let parsed = Url::parse(uri).with_context(|| format!("invalid --catalog URI: {uri}"))?;
+    let parsed = Url::parse(uri).with_context(|| "invalid --catalog URI")?;
 
     let (catalog_type, inner_scheme) = match parsed.scheme().split_once('+') {
         Some((t, inner)) => (t.to_string(), inner.to_string()),
@@ -57,13 +56,16 @@ pub fn parse_catalog_uri(uri: &str) -> anyhow::Result<ParsedCatalogUri> {
 
     if catalog_type == "rest" {
         let mut http_url = parsed;
-        http_url
-            .set_scheme(&inner_scheme)
-            .map_err(|()| anyhow::anyhow!("invalid inner scheme for rest catalog: {inner_scheme}"))?;
+        http_url.set_scheme(&inner_scheme).map_err(|()| {
+            anyhow::anyhow!("invalid inner scheme for rest catalog: {inner_scheme}")
+        })?;
 
         let mut props = HashMap::new();
         props.insert(REST_CATALOG_PROP_URI_KEY.to_string(), http_url.to_string());
-        return Ok(ParsedCatalogUri { catalog_type, props });
+        return Ok(ParsedCatalogUri {
+            catalog_type,
+            props,
+        });
     }
 
     anyhow::bail!(
@@ -133,8 +135,5 @@ pub async fn load_catalog(
     }
 
     let loader = CatalogLoader::from(catalog_type.as_str());
-    loader
-        .load(name, props)
-        .await
-        .map_err(anyhow::Error::from)
+    loader.load(name, props).await.map_err(anyhow::Error::from)
 }

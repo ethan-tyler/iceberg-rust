@@ -43,8 +43,10 @@ use parquet::file::metadata::{
     PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
+use tokio::sync::oneshot::Receiver;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::delete_filter::DeleteFilter;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
@@ -171,6 +173,14 @@ impl ArrowReader {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn await_delete_filter(
+        delete_filter_rx: Receiver<Result<DeleteFilter>>,
+    ) -> Result<DeleteFilter> {
+        delete_filter_rx
+            .await
+            .map_err(|_| Error::new(ErrorKind::Unexpected, "delete filter channel closed"))?
+    }
+
     async fn process_file_scan_task(
         task: FileScanTask,
         batch_size: Option<usize>,
@@ -300,7 +310,7 @@ impl ArrowReader {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
         }
 
-        let delete_filter = delete_filter_rx.await.unwrap()?;
+        let delete_filter = Self::await_delete_filter(delete_filter_rx).await?;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
         // In addition to the optional predicate supplied in the `FileScanTask`,
@@ -1769,9 +1779,11 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::ErrorKind;
+    use crate::arrow::delete_filter::DeleteFilter;
     use crate::arrow::reader::{CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY};
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::delete_vector::DeleteVector;
+    use crate::error::Result;
     use crate::expr::visitors::bound_predicate_visitor::visit;
     use crate::expr::{Bind, Predicate, Reference};
     use crate::io::FileIO;
@@ -1794,6 +1806,15 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn test_delete_filter_channel_closed() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Result<DeleteFilter>>();
+        drop(sender);
+
+        let result = super::ArrowReader::await_delete_filter(receiver).await;
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2083,6 +2104,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -2405,6 +2427,7 @@ message schema {
             partition_spec: None,
             partition_spec_id: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         // Task 2: read the second and third row groups
@@ -2422,6 +2445,7 @@ message schema {
             partition_spec: None,
             partition_spec_id: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let tasks1 = Box::pin(futures::stream::iter(vec![Ok(task1)])) as FileScanTaskStream;
@@ -2550,6 +2574,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -2722,6 +2747,7 @@ message schema {
             partition_spec: None,
             partition_spec_id: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -2940,6 +2966,7 @@ message schema {
             partition_spec: None,
             partition_spec_id: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3151,6 +3178,7 @@ message schema {
             partition_spec: None,
             partition_spec_id: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3255,6 +3283,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3353,6 +3382,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3440,6 +3470,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3541,6 +3572,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3671,6 +3703,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3768,6 +3801,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3878,6 +3912,7 @@ message schema {
                 partition_spec: None,
                 partition_spec_id: None,
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4018,6 +4053,7 @@ message schema {
                 partition_spec_id: Some(0),
                 partition_spec: Some(partition_spec),
                 name_mapping: None,
+                case_sensitive: true,
             })]
             .into_iter(),
         )) as FileScanTaskStream;

@@ -30,16 +30,12 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
-futures = { workspace = true }
 humantime = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-loader = { workspace = true }
 iceberg-datafusion = { workspace = true }
-serde = { workspace = true }
-serde_derive = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 url = { workspace = true }

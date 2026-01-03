@@ -456,7 +456,7 @@ mod tests {
             .file_io(file_io)
             .metadata(Arc::new(metadata))
             .identifier(crate::TableIdent::new(
-                crate::NamespaceIdent::from_strs(&["test"]).unwrap(),
+                crate::NamespaceIdent::from_strs(["test"]).unwrap(),
                 "test_table".to_string(),
             ))
             .build()
@@ -788,7 +788,7 @@ mod tests {
             .file_io(file_io)
             .metadata(Arc::new(metadata))
             .identifier(crate::TableIdent::new(
-                crate::NamespaceIdent::from_strs(&["test"]).unwrap(),
+                crate::NamespaceIdent::from_strs(["test"]).unwrap(),
                 "test_table".to_string(),
             ))
             .build()

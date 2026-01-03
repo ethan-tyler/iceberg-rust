@@ -615,12 +615,11 @@ impl RecordBatchTransformer {
                         source_index,
                     } => {
                         let source_array = &columns[*source_index];
-                        if let DataType::Struct(target_fields) = target_type {
-                            if let Some(struct_array) =
+                        if let DataType::Struct(target_fields) = target_type
+                            && let Some(struct_array) =
                                 source_array.as_any().downcast_ref::<StructArray>()
-                            {
-                                return Self::promote_struct_array(struct_array, target_fields);
-                            }
+                        {
+                            return Self::promote_struct_array(struct_array, target_fields);
                         }
                         cast(&**source_array, target_type)?
                     }
@@ -665,10 +664,7 @@ impl RecordBatchTransformer {
         }
     }
 
-    fn promote_struct_array(
-        source: &StructArray,
-        target_fields: &Fields,
-    ) -> Result<ArrayRef> {
+    fn promote_struct_array(source: &StructArray, target_fields: &Fields) -> Result<ArrayRef> {
         let num_rows = source.len();
         let mut source_by_id = HashMap::new();
         let mut source_by_name = HashMap::new();
@@ -689,16 +685,21 @@ impl RecordBatchTransformer {
 
             let array = if let Some(source_array) = source_array {
                 if let DataType::Struct(nested_fields) = target_field.data_type() {
-                    if let Some(nested_struct) =
-                        source_array.as_any().downcast_ref::<StructArray>()
+                    if let Some(nested_struct) = source_array.as_any().downcast_ref::<StructArray>()
                     {
                         Self::promote_struct_array(nested_struct, nested_fields)?
-                    } else if source_array.data_type().equals_datatype(target_field.data_type()) {
+                    } else if source_array
+                        .data_type()
+                        .equals_datatype(target_field.data_type())
+                    {
                         source_array.clone()
                     } else {
                         cast(&**source_array, target_field.data_type())?
                     }
-                } else if source_array.data_type().equals_datatype(target_field.data_type()) {
+                } else if source_array
+                    .data_type()
+                    .equals_datatype(target_field.data_type())
+                {
                     source_array.clone()
                 } else {
                     cast(&**source_array, target_field.data_type())?
@@ -711,9 +712,10 @@ impl RecordBatchTransformer {
         }
 
         let nulls = source.nulls().cloned();
-        let struct_array = StructArray::try_new(target_fields.clone(), arrays, nulls)
-            .map_err(|e| Error::new(ErrorKind::Unexpected, "Failed to build struct array")
-                .with_source(e))?;
+        let struct_array =
+            StructArray::try_new(target_fields.clone(), arrays, nulls).map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "Failed to build struct array").with_source(e)
+            })?;
         Ok(Arc::new(struct_array))
     }
 }

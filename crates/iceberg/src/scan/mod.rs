@@ -293,7 +293,7 @@ impl<'a> TableScanBuilder<'a> {
         }
 
         let snapshot_bound_predicate = if let Some(ref predicates) = self.filter {
-            Some(predicates.bind(schema.clone(), true)?)
+            Some(predicates.bind(schema.clone(), self.case_sensitive)?)
         } else {
             None
         };
@@ -1998,6 +1998,7 @@ pub mod tests {
             length: 100,
             project_field_ids: vec![1, 2, 3],
             predicate: None,
+            case_sensitive: true,
             schema: schema.clone(),
             record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
@@ -2016,6 +2017,7 @@ pub mod tests {
             length: 100,
             project_field_ids: vec![1, 2, 3],
             predicate: Some(BoundPredicate::AlwaysTrue),
+            case_sensitive: true,
             schema,
             record_count: None,
             data_file_format: DataFileFormat::Avro,
@@ -2026,6 +2028,28 @@ pub mod tests {
             name_mapping: None,
         };
         test_fn(task);
+    }
+
+    #[test]
+    fn test_scan_case_sensitive_binding() {
+        let fixture = TableTestFixture::new();
+        let predicate = Reference::new("X").equal_to(Datum::long(1));
+
+        let result = fixture
+            .table
+            .scan()
+            .with_filter(predicate.clone())
+            .with_case_sensitive(true)
+            .build();
+        assert!(result.is_err());
+
+        let result = fixture
+            .table
+            .scan()
+            .with_filter(predicate)
+            .with_case_sensitive(false)
+            .build();
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

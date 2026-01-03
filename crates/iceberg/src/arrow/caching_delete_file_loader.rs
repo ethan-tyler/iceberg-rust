@@ -995,6 +995,7 @@ mod tests {
             partition_spec_id: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         // Load the deletes - should handle both types without error
@@ -1163,6 +1164,7 @@ mod tests {
             partition_spec_id: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -1186,11 +1188,10 @@ mod tests {
         // Log performance characteristics for tuning
         println!(
             "WP3.2 Stress Test Results:\n\
-             - Rows processed: {}\n\
-             - Data rows scanned: {}\n\
-             - Scan time: {:?}\n\
-             - Rows remaining: {}",
-            delete_rows, data_rows, elapsed, total_rows
+             - Rows processed: {delete_rows}\n\
+             - Data rows scanned: {data_rows}\n\
+             - Scan time: {elapsed:?}\n\
+             - Rows remaining: {total_rows}"
         );
 
         if let (Some(before_kb), Some(after_kb)) = (baseline_hwm_kb, read_proc_status_kb("VmHWM:"))
@@ -1199,14 +1200,9 @@ mod tests {
             let max_delta_kb = 512 * 1024;
             assert!(
                 delta_kb <= max_delta_kb,
-                "Peak RSS delta exceeded limit: {} kB > {} kB",
-                delta_kb,
-                max_delta_kb
+                "Peak RSS delta exceeded limit: {delta_kb} kB > {max_delta_kb} kB"
             );
-            println!(
-                "Peak RSS delta (VmHWM): {} kB (limit {} kB)",
-                delta_kb, max_delta_kb
-            );
+            println!("Peak RSS delta (VmHWM): {delta_kb} kB (limit {max_delta_kb} kB)");
         } else {
             println!("VmHWM not available; skipping peak RSS assertion");
         }
@@ -1214,8 +1210,7 @@ mod tests {
         // All data rows should be deleted (delete file contains all values in the data file)
         assert_eq!(
             total_rows, 0,
-            "Expected all data rows to be deleted with {} equality deletes",
-            delete_rows
+            "Expected all data rows to be deleted with {delete_rows} equality deletes"
         );
     }
 
@@ -1280,18 +1275,14 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Multi-column stress test with {} rows failed: {:?}",
-            num_rows,
-            result.err()
+            "Multi-column stress test with {num_rows} rows failed: {err:?}",
+            err = result.err()
         );
 
         let predicate = result.unwrap();
         assert_ne!(predicate, Predicate::AlwaysTrue);
 
-        println!(
-            "Multi-column stress test passed: {} rows × 3 columns",
-            num_rows
-        );
+        println!("Multi-column stress test passed: {num_rows} rows × 3 columns");
     }
 
     /// Test that string columns (which use more memory per value) also work under load
@@ -1303,7 +1294,7 @@ mod tests {
 
         // 100k rows with string values (more memory per predicate)
         let num_rows = 100_000;
-        let col_vals: Vec<String> = (0..num_rows).map(|i| format!("value_{:06}", i)).collect();
+        let col_vals: Vec<String> = (0..num_rows).map(|i| format!("value_{i:06}")).collect();
         let col = Arc::new(StringArray::from(col_vals)) as ArrayRef;
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
@@ -1339,12 +1330,11 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "String column stress test with {} rows failed: {:?}",
-            num_rows,
-            result.err()
+            "String column stress test with {num_rows} rows failed: {err:?}",
+            err = result.err()
         );
 
-        println!("String column stress test passed: {} rows", num_rows);
+        println!("String column stress test passed: {num_rows} rows");
     }
 
     /// Test that the predicate limit guard mechanism works correctly.
@@ -1412,19 +1402,14 @@ mod tests {
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("exceeds maximum allowed rows"),
-            "Error message should mention row limit: {}",
-            err_msg
+            "Error message should mention row limit: {err_msg}"
         );
         assert!(
             err_msg.contains("Compacting"),
-            "Error message should provide remediation guidance: {}",
-            err_msg
+            "Error message should provide remediation guidance: {err_msg}"
         );
 
-        println!(
-            "Guard mechanism test passed - error returned gracefully:\n{}",
-            err
-        );
+        println!("Guard mechanism test passed - error returned gracefully:\n{err}");
     }
 
     /// Test that the limit can be disabled by passing Some(0) or None with large value
@@ -1480,6 +1465,6 @@ mod tests {
             result.err()
         );
 
-        println!("Limit disabled test passed - {} rows processed", num_rows);
+        println!("Limit disabled test passed - {num_rows} rows processed");
     }
 }

@@ -828,10 +828,8 @@ mod tests {
 
         let mut metadata = (*table.metadata()).clone();
         let branch_snapshot_id = 9001;
-        let manifest_list_path = format!(
-            "{}/metadata/branch-{}.avro",
-            table_location, branch_snapshot_id
-        );
+        let manifest_list_path =
+            format!("{table_location}/metadata/branch-{branch_snapshot_id}.avro");
 
         let snapshot = Snapshot::builder()
             .with_snapshot_id(branch_snapshot_id)
@@ -863,10 +861,7 @@ mod tests {
         write_manifest_list_and_manifest(&file_io, &table_location, table.metadata(), &snapshot)
             .await;
 
-        let protected_path = format!(
-            "{}/data/data-{}.parquet",
-            table_location, branch_snapshot_id
-        );
+        let protected_path = format!("{table_location}/data/data-{branch_snapshot_id}.parquet");
 
         let result = table
             .remove_orphan_files()

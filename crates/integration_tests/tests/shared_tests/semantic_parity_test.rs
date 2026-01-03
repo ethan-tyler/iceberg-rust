@@ -66,13 +66,13 @@ use iceberg_integration_tests::spark_validator::{
     spark_execute_dml_with_container, spark_execute_sql_with_container,
     spark_manifest_entries_with_container, spark_snapshot_summary_with_container,
 };
-use crate::get_shared_containers;
 
 use super::parity_utils::{
     assert_error_contains, assert_parity_expected_divergences, assert_rust_schema_rejection,
     assert_spark_schema_rejection, compare_manifest_entries, compare_snapshot_summaries,
     extract_rust_manifest_entries, extract_rust_snapshot_summary, summary_is_noop,
 };
+use crate::get_shared_containers;
 
 // =============================================================================
 // Semantic Parity Tests
@@ -104,8 +104,6 @@ async fn test_semantic_parity_delete() {
         IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_delete_rust")
             .await
             .unwrap();
-
-
 
     let deleted_count = rust_provider
         .delete(&ctx.state(), Some(col("value").gt(lit(300))))
@@ -280,10 +278,13 @@ async fn test_edge_case_empty_delete() {
     let initial_snapshot_count = table_before.metadata().snapshots().count();
 
     // Perform DELETE that matches nothing (value > 10000, but max is 500)
-    let rust_provider =
-        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_delete_empty_rust")
-            .await
-            .unwrap();
+    let rust_provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "parity_delete_empty_rust",
+    )
+    .await
+    .unwrap();
 
     let deleted_count = rust_provider
         .delete(&ctx.state(), Some(col("value").gt(lit(10000))))
@@ -329,21 +330,17 @@ async fn test_edge_case_empty_delete() {
     };
 
     println!("\nEmpty DELETE behavior:");
-    println!("  Initial snapshots: {}", initial_snapshot_count);
-    println!("  Final snapshots: {}", final_snapshot_count);
-    println!("  New snapshot created: {}", rust_created_snapshot);
-    println!("  Rust snapshot is no-op: {}", rust_noop_snapshot);
-    println!("  Spark snapshot changed: {}", spark_snapshot_changed);
-    println!("  Spark snapshot is no-op: {}", spark_noop_snapshot);
+    println!("  Initial snapshots: {initial_snapshot_count}");
+    println!("  Final snapshots: {final_snapshot_count}");
+    println!("  New snapshot created: {rust_created_snapshot}");
+    println!("  Rust snapshot is no-op: {rust_noop_snapshot}");
+    println!("  Spark snapshot changed: {spark_snapshot_changed}");
+    println!("  Spark snapshot is no-op: {spark_noop_snapshot}");
 
     assert!(
         (!rust_created_snapshot || rust_noop_snapshot)
             && (!spark_snapshot_changed || spark_noop_snapshot),
-        "Empty DELETE should be a no-op (no new snapshot or a no-op snapshot). rust_created_snapshot={}, rust_noop_snapshot={}, spark_snapshot_changed={}, spark_noop_snapshot={}",
-        rust_created_snapshot,
-        rust_noop_snapshot,
-        spark_snapshot_changed,
-        spark_noop_snapshot
+        "Empty DELETE should be a no-op (no new snapshot or a no-op snapshot). rust_created_snapshot={rust_created_snapshot}, rust_noop_snapshot={rust_noop_snapshot}, spark_snapshot_changed={spark_snapshot_changed}, spark_noop_snapshot={spark_noop_snapshot}"
     );
 }
 
@@ -466,11 +463,8 @@ async fn test_semantic_parity_three_valued_logic() {
     .await
     .expect("Spark DELETE with three-valued logic should succeed");
 
-    let parity_result = compare_snapshot_summaries(
-        "DELETE (three-valued logic)",
-        &rust_summary,
-        &spark_summary,
-    );
+    let parity_result =
+        compare_snapshot_summaries("DELETE (three-valued logic)", &rust_summary, &spark_summary);
 
     println!("\n{}\n", parity_result.summary());
 
@@ -1011,10 +1005,11 @@ async fn test_error_rejection_add_existing_column() {
     )
     .await;
     let spark_err = spark_result.expect_err("Spark should reject adding existing column");
-    assert_spark_schema_rejection(
-        &spark_err,
-        &["column_already_exists", "already exists", "duplicate column"],
-    );
+    assert_spark_schema_rejection(&spark_err, &[
+        "column_already_exists",
+        "already exists",
+        "duplicate column",
+    ]);
 }
 
 /// Error rejection parity: renaming to an existing column should fail.
@@ -1028,15 +1023,14 @@ async fn test_error_rejection_rename_to_existing_column() {
 
     let client = Arc::new(rest_catalog);
     let table = client
-        .load_table(&TableIdent::from_strs(["default", "parity_schema_rename_existing_rust"]).unwrap())
+        .load_table(
+            &TableIdent::from_strs(["default", "parity_schema_rename_existing_rust"]).unwrap(),
+        )
         .await
         .unwrap();
 
     let tx = Transaction::new(&table);
-    let apply_result = tx
-        .update_schema()
-        .rename_column("id", "name")
-        .apply(tx);
+    let apply_result = tx.update_schema().rename_column("id", "name").apply(tx);
 
     let rust_err = match apply_result {
         Ok(tx) => tx
@@ -1055,10 +1049,11 @@ async fn test_error_rejection_rename_to_existing_column() {
     )
     .await;
     let spark_err = spark_result.expect_err("Spark should reject renaming to an existing column");
-    assert_spark_schema_rejection(
-        &spark_err,
-        &["column_already_exists", "already exists", "duplicate column"],
-    );
+    assert_spark_schema_rejection(&spark_err, &[
+        "column_already_exists",
+        "already exists",
+        "duplicate column",
+    ]);
 }
 
 #[tokio::test]
@@ -1095,10 +1090,12 @@ async fn test_error_rejection_drop_missing_column() {
     )
     .await;
     let spark_err = spark_result.expect_err("Spark should reject dropping a missing column");
-    assert_spark_schema_rejection(
-        &spark_err,
-        &["missing field", "does not exist", "not found", "cannot resolve"],
-    );
+    assert_spark_schema_rejection(&spark_err, &[
+        "missing field",
+        "does not exist",
+        "not found",
+        "cannot resolve",
+    ]);
 }
 
 #[tokio::test]
@@ -1111,7 +1108,9 @@ async fn test_error_rejection_rename_missing_column() {
 
     let client = Arc::new(rest_catalog);
     let table = client
-        .load_table(&TableIdent::from_strs(["default", "parity_schema_rename_missing_rust"]).unwrap())
+        .load_table(
+            &TableIdent::from_strs(["default", "parity_schema_rename_missing_rust"]).unwrap(),
+        )
         .await
         .unwrap();
 
@@ -1138,10 +1137,12 @@ async fn test_error_rejection_rename_missing_column() {
     )
     .await;
     let spark_err = spark_result.expect_err("Spark should reject renaming a missing column");
-    assert_spark_schema_rejection(
-        &spark_err,
-        &["missing field", "does not exist", "not found", "cannot resolve"],
-    );
+    assert_spark_schema_rejection(&spark_err, &[
+        "missing field",
+        "does not exist",
+        "not found",
+        "cannot resolve",
+    ]);
 }
 
 #[tokio::test]
@@ -1156,10 +1157,13 @@ async fn test_error_rejection_incompatible_type_promotion() {
     let ctx = SessionContext::new();
     let namespace = iceberg::NamespaceIdent::new("default".to_string());
 
-    let provider =
-        IcebergTableProvider::try_new(client.clone(), namespace.clone(), "parity_schema_incompatible_rust")
-            .await
-            .unwrap();
+    let provider = IcebergTableProvider::try_new(
+        client.clone(),
+        namespace.clone(),
+        "parity_schema_incompatible_rust",
+    )
+    .await
+    .unwrap();
 
     let rust_result = provider
         .update()

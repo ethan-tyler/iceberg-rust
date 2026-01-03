@@ -45,6 +45,7 @@ pub(crate) struct ManifestFileContext {
     bound_predicates: Option<Arc<BoundPredicates>>,
     object_cache: Arc<ObjectCache>,
     snapshot_schema: SchemaRef,
+    case_sensitive: bool,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     delete_file_index: DeleteFileIndex,
 }
@@ -59,6 +60,7 @@ pub(crate) struct ManifestEntryContext {
     pub bound_predicates: Option<Arc<BoundPredicates>>,
     pub partition_spec: PartitionSpecRef,
     pub snapshot_schema: SchemaRef,
+    pub case_sensitive: bool,
     pub delete_file_index: DeleteFileIndex,
 }
 
@@ -72,6 +74,7 @@ impl ManifestFileContext {
             partition_spec,
             bound_predicates,
             snapshot_schema,
+            case_sensitive,
             field_ids,
             mut sender,
             expression_evaluator_cache,
@@ -89,6 +92,7 @@ impl ManifestFileContext {
                 partition_spec: partition_spec.clone(),
                 bound_predicates: bound_predicates.clone(),
                 snapshot_schema: snapshot_schema.clone(),
+                case_sensitive,
                 delete_file_index: delete_file_index.clone(),
             };
 
@@ -127,6 +131,7 @@ impl ManifestEntryContext {
             predicate: self
                 .bound_predicates
                 .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
+            case_sensitive: self.case_sensitive,
 
             deletes,
 
@@ -292,6 +297,7 @@ impl PlanContext {
             sender,
             object_cache: self.object_cache.clone(),
             snapshot_schema: self.snapshot_schema.clone(),
+            case_sensitive: self.case_sensitive,
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,

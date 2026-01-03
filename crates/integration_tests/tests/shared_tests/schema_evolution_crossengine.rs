@@ -585,6 +585,18 @@ async fn test_spark_nested_struct_evolution_rust_reads() {
 
     assert_eq!(spark_result.count.unwrap(), 4);
 
+    let full_result = spark_validate_with_container(
+        &container,
+        "default.test_schema_nested_evolution",
+        ValidationType::Full,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(full_result.count.unwrap(), 4);
+    assert!(full_result.checksum.is_some());
+    assert!(full_result.bounds.is_some());
+
     // Query to verify struct field values
     let query_result = spark_validate_query_with_container(
         &container,
@@ -985,7 +997,7 @@ async fn test_rust_add_column_spark_reads() {
         ])) as ArrayRef,
     ])
     .unwrap();
-    table = append_batch(&rest_catalog, &table, batch).await;
+    append_batch(&rest_catalog, &table, batch).await;
 
     let table_ref = format!("{}.{}", ns.name(), table_name);
     let container = fixture.spark_container_name();
@@ -1092,7 +1104,7 @@ async fn test_rust_rename_column_spark_reads() {
         Arc::new(StringArray::from(vec!["Gamma", "Delta"])) as ArrayRef,
     ])
     .unwrap();
-    table = append_batch(&rest_catalog, &table, batch).await;
+    append_batch(&rest_catalog, &table, batch).await;
 
     let table_ref = format!("{}.{}", ns.name(), table_name);
     let container = fixture.spark_container_name();
@@ -1189,7 +1201,7 @@ async fn test_rust_drop_column_spark_reads() {
         Arc::new(Int32Array::from(vec![400, 500])) as ArrayRef,
     ])
     .unwrap();
-    table = append_batch(&rest_catalog, &table, batch).await;
+    append_batch(&rest_catalog, &table, batch).await;
 
     let table_ref = format!("{}.{}", ns.name(), table_name);
     let container = fixture.spark_container_name();
@@ -1318,10 +1330,7 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
     let table_ref = format!("{}.{}", ns.name(), table_name);
     let container = fixture.spark_container_name();
 
-    let query_1 = format!(
-        "SELECT id, name FROM {{table}} VERSION AS OF {} ORDER BY id",
-        snapshot_1
-    );
+    let query_1 = format!("SELECT id, name FROM {{table}} VERSION AS OF {snapshot_1} ORDER BY id");
     let result_1 = spark_validate_query_with_container(&container, &table_ref, &query_1)
         .await
         .unwrap();
@@ -1330,10 +1339,8 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
     assert_eq!(rows_1[0]["id"], 1);
     assert_eq!(rows_1[0]["name"], "First");
 
-    let query_2 = format!(
-        "SELECT id, name, version FROM {{table}} VERSION AS OF {} ORDER BY id",
-        snapshot_2
-    );
+    let query_2 =
+        format!("SELECT id, name, version FROM {{table}} VERSION AS OF {snapshot_2} ORDER BY id");
     let result_2 = spark_validate_query_with_container(&container, &table_ref, &query_2)
         .await
         .unwrap();
@@ -1342,10 +1349,8 @@ async fn test_rust_historical_snapshot_schema_spark_reads() {
     assert!(rows_2[0]["version"].is_null());
     assert_eq!(rows_2[1]["version"], 2);
 
-    let query_3 = format!(
-        "SELECT id, label, version FROM {{table}} VERSION AS OF {} ORDER BY id",
-        snapshot_3
-    );
+    let query_3 =
+        format!("SELECT id, label, version FROM {{table}} VERSION AS OF {snapshot_3} ORDER BY id");
     let result_3 = spark_validate_query_with_container(&container, &table_ref, &query_3)
         .await
         .unwrap();
@@ -1375,23 +1380,20 @@ async fn test_schema_evolution_checksum_consistency() {
     for table in tables {
         let result = spark_validate_with_container(&container, table, ValidationType::Full)
             .await
-            .expect(&format!("Spark validation should succeed for {}", table));
+            .unwrap_or_else(|e| panic!("Spark validation should succeed for {table}: {e}"));
 
         assert!(
             result.count.is_some(),
-            "Count should be available for {}",
-            table
+            "Count should be available for {table}"
         );
         assert!(
             result.checksum.is_some(),
-            "Checksum should be available for {}",
-            table
+            "Checksum should be available for {table}"
         );
         assert!(
             result.error.is_none(),
-            "No errors for {}: {:?}",
-            table,
-            result.error
+            "No errors for {table}: {error:?}",
+            error = result.error
         );
 
         println!(

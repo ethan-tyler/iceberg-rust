@@ -31,9 +31,10 @@ use crate::spec::{
     ManifestFile, ManifestStatus, Operation, PartitionKey, Struct,
 };
 use crate::table::Table;
-use crate::transaction::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
+use crate::transaction::snapshot::{
+    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+};
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_schema,
 };
@@ -42,6 +43,7 @@ use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind};
 
 /// Action to rewrite position delete files.
@@ -140,7 +142,8 @@ impl TransactionAction for RewritePositionDeleteFilesAction {
             .map(|spec| (spec.spec_id(), spec.is_unpartitioned()))
             .collect();
 
-        let mut partition_groups: HashMap<(Option<Struct>, i32), Vec<ManifestEntry>> = HashMap::new();
+        let mut partition_groups: HashMap<(Option<Struct>, i32), Vec<ManifestEntry>> =
+            HashMap::new();
 
         for entry in position_delete_entries {
             if entry.sequence_number.is_none() || entry.file_sequence_number.is_none() {
@@ -189,9 +192,12 @@ impl TransactionAction for RewritePositionDeleteFilesAction {
 
         let delete_config = PositionDeleteWriterConfig::new();
         let delete_schema = delete_config.delete_schema().clone();
-        let iceberg_delete_schema = Arc::new(position_delete_schema(table.metadata().current_schema_id())?);
+        let iceberg_delete_schema = Arc::new(position_delete_schema(
+            table.metadata().current_schema_id(),
+        )?);
 
-        let parquet_writer_builder = ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema);
+        let parquet_writer_builder =
+            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema);
         let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
         let file_name_generator =
             DefaultFileNameGenerator::new("pos-delete".to_string(), None, DataFileFormat::Parquet);
@@ -243,13 +249,10 @@ impl TransactionAction for RewritePositionDeleteFilesAction {
             let file_paths: Vec<String> = deletes.iter().map(|(p, _)| p.clone()).collect();
             let positions: Vec<i64> = deletes.iter().map(|(_, p)| *p).collect();
 
-            let record_batch = RecordBatch::try_new(
-                delete_schema.clone(),
-                vec![
-                    Arc::new(StringArray::from(file_paths)),
-                    Arc::new(Int64Array::from(positions)),
-                ],
-            )
+            let record_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+                Arc::new(StringArray::from(file_paths)),
+                Arc::new(Int64Array::from(positions)),
+            ])
             .map_err(|e| {
                 Error::new(
                     ErrorKind::DataInvalid,
@@ -265,9 +268,10 @@ impl TransactionAction for RewritePositionDeleteFilesAction {
                 file_name_generator.clone(),
             );
 
-            let mut writer = PositionDeleteFileWriterBuilder::new(rolling_builder, delete_config.clone())
-                .build(partition_key)
-                .await?;
+            let mut writer =
+                PositionDeleteFileWriterBuilder::new(rolling_builder, delete_config.clone())
+                    .build(partition_key)
+                    .await?;
 
             writer.write(record_batch).await?;
             let new_files = writer.close().await?;

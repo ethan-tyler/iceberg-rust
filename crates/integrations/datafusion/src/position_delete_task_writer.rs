@@ -85,8 +85,9 @@ enum SupportedDeleteWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNa
         iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<B, L, F>,
     ),
     Mixed {
-        unpartitioned:
+        unpartitioned: Box<
             iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<B, L, F>,
+        >,
         fanout: FanoutWriter<PositionDeleteFileWriterBuilder<B, L, F>>,
     },
 }
@@ -125,7 +126,7 @@ where
             let inner = writer_builder.build(None).await?;
             SupportedDeleteWriter::Unpartitioned(inner)
         } else {
-            let unpartitioned = writer_builder.clone().build(None).await?;
+            let unpartitioned = Box::new(writer_builder.clone().build(None).await?);
             let fanout = FanoutWriter::new(writer_builder);
             SupportedDeleteWriter::Mixed {
                 unpartitioned,
@@ -205,7 +206,7 @@ where
                 mut unpartitioned,
                 fanout,
             } => {
-                let mut files = unpartitioned.close().await?;
+                let mut files = (*unpartitioned).close().await?;
                 files.extend(fanout.close().await?);
                 Ok(files)
             }
@@ -554,7 +555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_partitioned_requires_partition_key() -> Result<()> {
+    async fn test_partitioned_allows_unpartitioned_deletes() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let schema = create_test_schema()?;
 
@@ -569,14 +570,14 @@ mod tests {
         let mut task_writer =
             PositionDeleteTaskWriter::try_new(writer_builder, schema, partition_spec).await?;
 
-        // Try to write without partition key to partitioned writer
         let result = task_writer
             .write("s3://bucket/data/file1.parquet", &[0], None)
             .await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Partition key required"));
+        assert!(result.is_ok());
+
+        let files = task_writer.close().await?;
+        assert_eq!(files.len(), 1);
 
         Ok(())
     }
