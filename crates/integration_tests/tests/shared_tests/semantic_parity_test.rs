@@ -65,6 +65,7 @@ use iceberg_datafusion::compaction::{CompactionOptions, compact_table};
 use iceberg_integration_tests::spark_validator::{
     spark_execute_dml_with_container, spark_execute_sql_with_container,
     spark_manifest_entries_with_container, spark_snapshot_summary_with_container,
+    spark_validate_query_with_container,
 };
 
 use super::parity_utils::{
@@ -160,16 +161,34 @@ async fn test_spark_snapshot_summary_extraction() {
     let fixture = get_shared_containers();
     let spark_container = fixture.spark_container_name();
 
-    // Get snapshot summary from a Spark-created table
-    let summary = spark_snapshot_summary_with_container(&spark_container, "test_compaction", None)
-        .await
-        .expect("Spark snapshot summary extraction should succeed");
+    let snapshot_query = "SELECT snapshot_id, operation FROM {table}.snapshots WHERE operation = 'append' ORDER BY committed_at ASC LIMIT 1";
+    let snapshot_result = spark_validate_query_with_container(
+        &spark_container,
+        "test_compaction",
+        snapshot_query,
+    )
+    .await
+    .expect("Spark snapshot query should succeed");
+    let rows = snapshot_result.rows.expect("Snapshot query should return rows");
+    let snapshot_row = rows.first().expect("Should have an append snapshot");
+    let snapshot_id = snapshot_row
+        .get("snapshot_id")
+        .and_then(|value| value.as_i64())
+        .expect("Snapshot id should be numeric");
 
-    // Verify we got valid data
-    assert!(summary.snapshot_id.is_some(), "Should have snapshot ID");
-    assert!(summary.operation.is_some(), "Should have operation type");
+    let summary = spark_snapshot_summary_with_container(
+        &spark_container,
+        "test_compaction",
+        Some(snapshot_id),
+    )
+    .await
+    .expect("Spark snapshot summary extraction should succeed");
 
-    // The test_compaction table has 5 inserts, should have append operation
+    assert_eq!(
+        summary.snapshot_id,
+        Some(snapshot_id),
+        "Summary should match requested snapshot"
+    );
     assert_eq!(
         summary.operation.as_deref(),
         Some("append"),
