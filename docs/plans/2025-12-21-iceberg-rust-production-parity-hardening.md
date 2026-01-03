@@ -487,6 +487,9 @@ Based on the verification report, the equality delete path is present end-to-end
 - Maintenance actions do not delete snapshots referenced by branches/tags.
 - `$refs` metadata table reflects expected state.
 
+**Status:** ✅ Complete (cross-engine coverage added in `crates/integration_tests/tests/shared_tests/partition_evolution_crossengine.rs`).
+**Validation:** `cargo test -p iceberg-integration-tests --test shared partition_evolution_crossengine`
+
 ---
 
 ### WP6 -- Schema evolution interoperability suite **P1**
@@ -534,6 +537,9 @@ Based on the verification report, the equality delete path is present end-to-end
 - Correct change sets for each commit type.
 - Cross-engine validation via metadata tables/snapshot summaries where possible.
 
+**Status:** ✅ Complete (Spark validation via `$entries` parity in `crates/integration_tests/tests/shared_tests/partition_evolution_crossengine.rs`).
+**Validation:** `cargo test -p iceberg-integration-tests --test shared partition_evolution_crossengine`
+
 ---
 
 ### WP9 -- Metadata tables: `$partitions` and `$entries` **P1**
@@ -569,6 +575,9 @@ Based on the verification report, the equality delete path is present end-to-end
 - Works in CI using the same harness tables.
 - Supports dry-run and explicit opt-in for destructive actions.
 - Returns non-zero exit code on partial failures.
+
+**Status:** ✅ Complete (rewrite-deletes wired to `rewrite_position_delete_files`, CLI aliases added).
+**Validation:** `cargo test -p iceberg-integration-tests --test shared cli_test`
 
 ---
 

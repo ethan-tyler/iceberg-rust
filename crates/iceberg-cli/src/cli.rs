@@ -203,6 +203,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Compact a table's data files.
+    #[command(name = "compact", aliases = ["rewrite-data-files"])]
     Compact(CompactArgs),
 
     /// Rewrite small manifests into larger consolidated manifests.
@@ -217,8 +218,8 @@ pub enum Commands {
     #[command(name = "remove-orphans")]
     RemoveOrphans(RemoveOrphansArgs),
 
-    /// Rewrite position delete files (limited support).
-    #[command(name = "rewrite-deletes")]
+    /// Rewrite position delete files.
+    #[command(name = "rewrite-deletes", aliases = ["rewrite-position-delete-files"])]
     RewriteDeletes(RewriteDeletesArgs),
 }
 
@@ -576,9 +577,19 @@ impl Cli {
                     anyhow::bail!("--location is not supported for rewrite-deletes");
                 };
 
+                let before_snapshot = table.table.metadata().current_snapshot_id();
                 let start = Instant::now();
-                let changed = false;
+
+                let tx = Transaction::new(&table.table);
+                let tx = tx
+                    .rewrite_position_delete_files()
+                    .apply(tx)
+                    .map_err(anyhow::Error::from)?;
+                let table_after = tx.commit(table.catalog.as_ref()).await.map_err(anyhow::Error::from)?;
+
                 let duration_ms = start.elapsed().as_millis() as u64;
+                let after_snapshot = table_after.metadata().current_snapshot_id();
+                let changed = after_snapshot != before_snapshot;
 
                 if self.output == OutputFormat::Json {
                     let payload = json!({
@@ -590,6 +601,8 @@ impl Cli {
                         }
                     });
                     println!("{}", serde_json::to_string(&payload)?);
+                } else if changed {
+                    println!("Rewrote position delete files");
                 } else {
                     println!("No position delete files to rewrite");
                 }

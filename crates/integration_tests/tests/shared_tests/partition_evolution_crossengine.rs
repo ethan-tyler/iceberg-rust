@@ -32,10 +32,11 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use datafusion::assert_batches_sorted_eq;
 use datafusion::prelude::*;
-use iceberg::spec::Operation;
+use iceberg::spec::{DataContentType, DataFile, DataFileFormat, ManifestStatus, Operation};
 use iceberg::transaction::{
     ApplyTransactionAction, RewriteDataFilesOptions, RewriteStrategy, Transaction,
 };
+use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_datafusion::IcebergTableProvider;
@@ -66,6 +67,53 @@ async fn assert_spark_full_validation(spark_container: &str, table: &str, expect
         full_result.bounds.is_some(),
         "Spark bounds should be computed"
     );
+}
+
+async fn write_unpartitioned_data_files(
+    table: &Table,
+    file_prefix: &str,
+    batches: Vec<arrow_array::RecordBatch>,
+) -> Vec<DataFile> {
+    use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
+    use iceberg::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+    use parquet::file::properties::WriterProperties;
+
+    let mut data_files = Vec::new();
+
+    for (index, batch) in batches.into_iter().enumerate() {
+        let location_generator =
+            DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+        let file_name_generator = DefaultFileNameGenerator::new(
+            format!("{file_prefix}-{index}"),
+            None,
+            DataFileFormat::Parquet,
+        );
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            table.metadata().current_schema().clone(),
+        );
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        );
+        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+
+        let mut writer = data_file_writer_builder
+            .build(None)
+            .await
+            .expect("data file writer");
+        writer.write(batch).await.expect("write data batch");
+        data_files.extend(writer.close().await.expect("close data file writer"));
+    }
+
+    data_files
 }
 
 /// Test DELETE on a Spark-created table with evolved partition spec.
@@ -3130,4 +3178,322 @@ async fn test_crossengine_metadata_tables_partitions_entries_parity() {
             .then_with(|| a.content.cmp(&b.content))
     });
     assert_eq!(spark_entries, rust_entries);
+}
+
+#[tokio::test]
+async fn test_crossengine_wap_branch_fast_forward() {
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_schema::Schema as ArrowSchema;
+    use iceberg::TableCreation;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+    let ns = crate::shared_tests::random_ns().await;
+    let table_name = format!("wap_branch_ff_{}", Uuid::new_v4().simple());
+
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()
+        .unwrap();
+
+    let table_creation = TableCreation::builder()
+        .name(table_name.clone())
+        .schema(schema.clone())
+        .build();
+
+    let table = rest_catalog
+        .create_table(ns.name(), table_creation)
+        .await
+        .unwrap();
+
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+
+    let initial_batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let initial_files = write_unpartitioned_data_files(
+        &table,
+        &format!("wap-init-{}", Uuid::new_v4().simple()),
+        vec![initial_batch],
+    )
+    .await;
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(initial_files)
+        .apply(tx)
+        .unwrap();
+    let table = tx.commit(&rest_catalog).await.unwrap();
+    let main_snapshot_id = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("main snapshot should exist");
+
+    let table = table
+        .create_branch("staging")
+        .commit(&rest_catalog)
+        .await
+        .unwrap();
+
+    let staged_batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![30, 40])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let staged_files = write_unpartitioned_data_files(
+        &table,
+        &format!("wap-staged-{}", Uuid::new_v4().simple()),
+        vec![staged_batch],
+    )
+    .await;
+
+    let table = table
+        .write_to_branch("staging")
+        .add_data_files(staged_files)
+        .commit(&rest_catalog)
+        .await
+        .unwrap();
+
+    let staging_ref = table
+        .metadata()
+        .refs()
+        .get("staging")
+        .expect("staging ref should exist");
+    let staging_snapshot_id = staging_ref.snapshot_id;
+
+    assert_ne!(
+        staging_snapshot_id, main_snapshot_id,
+        "staging snapshot should differ from main"
+    );
+
+    let spark_container = fixture.spark_container_name();
+    let table_ref = format!("{}.{}", ns.name(), table_name);
+
+    let count_result = spark_validate_with_container(
+        &spark_container,
+        &table_ref,
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+    assert_eq!(
+        count_result.count,
+        Some(2),
+        "Spark main should not see staged data before fast-forward"
+    );
+
+    let refs_result = spark_validate_query_with_container(
+        &spark_container,
+        &table_ref,
+        "SELECT name, snapshot_id FROM {table}.refs",
+    )
+    .await
+    .expect("Spark refs query should succeed");
+    let rows = refs_result.rows.expect("refs query should return rows");
+    let staging_row = rows
+        .iter()
+        .find(|row| row.get("name").and_then(|value| value.as_str()) == Some("staging"))
+        .expect("Spark refs should include staging");
+    let spark_snapshot_id = staging_row
+        .get("snapshot_id")
+        .and_then(|value| value.as_i64())
+        .expect("staging snapshot id should be numeric");
+
+    assert_eq!(
+        spark_snapshot_id, staging_snapshot_id,
+        "Spark refs should match staging snapshot id"
+    );
+
+    let table = table
+        .fast_forward("main", "staging")
+        .commit(&rest_catalog)
+        .await
+        .unwrap();
+
+    let after_result = spark_validate_with_container(
+        &spark_container,
+        &table_ref,
+        ValidationType::Count,
+    )
+    .await
+    .expect("Spark count validation should succeed");
+
+    assert_eq!(
+        after_result.count,
+        Some(4),
+        "Spark main should see staged data after fast-forward"
+    );
+
+    let main_snapshot_after = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("main snapshot should exist");
+    assert_eq!(
+        main_snapshot_after, staging_snapshot_id,
+        "main should fast-forward to staging snapshot"
+    );
+}
+
+#[tokio::test]
+async fn test_crossengine_incremental_scan_matches_entries_table() {
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_schema::Schema as ArrowSchema;
+    use iceberg::TableCreation;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use std::collections::HashSet;
+
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
+    let ns = crate::shared_tests::random_ns().await;
+    let table_name = format!("incremental_scan_{}", Uuid::new_v4().simple());
+
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()
+        .unwrap();
+
+    let table_creation = TableCreation::builder()
+        .name(table_name.clone())
+        .schema(schema.clone())
+        .build();
+
+    let table = rest_catalog
+        .create_table(ns.name(), table_creation)
+        .await
+        .unwrap();
+
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+
+    let batch_one = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let files_one = write_unpartitioned_data_files(
+        &table,
+        &format!("incremental-a-{}", Uuid::new_v4().simple()),
+        vec![batch_one],
+    )
+    .await;
+
+    let tx = Transaction::new(&table);
+    let tx = tx.fast_append().add_data_files(files_one).apply(tx).unwrap();
+    let table = tx.commit(&rest_catalog).await.unwrap();
+    let snapshot_1 = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("snapshot 1 should exist");
+
+    let batch_two = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![300, 400])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let files_two = write_unpartitioned_data_files(
+        &table,
+        &format!("incremental-b-{}", Uuid::new_v4().simple()),
+        vec![batch_two],
+    )
+    .await;
+
+    let tx = Transaction::new(&table);
+    let tx = tx.fast_append().add_data_files(files_two).apply(tx).unwrap();
+    let table = tx.commit(&rest_catalog).await.unwrap();
+    let snapshot_2 = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("snapshot 2 should exist");
+
+    let changes = table
+        .incremental_scan(snapshot_1, snapshot_2)
+        .build()
+        .expect("incremental scan should build")
+        .changes()
+        .await
+        .expect("incremental scan should succeed");
+
+    assert!(changes.removed_data_files().is_empty(), "No files removed");
+    assert!(
+        !changes.added_data_files().is_empty(),
+        "Expected added files"
+    );
+
+    let rust_paths: HashSet<String> = changes
+        .added_data_files()
+        .iter()
+        .map(|file| file.file_path().to_string())
+        .collect();
+
+    let spark_container = fixture.spark_container_name();
+    let table_ref = format!("{}.{}", ns.name(), table_name);
+    let entries_result = spark_entries_table_with_container(&spark_container, &table_ref, Some(200))
+        .await
+        .expect("Spark entries table should succeed");
+
+    let spark_paths: HashSet<String> = entries_result
+        .entries
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.snapshot_id == Some(snapshot_2))
+        .filter(|entry| entry.status == Some(ManifestStatus::Added as i32))
+        .filter_map(|entry| {
+            let data_file = entry.data_file?;
+            if data_file.content == Some(DataContentType::Data as i32) {
+                data_file.file_path
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        spark_paths, rust_paths,
+        "Incremental scan added files should match Spark entries"
+    );
 }
