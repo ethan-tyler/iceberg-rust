@@ -39,15 +39,45 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use iceberg::spec::{DataFile, PartitionKey, PartitionSpecRef, SchemaRef};
+use iceberg::writer::base_writer::deletion_vector_writer::DeletionVectorWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
 };
-use iceberg::writer::file_writer::FileWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
-use iceberg::writer::partitioning::PartitioningWriter;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
+use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Error, ErrorKind, Result};
+
+pub(crate) type ParquetDeleteWriterBuilder = PositionDeleteFileWriterBuilder<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+pub(crate) type DeletionVectorDeleteWriterBuilder =
+    DeletionVectorWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+#[derive(Clone)]
+pub(crate) enum DeleteWriterBuilder {
+    Parquet(ParquetDeleteWriterBuilder),
+    DeletionVector(DeletionVectorDeleteWriterBuilder),
+}
+
+#[async_trait::async_trait]
+impl IcebergWriterBuilder<RecordBatch, Vec<DataFile>> for DeleteWriterBuilder {
+    type R = Box<dyn IcebergWriter<RecordBatch, Vec<DataFile>>>;
+
+    async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
+        match self {
+            Self::Parquet(builder) => Ok(Box::new(builder.build(partition_key).await?)),
+            Self::DeletionVector(builder) => Ok(Box::new(builder.build(partition_key).await?)),
+        }
+    }
+}
 
 /// Task-level writer for position delete files with partition support.
 ///
@@ -69,34 +99,30 @@ use iceberg::{Error, ErrorKind, Result};
 /// 1. Accepting partition keys with their original partition spec (from FileScanTask)
 /// 2. Using FanoutWriter to create separate delete files per partition
 /// 3. Each delete file gets the correct `partition_spec_id` from its partition key
-pub struct PositionDeleteTaskWriter<
-    B: FileWriterBuilder,
-    L: LocationGenerator,
-    F: FileNameGenerator,
-> {
-    writer: SupportedDeleteWriter<B, L, F>,
+pub struct PositionDeleteTaskWriter<W>
+where
+    W: IcebergWriterBuilder<RecordBatch, Vec<DataFile>> + Clone,
+{
+    writer: SupportedDeleteWriter<W>,
     config: PositionDeleteWriterConfig,
 }
 
 /// Internal enum to hold different writer types based on partitioning strategy.
-enum SupportedDeleteWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> {
+enum SupportedDeleteWriter<W>
+where
+    W: IcebergWriterBuilder<RecordBatch, Vec<DataFile>> + Clone,
+{
     /// Writer for unpartitioned tables - single writer, no partition routing
-    Unpartitioned(
-        iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<B, L, F>,
-    ),
+    Unpartitioned(W::R),
     Mixed {
-        unpartitioned: Box<
-            iceberg::writer::base_writer::position_delete_writer::PositionDeleteFileWriter<B, L, F>,
-        >,
-        fanout: FanoutWriter<PositionDeleteFileWriterBuilder<B, L, F>>,
+        unpartitioned: Box<W::R>,
+        fanout: FanoutWriter<W>,
     },
 }
 
-impl<B, L, F> PositionDeleteTaskWriter<B, L, F>
+impl<W> PositionDeleteTaskWriter<W>
 where
-    B: FileWriterBuilder,
-    L: LocationGenerator,
-    F: FileNameGenerator,
+    W: IcebergWriterBuilder<RecordBatch, Vec<DataFile>> + Clone,
 {
     /// Create a new `PositionDeleteTaskWriter`.
     ///
@@ -115,7 +141,7 @@ where
     /// - If `partition_spec` is unpartitioned: creates a single position delete writer
     /// - If `partition_spec` is partitioned: creates a FanoutWriter for multi-partition support
     pub async fn try_new(
-        writer_builder: PositionDeleteFileWriterBuilder<B, L, F>,
+        writer_builder: W,
         _schema: SchemaRef,
         partition_spec: PartitionSpecRef,
     ) -> Result<Self> {

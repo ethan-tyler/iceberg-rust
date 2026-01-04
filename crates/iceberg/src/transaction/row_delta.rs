@@ -76,6 +76,8 @@ pub struct RowDeltaAction {
     validate_from_snapshot_id: Option<i64>,
     validate_no_conflicting_data: bool,
     validate_no_conflicting_deletes: bool,
+    validate_data_files_exist: HashSet<String>,
+    validate_deleted_files: bool,
 }
 
 impl RowDeltaAction {
@@ -90,6 +92,8 @@ impl RowDeltaAction {
             validate_from_snapshot_id: None,
             validate_no_conflicting_data: false,
             validate_no_conflicting_deletes: false,
+            validate_data_files_exist: HashSet::new(),
+            validate_deleted_files: false,
         }
     }
 
@@ -175,6 +179,23 @@ impl RowDeltaAction {
     /// to affected partitions since the baseline snapshot.
     pub fn validate_no_conflicting_delete_files(mut self) -> Self {
         self.validate_no_conflicting_deletes = true;
+        self
+    }
+
+    /// Require referenced data files to exist during conflict validation.
+    pub fn validate_data_files_exist<I, S>(mut self, referenced_files: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.validate_data_files_exist
+            .extend(referenced_files.into_iter().map(Into::into));
+        self
+    }
+
+    /// Include delete operations when validating referenced data files.
+    pub fn validate_deleted_files(mut self) -> Self {
+        self.validate_deleted_files = true;
         self
     }
 
@@ -311,6 +332,78 @@ impl RowDeltaAction {
 
         Ok(())
     }
+
+    async fn validate_referenced_data_files(&self, table: &Table) -> Result<()> {
+        if self.validate_data_files_exist.is_empty() {
+            return Ok(());
+        }
+
+        let mut current_snapshot_id = table.metadata().current_snapshot_id();
+        while let Some(snapshot_id) = current_snapshot_id {
+            if self.validate_from_snapshot_id == Some(snapshot_id) {
+                break;
+            }
+
+            let snapshot = table.metadata().snapshot_by_id(snapshot_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Snapshot {snapshot_id} not found in metadata during validation"
+                    ),
+                )
+            })?;
+
+            let should_check = match snapshot.summary().operation {
+                Operation::Replace | Operation::Overwrite => true,
+                Operation::Delete => self.validate_deleted_files,
+                _ => false,
+            };
+
+            if should_check {
+                let manifest_list = snapshot
+                    .load_manifest_list(table.file_io(), &table.metadata_ref())
+                    .await?;
+
+                for manifest in manifest_list.entries() {
+                    if manifest.content != ManifestContentType::Data
+                        || !manifest.has_deleted_files()
+                    {
+                        continue;
+                    }
+
+                    let loaded_manifest = manifest.load_manifest(table.file_io()).await?;
+                    for entry in loaded_manifest.entries() {
+                        if entry.status() != ManifestStatus::Deleted {
+                            continue;
+                        }
+
+                        if self
+                            .validate_data_files_exist
+                            .contains(entry.data_file().file_path())
+                        {
+                            return Err(Error::new(
+                                ErrorKind::CatalogCommitConflicts,
+                                format!(
+                                    "Referenced data file removed in snapshot {}: {}",
+                                    snapshot_id,
+                                    entry.data_file().file_path()
+                                ),
+                            )
+                            .with_context(
+                                "conflicting_file",
+                                entry.data_file().file_path().to_string(),
+                            )
+                            .with_retryable(true));
+                        }
+                    }
+                }
+            }
+
+            current_snapshot_id = snapshot.parent_snapshot_id();
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -342,6 +435,8 @@ impl TransactionAction for RowDeltaAction {
         if self.check_duplicate {
             snapshot_producer.validate_duplicate_files().await?;
         }
+
+        self.validate_referenced_data_files(table).await?;
 
         // Validate no conflicting files have been added since baseline
         self.validate_no_conflicts(table).await?;
@@ -417,8 +512,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Operation, Struct,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestListWriter,
+        ManifestWriterBuilder, MAIN_BRANCH, Operation, Snapshot, SnapshotReference,
+        SnapshotRetention, Struct, Summary, TableMetadataBuilder,
     };
+    use crate::table::Table;
     use crate::transaction::tests::{make_v1_table, make_v2_minimal_table};
     use crate::transaction::{Transaction, TransactionAction};
     use crate::{TableRequirement, TableUpdate};
@@ -1055,6 +1153,217 @@ mod tests {
         // Should succeed because validation flags are not enabled
         let result = Arc::new(action).commit(&table).await;
         assert!(result.is_ok());
+    }
+
+    async fn table_with_removed_data_file_snapshot(
+        operation: Operation,
+    ) -> (Table, i64, String) {
+        let table = make_v2_minimal_table();
+        let file_io = table.file_io().clone();
+        let table_location = table.metadata().location().to_string();
+        let schema = table.metadata().current_schema().clone();
+        let partition_spec = table.metadata().default_partition_spec().clone();
+        let spec_id = table.metadata().default_partition_spec_id();
+        let base_sequence = table.metadata().last_sequence_number();
+        let base_ts = table.metadata().last_updated_ms();
+
+        let removed_file_path =
+            format!("{}/data/removed-file.parquet", table.metadata().location());
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(removed_file_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(spec_id)
+            .partition(Struct::from_iter([Some(Literal::long(100))]))
+            .build()
+            .unwrap();
+
+        let baseline_snapshot_id = base_sequence + 101;
+        let current_snapshot_id = base_sequence + 102;
+        let baseline_sequence = base_sequence + 1;
+        let current_sequence = base_sequence + 2;
+
+        let manifest_path = format!("{}/metadata/manifest-2.avro", table_location);
+        let output = file_io.new_output(&manifest_path).unwrap();
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            Some(current_snapshot_id),
+            None,
+            schema.clone(),
+            (*partition_spec).clone(),
+        )
+        .build_v2_data();
+        writer
+            .add_delete_file(data_file, current_sequence, Some(current_sequence))
+            .unwrap();
+        let manifest = writer.write_manifest_file().await.unwrap();
+
+        let baseline_manifest_list_path = format!("{}/metadata/snap-1.avro", table_location);
+        let baseline_writer = ManifestListWriter::v2(
+            file_io.new_output(&baseline_manifest_list_path).unwrap(),
+            baseline_snapshot_id,
+            None,
+            baseline_sequence,
+        );
+        baseline_writer.close().await.unwrap();
+
+        let current_manifest_list_path = format!("{}/metadata/snap-2.avro", table_location);
+        let mut manifest_list_writer = ManifestListWriter::v2(
+            file_io.new_output(&current_manifest_list_path).unwrap(),
+            current_snapshot_id,
+            Some(baseline_snapshot_id),
+            current_sequence,
+        );
+        manifest_list_writer
+            .add_manifests(vec![manifest].into_iter())
+            .unwrap();
+        manifest_list_writer.close().await.unwrap();
+
+        let baseline_snapshot = Snapshot::builder()
+            .with_snapshot_id(baseline_snapshot_id)
+            .with_sequence_number(baseline_sequence)
+            .with_timestamp_ms(base_ts + 1000)
+            .with_manifest_list(baseline_manifest_list_path)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        let current_snapshot = Snapshot::builder()
+            .with_snapshot_id(current_snapshot_id)
+            .with_parent_snapshot_id(Some(baseline_snapshot_id))
+            .with_sequence_number(current_sequence)
+            .with_timestamp_ms(base_ts + 2000)
+            .with_manifest_list(current_manifest_list_path)
+            .with_summary(Summary {
+                operation,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        let build_result = TableMetadataBuilder::new_from_metadata(table.metadata().clone(), None)
+            .add_snapshot(baseline_snapshot)
+            .unwrap()
+            .add_snapshot(current_snapshot)
+            .unwrap()
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(
+                    current_snapshot_id,
+                    SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let table = table.with_metadata(Arc::new(build_result.metadata));
+
+        (table, baseline_snapshot_id, removed_file_path)
+    }
+
+    #[tokio::test]
+    async fn test_row_delta_validate_data_files_exist_fails_on_overwrite() {
+        let (table, baseline_snapshot_id, removed_file_path) =
+            table_with_removed_data_file_snapshot(Operation::Overwrite).await;
+        let tx = Transaction::new(&table);
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let action = tx
+            .row_delta()
+            .add_data_files(vec![data_file])
+            .validate_from_snapshot(baseline_snapshot_id)
+            .validate_data_files_exist([removed_file_path]);
+
+        let result = Arc::new(action).commit(&table).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.message()
+                .contains("Referenced data file removed in snapshot"),
+            "Unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_delta_validate_data_files_exist_skips_delete_operations() {
+        let (table, baseline_snapshot_id, removed_file_path) =
+            table_with_removed_data_file_snapshot(Operation::Delete).await;
+        let tx = Transaction::new(&table);
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let action = tx
+            .row_delta()
+            .add_data_files(vec![data_file])
+            .validate_from_snapshot(baseline_snapshot_id)
+            .validate_data_files_exist([removed_file_path]);
+
+        let result = Arc::new(action).commit(&table).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_row_delta_validate_deleted_files_checks_delete_operations() {
+        let (table, baseline_snapshot_id, removed_file_path) =
+            table_with_removed_data_file_snapshot(Operation::Delete).await;
+        let tx = Transaction::new(&table);
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let action = tx
+            .row_delta()
+            .add_data_files(vec![data_file])
+            .validate_from_snapshot(baseline_snapshot_id)
+            .validate_data_files_exist([removed_file_path])
+            .validate_deleted_files();
+
+        let result = Arc::new(action).commit(&table).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.message()
+                .contains("Referenced data file removed in snapshot"),
+            "Unexpected error: {}",
+            err.message()
+        );
     }
 
     #[test]

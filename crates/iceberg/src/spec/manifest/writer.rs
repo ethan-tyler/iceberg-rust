@@ -244,7 +244,7 @@ impl ManifestWriter {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
-                            "Date file at path {} with manifest content type `deletes`, should have DataContentType `Data`, but has `{:?}`",
+                            "Data file at path {} with manifest content type `deletes`, should have DataContentType `EqualityDeletes` or `PositionDeletes`, but has `{:?}`",
                             data_file.file_path(),
                             data_file.content
                         ),
@@ -707,5 +707,73 @@ mod tests {
         // file sequence number is assigned to None when the entry is added and delete to the manifest.
         entries[0].file_sequence_number = None;
         assert_eq!(actual_manifest, Manifest::new(metadata, entries));
+    }
+
+    #[tokio::test]
+    async fn test_delete_manifest_rejects_data_content_message() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("test_manifest.avro");
+        let io = FileIOBuilder::new_fs_io().build().unwrap();
+        let output_file = io.new_output(path.to_str().unwrap()).unwrap();
+        let mut writer = ManifestWriterBuilder::new(
+            output_file,
+            Some(1),
+            None,
+            schema,
+            partition_spec,
+        )
+        .build_v2_deletes();
+
+        let entry = ManifestEntry {
+            status: ManifestStatus::Added,
+            snapshot_id: None,
+            sequence_number: Some(1),
+            file_sequence_number: Some(1),
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: "s3a://icebergdata/demo/s1/t1/data/00000.parquet".to_string(),
+                file_format: DataFileFormat::Parquet,
+                partition: Struct::empty(),
+                record_count: 1,
+                file_size_in_bytes: 10,
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        };
+
+        let err = writer.add_entry(entry).unwrap_err();
+        assert!(err
+            .message()
+            .contains("manifest content type `deletes`"));
+        assert!(err.message().contains("EqualityDeletes"));
+        assert!(err.message().contains("PositionDeletes"));
     }
 }

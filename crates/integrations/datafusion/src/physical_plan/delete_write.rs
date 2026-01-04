@@ -42,12 +42,13 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::spec::{
-    DataFileFormat, PartitionSpec, SchemaRef as IcebergSchemaRef, Struct, TableProperties,
-    serialize_data_file_to_json,
+    DataFile, DataFileFormat, FormatVersion, PartitionSpec, SchemaRef as IcebergSchemaRef, Struct,
+    TableProperties, serialize_data_file_to_json,
 };
 use iceberg::table::Table;
+use iceberg::writer::base_writer::deletion_vector_writer::DeletionVectorWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriter, PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -60,6 +61,7 @@ use uuid::Uuid;
 
 use super::delete_scan::{DELETE_FILE_PATH_COL, DELETE_POS_COL};
 use crate::partition_utils::{FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map};
+use crate::position_delete_task_writer::DeleteWriterBuilder;
 use crate::to_datafusion_error;
 
 /// Column name for serialized delete files in output
@@ -114,19 +116,8 @@ impl Hash for PartitionGroupKey {
     }
 }
 
-/// Type alias for the position delete writer builder.
-type DeleteWriterBuilder = PositionDeleteFileWriterBuilder<
-    ParquetWriterBuilder,
-    DefaultLocationGenerator,
-    DefaultFileNameGenerator,
->;
-
 /// Type alias for the position delete writer used in partitioned delete collection.
-type PartitionDeleteWriter = PositionDeleteFileWriter<
-    ParquetWriterBuilder,
-    DefaultLocationGenerator,
-    DefaultFileNameGenerator,
->;
+type PartitionDeleteWriter = Box<dyn IcebergWriter<RecordBatch, Vec<DataFile>>>;
 
 /// Collects position deletes grouped by partition and manages writers.
 ///
@@ -531,10 +522,16 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                 .map_err(to_datafusion_error)?;
 
             // Use "delete" prefix for delete files
+            let delete_file_prefix = format!("delete-{}", Uuid::now_v7());
+            let delete_file_format = if format_version == FormatVersion::V3 {
+                DataFileFormat::Puffin
+            } else {
+                DataFileFormat::Parquet
+            };
             let file_name_generator = DefaultFileNameGenerator::new(
-                format!("delete-{}", Uuid::now_v7()),
+                delete_file_prefix,
                 None,
-                DataFileFormat::Parquet,
+                delete_file_format,
             );
 
             let target_file_size = table
@@ -569,22 +566,34 @@ impl ExecutionPlan for IcebergDeleteWriteExec {
                     .map_err(to_datafusion_error)?,
             );
 
-            let parquet_writer_builder = ParquetWriterBuilder::new(
-                WriterProperties::default(),
-                iceberg_delete_schema,
-            );
+            let delete_writer_builder = if format_version == FormatVersion::V3 {
+                let dv_builder = DeletionVectorWriterBuilder::new(
+                    file_io.clone(),
+                    location_generator.clone(),
+                    file_name_generator,
+                    delete_config.clone(),
+                );
+                DeleteWriterBuilder::DeletionVector(dv_builder)
+            } else {
+                let parquet_writer_builder = ParquetWriterBuilder::new(
+                    WriterProperties::default(),
+                    iceberg_delete_schema,
+                );
 
-            let rolling_writer_builder = RollingFileWriterBuilder::new(
-                parquet_writer_builder,
-                target_file_size,
-                file_io,
-                location_generator,
-                file_name_generator,
-            );
+                let rolling_writer_builder = RollingFileWriterBuilder::new(
+                    parquet_writer_builder,
+                    target_file_size,
+                    file_io,
+                    location_generator,
+                    file_name_generator,
+                );
 
-            let delete_writer_builder =
-                PositionDeleteFileWriterBuilder::new(rolling_writer_builder, delete_config.clone());
-
+                let delete_file_builder = PositionDeleteFileWriterBuilder::new(
+                    rolling_writer_builder,
+                    delete_config.clone(),
+                );
+                DeleteWriterBuilder::Parquet(delete_file_builder)
+            };
             // Create partitioned delete collector
             // Collect all schemas for partition evolution support (historical partition specs
             // may reference fields not in the current schema)

@@ -170,8 +170,12 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
         FileScanTaskDeleteFile {
             file_path: ctx.manifest_entry.file_path().to_string(),
             file_type: ctx.manifest_entry.content_type(),
+            file_format: ctx.manifest_entry.data_file.file_format(),
             partition_spec_id: ctx.partition_spec_id,
             equality_ids: ctx.manifest_entry.data_file.equality_ids.clone(),
+            referenced_data_file: ctx.manifest_entry.data_file.referenced_data_file(),
+            content_offset: ctx.manifest_entry.data_file.content_offset(),
+            content_size_in_bytes: ctx.manifest_entry.data_file.content_size_in_bytes(),
         }
     }
 }
@@ -185,11 +189,29 @@ pub struct FileScanTaskDeleteFile {
     /// delete file type
     pub file_type: DataContentType,
 
+    /// File format of the delete file.
+    pub file_format: DataFileFormat,
+
     /// partition id
     pub partition_spec_id: i32,
 
     /// equality ids for equality deletes (null for anything other than equality-deletes)
     pub equality_ids: Option<Vec<i32>>,
+
+    /// Referenced data file for position deletes or deletion vectors.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced_data_file: Option<String>,
+
+    /// Offset of the deletion vector blob within the delete file.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_offset: Option<i64>,
+
+    /// Length in bytes of the deletion vector blob.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_size_in_bytes: Option<i64>,
 }
 
 #[cfg(test)]

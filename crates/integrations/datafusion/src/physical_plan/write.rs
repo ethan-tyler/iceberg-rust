@@ -16,6 +16,7 @@
 // under the License.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -51,6 +52,24 @@ use uuid::Uuid;
 use crate::physical_plan::DATA_FILES_COL_NAME;
 use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
+
+pub(crate) fn resolve_fanout_enabled(
+    properties: &HashMap<String, String>,
+) -> std::result::Result<bool, Error> {
+    properties
+        .get(TableProperties::PROPERTY_WRITE_FANOUT_ENABLED)
+        .map(|value| {
+            value.parse::<bool>().map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Invalid value for write.fanout.enabled",
+                )
+                .with_source(e)
+            })
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(TableProperties::PROPERTY_WRITE_FANOUT_ENABLED_DEFAULT))
+}
 
 /// An execution plan node that writes data to an Iceberg table.
 ///
@@ -266,8 +285,8 @@ impl ExecutionPlan for IcebergWriteExec {
         let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
         // Create TaskWriter
-        // TODO: Make fanout_enabled configurable via table properties
-        let fanout_enabled = true;
+        let fanout_enabled =
+            resolve_fanout_enabled(self.table.metadata().properties()).map_err(to_datafusion_error)?;
         let schema = self.table.metadata().current_schema().clone();
         let partition_spec = self.table.metadata().default_partition_spec().clone();
         let task_writer = TaskWriter::try_new(
@@ -348,6 +367,32 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn test_resolve_fanout_enabled_default() {
+        let props = HashMap::new();
+        let enabled = resolve_fanout_enabled(&props).unwrap();
+        assert!(enabled);
+    }
+
+    #[test]
+    fn test_resolve_fanout_enabled_false() {
+        let props = HashMap::from([(
+            TableProperties::PROPERTY_WRITE_FANOUT_ENABLED.to_string(),
+            "false".to_string(),
+        )]);
+        let enabled = resolve_fanout_enabled(&props).unwrap();
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn test_resolve_fanout_enabled_invalid() {
+        let props = HashMap::from([(
+            TableProperties::PROPERTY_WRITE_FANOUT_ENABLED.to_string(),
+            "not-a-bool".to_string(),
+        )]);
+        assert!(resolve_fanout_enabled(&props).is_err());
+    }
 
     /// A simple execution plan that returns a predefined set of record batches
     struct MockExecutionPlan {

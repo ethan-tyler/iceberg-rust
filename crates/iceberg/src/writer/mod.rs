@@ -417,6 +417,25 @@ pub trait IcebergWriter<I = DefaultInput, O = DefaultOutput>: Send + 'static {
     async fn close(&mut self) -> Result<O>;
 }
 
+/// Blanket implementation for boxed trait objects.
+///
+/// This allows `Box<dyn IcebergWriter<I, O>>` to be used where `IcebergWriter<I, O>` is required,
+/// enabling dynamic dispatch for writer implementations (e.g., in `IcebergWriterBuilder::R`).
+#[async_trait::async_trait]
+impl<I, O> IcebergWriter<I, O> for Box<dyn IcebergWriter<I, O>>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+{
+    async fn write(&mut self, input: I) -> Result<()> {
+        (**self).write(input).await
+    }
+
+    async fn close(&mut self) -> Result<O> {
+        (**self).close().await
+    }
+}
+
 /// The current file status of the Iceberg writer.
 /// This is implemented for writers that write a single file at a time.
 pub trait CurrentFileStatus {

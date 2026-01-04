@@ -188,6 +188,11 @@ impl TableProperties {
     /// Default value for write.distribution-mode.
     pub const PROPERTY_WRITE_DISTRIBUTION_MODE_DEFAULT: &str = "none";
 
+    /// Enable fanout writers for partitioned writes.
+    pub const PROPERTY_WRITE_FANOUT_ENABLED: &str = "write.fanout.enabled";
+    /// Default value for write.fanout.enabled.
+    pub const PROPERTY_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
+
     // =========================================================================
     // Metadata Cleanup Properties
     // =========================================================================

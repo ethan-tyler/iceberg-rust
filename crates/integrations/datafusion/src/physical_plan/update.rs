@@ -67,10 +67,11 @@ use futures::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
-    DataFileFormat, PartitionKey, Struct, TableProperties, serialize_data_file_to_json,
+    DataFileFormat, FormatVersion, PartitionKey, Struct, TableProperties, serialize_data_file_to_json,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::base_writer::deletion_vector_writer::DeletionVectorWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
 };
@@ -84,7 +85,8 @@ use uuid::Uuid;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
 use super::record_batch::coerce_batch_schema;
-use crate::position_delete_task_writer::PositionDeleteTaskWriter;
+use crate::physical_plan::write::resolve_fanout_enabled;
+use crate::position_delete_task_writer::{DeleteWriterBuilder, PositionDeleteTaskWriter};
 use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
 
@@ -357,7 +359,8 @@ async fn execute_update(
     // Use computed partitions mode since UPDATE reads existing files without a _partition column
     let iceberg_schema = table.metadata().current_schema().clone();
     let data_partition_spec = table.metadata().default_partition_spec().clone();
-    let fanout_enabled = true; // Use fanout for unsorted partition data
+    let fanout_enabled =
+        resolve_fanout_enabled(table.metadata().properties()).map_err(to_datafusion_error)?;
     let mut data_file_writer = TaskWriter::try_new_with_computed_partitions(
         data_file_builder,
         fanout_enabled,
@@ -391,22 +394,39 @@ async fn execute_update(
             .map_err(to_datafusion_error)?,
     );
 
-    let delete_parquet_writer =
-        ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema.clone());
+    let delete_file_format = if format_version == FormatVersion::V3 {
+        DataFileFormat::Puffin
+    } else {
+        DataFileFormat::Parquet
+    };
     let delete_file_name_generator = DefaultFileNameGenerator::new(
         format!("update-delete-{}", Uuid::now_v7()),
         None,
-        DataFileFormat::Parquet,
+        delete_file_format,
     );
-    let delete_rolling_writer = RollingFileWriterBuilder::new(
-        delete_parquet_writer,
-        target_file_size,
-        file_io.clone(),
-        location_generator,
-        delete_file_name_generator,
-    );
-    let delete_file_builder =
-        PositionDeleteFileWriterBuilder::new(delete_rolling_writer, delete_config.clone());
+
+    let delete_writer_builder = if format_version == FormatVersion::V3 {
+        let dv_builder = DeletionVectorWriterBuilder::new(
+            file_io.clone(),
+            location_generator.clone(),
+            delete_file_name_generator,
+            delete_config.clone(),
+        );
+        DeleteWriterBuilder::DeletionVector(dv_builder)
+    } else {
+        let delete_parquet_writer =
+            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema.clone());
+        let delete_rolling_writer = RollingFileWriterBuilder::new(
+            delete_parquet_writer,
+            target_file_size,
+            file_io.clone(),
+            location_generator.clone(),
+            delete_file_name_generator,
+        );
+        let delete_file_builder =
+            PositionDeleteFileWriterBuilder::new(delete_rolling_writer, delete_config.clone());
+        DeleteWriterBuilder::Parquet(delete_file_builder)
+    };
 
     // Get default partition spec for constructing partition keys
     let default_partition_spec = table.metadata().default_partition_spec().clone();
@@ -424,7 +444,7 @@ async fn execute_update(
         .collect();
 
     let mut delete_task_writer = PositionDeleteTaskWriter::try_new(
-        delete_file_builder,
+        delete_writer_builder,
         iceberg_delete_schema,
         default_partition_spec.clone(),
     )

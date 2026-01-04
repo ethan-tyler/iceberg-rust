@@ -66,6 +66,7 @@ bytes = "1.10"
 chrono = "0.4.41"
 clap = { version = "4.5.48", features = ["derive", "cargo", "env"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
+crc32fast = "1.4.2"
 ctor = "0.2.8"
 datafusion = "51.0"
 datafusion-cli = "51.0"

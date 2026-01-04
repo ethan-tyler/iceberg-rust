@@ -155,6 +155,33 @@ mod tests {
     use crate::transaction::{Transaction, TransactionAction};
     use crate::{TableRequirement, TableUpdate};
 
+    fn make_v3_minimal_table() -> crate::table::Table {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        use crate::TableIdent;
+        use crate::io::FileIOBuilder;
+        use crate::spec::TableMetadata;
+        use crate::table::Table;
+
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV3ValidMinimal.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .build()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_reject_delete_files_for_v1_table() {
         let table = make_v1_table();
@@ -292,6 +319,269 @@ mod tests {
             err.message()
                 .contains("Equality delete files must have equality_ids set")
         );
+    }
+
+    #[tokio::test]
+    async fn test_reject_puffin_delete_for_v2_table() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let delete_file = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/delete-1.puffin".to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .referenced_data_file(Some("test/data-1.parquet".to_string()))
+            .content_offset(Some(10))
+            .content_size_in_bytes(Some(20))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![delete_file]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err
+            .message()
+            .contains("Deletion vectors are only supported in format version 3"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_parquet_position_delete_for_v3_table() {
+        let table = make_v3_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let delete_file = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/delete-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![delete_file]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err
+            .message()
+            .contains("Position delete files must use Puffin format in format version 3"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_puffin_delete_missing_referenced_data_file() {
+        let table = make_v3_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let delete_file = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/delete-1.puffin".to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .content_offset(Some(10))
+            .content_size_in_bytes(Some(20))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![delete_file]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err
+            .message()
+            .contains("Deletion vectors require referenced_data_file"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_puffin_delete_missing_content_offset() {
+        let table = make_v3_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let delete_file = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/delete-2.puffin".to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .referenced_data_file(Some("test/data-1.parquet".to_string()))
+            .content_size_in_bytes(Some(20))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![delete_file]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.message().contains("Deletion vectors require content_offset"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_puffin_delete_missing_content_size() {
+        let table = make_v3_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let delete_file = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/delete-3.puffin".to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .referenced_data_file(Some("test/data-1.parquet".to_string()))
+            .content_offset(Some(10))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![delete_file]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.message()
+                .contains("Deletion vectors require content_size_in_bytes")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reject_duplicate_deletion_vectors_for_same_data_file() {
+        let table = make_v3_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let delete_file_1 = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/delete-dup-1.puffin".to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .referenced_data_file(Some("test/data-1.parquet".to_string()))
+            .content_offset(Some(10))
+            .content_size_in_bytes(Some(20))
+            .build()
+            .unwrap();
+
+        let delete_file_2 = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/delete-dup-2.puffin".to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(120)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .referenced_data_file(Some("test/data-1.parquet".to_string()))
+            .content_offset(Some(30))
+            .content_size_in_bytes(Some(40))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![delete_file_1, delete_file_2]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.message().contains(
+            "Deletion vectors must not target the same referenced_data_file more than once"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reject_equality_delete_duplicate_equality_ids() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let equality_delete = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("test/eq-delete-dup.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .equality_ids(Some(vec![1, 1]))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![equality_delete]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err
+            .message()
+            .contains("Equality delete files must have unique equality_ids"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_equality_delete_content_offset() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let equality_delete = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("test/eq-delete-offset.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .equality_ids(Some(vec![1]))
+            .content_offset(Some(10))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![equality_delete]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err
+            .message()
+            .contains("Equality delete files must not set content_offset or content_size_in_bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_equality_delete_unknown_equality_id() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let equality_delete = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("test/eq-delete-unknown.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .equality_ids(Some(vec![999]))
+            .build()
+            .unwrap();
+
+        let action = tx.delete().add_delete_files(vec![equality_delete]);
+        let result = Arc::new(action).commit(&table).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err
+            .message()
+            .contains("Equality delete files reference unknown field id: 999"));
     }
 
     #[tokio::test]

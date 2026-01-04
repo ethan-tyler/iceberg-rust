@@ -17,7 +17,6 @@
 
 //! This module provides `PositionDeleteFileWriter`.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
@@ -163,7 +162,8 @@ where
             inner: Some(self.inner.clone().build()),
             config: self.config.clone(),
             partition_key,
-            referenced_data_files: HashSet::new(),
+            referenced_data_file: None,
+            has_multiple_referenced_data_files: false,
         })
     }
 }
@@ -178,8 +178,8 @@ pub struct PositionDeleteFileWriter<
     inner: Option<RollingFileWriter<B, L, F>>,
     config: PositionDeleteWriterConfig,
     partition_key: Option<PartitionKey>,
-    // Track unique data file paths referenced by position deletes
-    referenced_data_files: HashSet<String>,
+    referenced_data_file: Option<String>,
+    has_multiple_referenced_data_files: bool,
 }
 
 impl<B, L, F> PositionDeleteFileWriter<B, L, F>
@@ -191,6 +191,62 @@ where
     /// Returns the Arrow schema for position delete files.
     pub fn delete_schema(&self) -> &ArrowSchemaRef {
         &self.config.delete_schema
+    }
+
+    fn update_referenced_data_file(&mut self, path: &str) {
+        if self.has_multiple_referenced_data_files {
+            return;
+        }
+
+        match &self.referenced_data_file {
+            None => {
+                self.referenced_data_file = Some(path.to_string());
+            }
+            Some(existing) => {
+                if existing != path {
+                    self.referenced_data_file = None;
+                    self.has_multiple_referenced_data_files = true;
+                }
+            }
+        }
+    }
+
+    fn sort_batch(
+        &self,
+        file_path_array: &arrow_array::StringArray,
+        pos_array: &arrow_array::Int64Array,
+    ) -> Result<RecordBatch> {
+        let mut indices: Vec<usize> = (0..file_path_array.len()).collect();
+        indices.sort_by(|&left, &right| {
+            file_path_array
+                .value(left)
+                .cmp(file_path_array.value(right))
+                .then_with(|| pos_array.value(left).cmp(&pos_array.value(right)))
+        });
+
+        let file_paths = indices
+            .iter()
+            .map(|&idx| file_path_array.value(idx).to_string())
+            .collect::<Vec<_>>();
+        let positions = indices
+            .iter()
+            .map(|&idx| pos_array.value(idx))
+            .collect::<Vec<_>>();
+
+        RecordBatch::try_new(
+            self.config.delete_schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from_iter_values(file_paths)),
+                Arc::new(arrow_array::Int64Array::from_iter_values(positions)),
+            ],
+        )
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Failed to build sorted position delete batch".to_string(),
+            )
+            .with_source(err)
+        })
     }
 
     fn validate_schema(&self, batch: &RecordBatch) -> Result<()> {
@@ -327,6 +383,11 @@ where
                 )
             })?;
 
+        let mut is_sorted = true;
+        let mut last_path = "";
+        let mut last_pos = 0i64;
+        let mut has_last = false;
+
         for i in 0..file_path_array.len() {
             if file_path_array.is_null(i) {
                 return Err(Error::new(
@@ -348,8 +409,28 @@ where
                 ));
             }
             let path = file_path_array.value(i);
-            self.referenced_data_files.insert(path.to_string());
+            self.update_referenced_data_file(path);
+
+            if has_last {
+                let cmp = last_path.cmp(path);
+                if cmp == std::cmp::Ordering::Greater
+                    || (cmp == std::cmp::Ordering::Equal && last_pos > pos)
+                {
+                    is_sorted = false;
+                }
+            } else {
+                has_last = true;
+            }
+
+            last_path = path;
+            last_pos = pos;
         }
+
+        let batch = if is_sorted {
+            batch
+        } else {
+            self.sort_batch(file_path_array, pos_array)?
+        };
 
         if let Some(writer) = self.inner.as_mut() {
             writer.write(&self.partition_key, &batch).await
@@ -363,10 +444,10 @@ where
 
     async fn close(&mut self) -> Result<Vec<DataFile>> {
         if let Some(writer) = self.inner.take() {
-            let referenced_data_file = if self.referenced_data_files.len() == 1 {
-                self.referenced_data_files.iter().next().cloned()
-            } else {
+            let referenced_data_file = if self.has_multiple_referenced_data_files {
                 None
+            } else {
+                self.referenced_data_file.clone()
             };
 
             writer
@@ -562,7 +643,7 @@ mod test {
             "s3://bucket/table/data/file1.parquet",
         ]));
         let positions = Arc::new(Int64Array::from(vec![0, 5, 10]));
-        let batch = RecordBatch::try_new(delete_schema, vec![file_paths, positions])?;
+        let batch = RecordBatch::try_new(delete_schema.clone(), vec![file_paths, positions])?;
 
         position_delete_writer.write(batch).await?;
         let res = position_delete_writer.close().await?;
@@ -574,6 +655,41 @@ mod test {
         // When multiple files are referenced, referenced_data_file should be None
         assert_eq!(data_file.referenced_data_file(), None);
         assert_eq!(data_file.record_count(), 3);
+
+        let input_file = file_io.new_input(data_file.file_path()).unwrap();
+        let input_content = input_file.read().await.unwrap();
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(input_content.clone()).unwrap();
+        let reader = reader_builder.build().unwrap();
+        let batches: Vec<_> = reader.map(|b| b.unwrap()).collect();
+        let result = concat_batches(&delete_schema, &batches).unwrap();
+
+        let file_path_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let pos_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let mut expected_entries = vec![
+            ("s3://bucket/table/data/file1.parquet", 0i64),
+            ("s3://bucket/table/data/file2.parquet", 5i64),
+            ("s3://bucket/table/data/file1.parquet", 10i64),
+        ];
+        expected_entries.sort_by(|(left_path, left_pos), (right_path, right_pos)| {
+            left_path
+                .cmp(right_path)
+                .then_with(|| left_pos.cmp(right_pos))
+        });
+
+        for (idx, (expected_path, expected_pos)) in expected_entries.iter().enumerate() {
+            assert_eq!(file_path_col.value(idx), *expected_path);
+            assert_eq!(pos_col.value(idx), *expected_pos);
+        }
 
         Ok(())
     }
@@ -1140,9 +1256,26 @@ mod test {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
+        let pos_col = result_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
 
-        for (i, expected_path) in unicode_paths.iter().enumerate() {
+        let mut expected_entries: Vec<(&str, i64)> = unicode_paths
+            .iter()
+            .copied()
+            .zip(vec![0i64, 1, 2])
+            .collect();
+        expected_entries.sort_by(|(left_path, left_pos), (right_path, right_pos)| {
+            left_path
+                .cmp(right_path)
+                .then_with(|| left_pos.cmp(right_pos))
+        });
+
+        for (i, (expected_path, expected_pos)) in expected_entries.iter().enumerate() {
             assert_eq!(file_path_col.value(i), *expected_path);
+            assert_eq!(pos_col.value(i), *expected_pos);
         }
 
         Ok(())

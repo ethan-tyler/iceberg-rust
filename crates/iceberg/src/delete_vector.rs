@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::io::Cursor;
 use std::ops::BitOrAssign;
 
+use crc32fast::Hasher;
 use roaring::RoaringTreemap;
 use roaring::bitmap::Iter;
 use roaring::treemap::BitmapIter;
+
+const DELETION_VECTOR_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+const DELETION_VECTOR_LENGTH_BYTES: usize = 4;
+const DELETION_VECTOR_CRC_BYTES: usize = 4;
 
 use crate::{Error, ErrorKind, Result};
 
@@ -68,6 +74,141 @@ impl DeleteVector {
     pub fn len(&self) -> u64 {
         self.inner.len()
     }
+
+    /// Serializes this deletion vector to the Iceberg spec wire format.
+    ///
+    /// Reserved for future use in deletion vector file I/O operations.
+    #[allow(dead_code)]
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
+        serialize_deletion_vector(&self.inner)
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        deserialize_deletion_vector(bytes).map(DeleteVector::new)
+    }
+}
+
+#[allow(dead_code)]
+fn serialize_deletion_vector(bitmap: &RoaringTreemap) -> Result<Vec<u8>> {
+    let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
+    bitmap
+        .serialize_into(&mut bitmap_bytes)
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Failed to serialize deletion vector bitmap".to_string(),
+            )
+            .with_source(err)
+        })?;
+
+    let mut payload = Vec::with_capacity(DELETION_VECTOR_MAGIC.len() + bitmap_bytes.len());
+    payload.extend_from_slice(&DELETION_VECTOR_MAGIC);
+    payload.extend_from_slice(&bitmap_bytes);
+
+    let payload_len = payload.len();
+    if payload_len > u32::MAX as usize {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Deletion vector payload exceeds u32 length".to_string(),
+        ));
+    }
+
+    let mut hasher = Hasher::new();
+    hasher.update(&payload);
+    let crc = hasher.finalize();
+
+    let mut out = Vec::with_capacity(
+        DELETION_VECTOR_LENGTH_BYTES + payload.len() + DELETION_VECTOR_CRC_BYTES,
+    );
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&crc.to_be_bytes());
+    Ok(out)
+}
+
+fn deserialize_deletion_vector(bytes: &[u8]) -> Result<RoaringTreemap> {
+    let min_len = DELETION_VECTOR_LENGTH_BYTES + DELETION_VECTOR_MAGIC.len() + DELETION_VECTOR_CRC_BYTES;
+    if bytes.len() < min_len {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Deletion vector blob is too short".to_string(),
+        ));
+    }
+
+    let length = u32::from_be_bytes(bytes[..DELETION_VECTOR_LENGTH_BYTES].try_into().map_err(
+        |err| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Deletion vector length prefix is invalid".to_string(),
+            )
+            .with_source(err)
+        },
+    )?) as usize;
+
+    let total_len = DELETION_VECTOR_LENGTH_BYTES
+        .checked_add(length)
+        .and_then(|value| value.checked_add(DELETION_VECTOR_CRC_BYTES))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Deletion vector length overflows".to_string(),
+            )
+        })?;
+
+    if bytes.len() != total_len {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Deletion vector length mismatch: expected {total_len} bytes, got {}",
+                bytes.len()
+            ),
+        ));
+    }
+
+    if length < DELETION_VECTOR_MAGIC.len() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Deletion vector payload is too short for magic".to_string(),
+        ));
+    }
+
+    let payload_start = DELETION_VECTOR_LENGTH_BYTES;
+    let payload_end = payload_start + length;
+    let payload = &bytes[payload_start..payload_end];
+
+    if payload[..DELETION_VECTOR_MAGIC.len()] != DELETION_VECTOR_MAGIC {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Deletion vector magic mismatch".to_string(),
+        ));
+    }
+
+    let mut hasher = Hasher::new();
+    hasher.update(payload);
+    let expected_crc = hasher.finalize();
+
+    let crc_start = payload_end;
+    let crc_end = crc_start + DELETION_VECTOR_CRC_BYTES;
+    let actual_crc = u32::from_be_bytes(bytes[crc_start..crc_end].try_into().map_err(|err| {
+        Error::new(ErrorKind::DataInvalid, "Deletion vector CRC is invalid".to_string())
+            .with_source(err)
+    })?);
+
+    if actual_crc != expected_crc {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Deletion vector CRC mismatch".to_string(),
+        ));
+    }
+
+    let bitmap_bytes = &payload[DELETION_VECTOR_MAGIC.len()..];
+    RoaringTreemap::deserialize_from(Cursor::new(bitmap_bytes)).map_err(|err| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Failed to deserialize deletion vector bitmap".to_string(),
+        )
+        .with_source(err)
+    })
 }
 
 // Ideally, we'd just wrap `roaring::RoaringTreemap`'s iterator, `roaring::treemap::Iter` here.
@@ -197,5 +338,58 @@ mod tests {
         let positions = vec![1, 3, 5, 5];
         let res = dv.insert_positions(&positions);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_delete_vector_roundtrip_bytes() {
+        let mut dv = DeleteVector::default();
+        dv.insert(1);
+        dv.insert(5);
+        dv.insert(1 << 33);
+
+        let bytes = dv.to_bytes().unwrap();
+        let decoded = DeleteVector::from_bytes(&bytes).unwrap();
+
+        let mut actual: Vec<u64> = decoded.iter().collect();
+        actual.sort();
+        assert_eq!(actual, vec![1, 5, 1 << 33]);
+    }
+
+    #[test]
+    fn test_delete_vector_bad_magic() {
+        let mut dv = DeleteVector::default();
+        dv.insert(10);
+        let mut bytes = dv.to_bytes().unwrap();
+        bytes[DELETION_VECTOR_LENGTH_BYTES] ^= 0xFF;
+
+        let err = DeleteVector::from_bytes(&bytes).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_delete_vector_bad_crc() {
+        let mut dv = DeleteVector::default();
+        dv.insert(10);
+        let mut bytes = dv.to_bytes().unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+
+        let err = DeleteVector::from_bytes(&bytes).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_delete_vector_length_mismatch() {
+        let mut dv = DeleteVector::default();
+        dv.insert(10);
+        let mut bytes = dv.to_bytes().unwrap();
+
+        bytes[0] = 0;
+        bytes[1] = 0;
+        bytes[2] = 0;
+        bytes[3] = 0;
+
+        let err = DeleteVector::from_bytes(&bytes).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
     }
 }

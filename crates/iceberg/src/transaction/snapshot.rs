@@ -277,25 +277,119 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
-        if self.table.metadata().format_version() == FormatVersion::V1
-            && !self.added_delete_files.is_empty()
-        {
+        let format_version = self.table.metadata().format_version();
+        if format_version == FormatVersion::V1 && !self.added_delete_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 "Delete files are not supported in format version 1. Upgrade the table to format version 2 or later.",
             ));
         }
 
+        let mut delete_vector_targets = HashSet::new();
         for delete_file in &self.added_delete_files {
+            let mut equality_ids = None;
             match delete_file.content_type() {
-                DataContentType::PositionDeletes => {}
+                DataContentType::PositionDeletes => {
+                    if delete_file.file_format() == DataFileFormat::Puffin {
+                        if format_version != FormatVersion::V3 {
+                            return Err(Error::new(
+                                ErrorKind::FeatureUnsupported,
+                                "Deletion vectors are only supported in format version 3.",
+                            ));
+                        }
+                        let referenced_data_file =
+                            delete_file.referenced_data_file().ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    "Deletion vectors require referenced_data_file",
+                                )
+                            })?;
+                        if !delete_vector_targets.insert(referenced_data_file.clone()) {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Deletion vectors must not target the same referenced_data_file more than once: {referenced_data_file}"
+                                ),
+                            ));
+                        }
+                        let content_offset = delete_file.content_offset().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "Deletion vectors require content_offset",
+                            )
+                        })?;
+                        let content_size_in_bytes =
+                            delete_file.content_size_in_bytes().ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    "Deletion vectors require content_size_in_bytes",
+                                )
+                            })?;
+
+                        if content_offset < 0 {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                "Deletion vector content_offset must be non-negative",
+                            ));
+                        }
+                        if content_size_in_bytes < 0 {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                "Deletion vector content_size_in_bytes must be non-negative",
+                            ));
+                        }
+                    } else {
+                        if format_version == FormatVersion::V3 {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                "Position delete files must use Puffin format in format version 3.",
+                            ));
+                        }
+                        if delete_file.content_offset().is_some()
+                            || delete_file.content_size_in_bytes().is_some()
+                        {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                "Non-Puffin delete files must not set content_offset or content_size_in_bytes",
+                            ));
+                        }
+                    }
+                }
                 DataContentType::EqualityDeletes => {
-                    if delete_file.equality_ids().is_none_or(|ids| ids.is_empty()) {
+                    if delete_file.file_format() == DataFileFormat::Puffin {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Equality delete files cannot use Puffin format",
+                        ));
+                    }
+                    if delete_file.content_offset().is_some()
+                        || delete_file.content_size_in_bytes().is_some()
+                    {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Equality delete files must not set content_offset or content_size_in_bytes",
+                        ));
+                    }
+                    let ids = delete_file.equality_ids().ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "Equality delete files must have equality_ids set",
+                        )
+                    })?;
+                    if ids.is_empty() {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
                             "Equality delete files must have equality_ids set",
                         ));
                     }
+                    let mut seen_ids = HashSet::new();
+                    if ids.iter().any(|id| !seen_ids.insert(*id)) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Equality delete files must have unique equality_ids",
+                        ));
+                    }
+                    equality_ids = Some(ids);
                 }
                 DataContentType::Data => {
                     return Err(Error::new(
@@ -329,6 +423,9 @@ impl<'a> SnapshotProducer<'a> {
                     )
                 })?;
             Self::validate_partition_value(delete_file.partition(), &partition_type)?;
+            if let Some(ids) = equality_ids.as_ref() {
+                self.find_compatible_schema_for_equality_ids(partition_spec, ids)?;
+            }
         }
 
         Ok(())
@@ -568,6 +665,76 @@ impl<'a> SnapshotProducer<'a> {
             ErrorKind::DataInvalid,
             format!(
                 "Cannot find compatible schema for partition spec {}: no schema contains all referenced fields",
+                partition_spec.spec_id()
+            ),
+        ))
+    }
+
+    fn schema_supports_equality_ids(
+        partition_spec: &crate::spec::PartitionSpecRef,
+        schema: &crate::spec::SchemaRef,
+        equality_ids: &[i32],
+    ) -> bool {
+        partition_spec.partition_type(schema).is_ok()
+            && equality_ids
+                .iter()
+                .all(|field_id| schema.field_by_id(*field_id).is_some())
+    }
+
+    fn find_compatible_schema_for_equality_ids(
+        &self,
+        partition_spec: &crate::spec::PartitionSpecRef,
+        equality_ids: &[i32],
+    ) -> Result<crate::spec::SchemaRef> {
+        let current_schema = self.table.metadata().current_schema();
+        if Self::schema_supports_equality_ids(partition_spec, current_schema, equality_ids) {
+            return Ok(current_schema.clone());
+        }
+
+        for schema in self.table.metadata().schemas_iter() {
+            if Self::schema_supports_equality_ids(partition_spec, schema, equality_ids) {
+                return Ok(schema.clone());
+            }
+        }
+
+        let mut missing_ids = Vec::new();
+        for field_id in equality_ids {
+            let mut found = false;
+            if partition_spec.partition_type(current_schema).is_ok()
+                && current_schema.field_by_id(*field_id).is_some()
+            {
+                found = true;
+            } else {
+                for schema in self.table.metadata().schemas_iter() {
+                    if partition_spec.partition_type(schema).is_ok()
+                        && schema.field_by_id(*field_id).is_some()
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                missing_ids.push(*field_id);
+            }
+        }
+
+        if !missing_ids.is_empty() {
+            let ids = missing_ids
+                .into_iter()
+                .map(|field_id| field_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Equality delete files reference unknown field id: {ids}"),
+            ));
+        }
+
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Equality delete files reference field ids that are not present together in a compatible schema for partition spec {}",
                 partition_spec.spec_id()
             ),
         ))

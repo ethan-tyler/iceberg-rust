@@ -18,5 +18,7 @@
 //! Base writer module contains the basic writer provide by iceberg: `DataFileWriter`, `PositionDeleteFileWriter`, `EqualityDeleteFileWriter`.
 
 pub mod data_file_writer;
+/// Writer for Puffin-based deletion vectors (V3 spec).
+pub mod deletion_vector_writer;
 pub mod equality_delete_writer;
 pub mod position_delete_writer;

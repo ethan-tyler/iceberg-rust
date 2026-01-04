@@ -343,22 +343,34 @@ pub(crate) mod tests {
         let pos_del_1 = FileScanTaskDeleteFile {
             file_path: format!("{}/pos-del-1.parquet", table_location.to_str().unwrap()),
             file_type: DataContentType::PositionDeletes,
+            file_format: DataFileFormat::Parquet,
             partition_spec_id: 0,
             equality_ids: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
         };
 
         let pos_del_2 = FileScanTaskDeleteFile {
             file_path: format!("{}/pos-del-2.parquet", table_location.to_str().unwrap()),
             file_type: DataContentType::PositionDeletes,
+            file_format: DataFileFormat::Parquet,
             partition_spec_id: 0,
             equality_ids: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
         };
 
         let pos_del_3 = FileScanTaskDeleteFile {
             file_path: format!("{}/pos-del-3.parquet", table_location.to_str().unwrap()),
             file_type: DataContentType::PositionDeletes,
+            file_format: DataFileFormat::Parquet,
             partition_spec_id: 0,
             equality_ids: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
         };
 
         let file_scan_tasks = vec![
@@ -456,8 +468,12 @@ pub(crate) mod tests {
             deletes: vec![FileScanTaskDeleteFile {
                 file_path: "delete-file.parquet".to_string(),
                 file_type: DataContentType::EqualityDeletes,
+                file_format: DataFileFormat::Parquet,
                 partition_spec_id: 0,
                 equality_ids: Some(vec![1]),
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
             }],
             partition: None,
             partition_spec_id: None,

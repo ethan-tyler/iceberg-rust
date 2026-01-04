@@ -558,12 +558,16 @@ pub async fn read_file_group(table: &Table, file_group: &FileGroup) -> DFResult<
             FileScanTaskDeleteFile {
                 file_path: delete_file.file_path().to_string(),
                 file_type: delete_file.content_type(),
+                file_format: delete_file.file_format(),
                 partition_spec_id: delete_file.partition_spec_id_or_default(),
                 equality_ids: if delete_file.content_type() == DataContentType::EqualityDeletes {
                     delete_file.equality_ids().map(|ids| ids.to_vec())
                 } else {
                     None
                 },
+                referenced_data_file: delete_file.referenced_data_file(),
+                content_offset: delete_file.content_offset(),
+                content_size_in_bytes: delete_file.content_size_in_bytes(),
             }
         })
         .collect();

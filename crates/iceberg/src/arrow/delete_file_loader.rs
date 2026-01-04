@@ -21,7 +21,7 @@ use futures::{StreamExt, TryStreamExt};
 
 use crate::arrow::ArrowReader;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
-use crate::io::FileIO;
+use crate::io::{FileIO, InputFile};
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{Schema, SchemaRef};
 use crate::{Error, ErrorKind, Result};
@@ -50,6 +50,11 @@ impl BasicDeleteFileLoader {
     pub fn new(file_io: FileIO) -> Self {
         BasicDeleteFileLoader { file_io }
     }
+
+    pub(crate) fn input_file(&self, path: &str) -> Result<InputFile> {
+        self.file_io.new_input(path)
+    }
+
     /// Loads a RecordBatchStream for a given datafile.
     pub(crate) async fn parquet_to_batch_stream(
         &self,

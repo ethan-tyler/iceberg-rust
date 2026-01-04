@@ -45,10 +45,7 @@ struct PopulatedDeleteFileIndex {
     global_equality_deletes: Vec<Arc<DeleteFileContext>>,
     eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
     pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
-    // TODO: do we need this?
-    // pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
-
-    // TODO: Deletion Vector support
+    pos_deletes_by_data_file: HashMap<String, Vec<Arc<DeleteFileContext>>>,
 }
 
 impl DeleteFileIndex {
@@ -122,41 +119,53 @@ impl PopulatedDeleteFileIndex {
             HashMap::default();
         let mut pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
             HashMap::default();
+        let mut pos_deletes_by_data_file: HashMap<String, Vec<Arc<DeleteFileContext>>> =
+            HashMap::default();
 
         let mut global_equality_deletes: Vec<Arc<DeleteFileContext>> = vec![];
 
         files.into_iter().for_each(|ctx| {
             let arc_ctx = Arc::new(ctx);
-
             let partition = arc_ctx.manifest_entry.data_file().partition();
+            let content_type = arc_ctx.manifest_entry.content_type();
 
             // The spec states that "Equality delete files stored with an unpartitioned spec are applied as global deletes".
-            if partition.fields().is_empty() {
-                // TODO: confirm we're good to skip here if we encounter a pos del
-                if arc_ctx.manifest_entry.content_type() != DataContentType::PositionDeletes {
-                    global_equality_deletes.push(arc_ctx);
-                    return;
-                }
+            if partition.fields().is_empty() && content_type == DataContentType::EqualityDeletes {
+                global_equality_deletes.push(arc_ctx);
+                return;
             }
 
-            let destination_map = match arc_ctx.manifest_entry.content_type() {
-                DataContentType::PositionDeletes => &mut pos_deletes_by_partition,
-                DataContentType::EqualityDeletes => &mut eq_deletes_by_partition,
+            match content_type {
+                DataContentType::PositionDeletes => {
+                    if let Some(referenced_data_file) =
+                        arc_ctx.manifest_entry.data_file().referenced_data_file()
+                    {
+                        pos_deletes_by_data_file
+                            .entry(referenced_data_file)
+                            .and_modify(|entry| entry.push(arc_ctx.clone()))
+                            .or_insert(vec![arc_ctx.clone()]);
+                    } else {
+                        pos_deletes_by_partition
+                            .entry(partition.clone())
+                            .and_modify(|entry| entry.push(arc_ctx.clone()))
+                            .or_insert(vec![arc_ctx.clone()]);
+                    }
+                }
+                DataContentType::EqualityDeletes => {
+                    eq_deletes_by_partition
+                        .entry(partition.clone())
+                        .and_modify(|entry| entry.push(arc_ctx.clone()))
+                        .or_insert(vec![arc_ctx.clone()]);
+                }
                 _ => unreachable!(),
-            };
-
-            destination_map
-                .entry(partition.clone())
-                .and_modify(|entry| {
-                    entry.push(arc_ctx.clone());
-                })
-                .or_insert(vec![arc_ctx.clone()]);
+            }
         });
 
         PopulatedDeleteFileIndex {
             global_equality_deletes,
             eq_deletes_by_partition,
             pos_deletes_by_partition,
+            pos_deletes_by_data_file,
         }
     }
 
@@ -191,10 +200,19 @@ impl PopulatedDeleteFileIndex {
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
 
-        // TODO: the spec states that:
-        //     "The data file's file_path is equal to the delete file's referenced_data_file if it is non-null".
-        //     we're not yet doing that here. The referenced data file's name will also be present in the positional
-        //     delete file's file path column.
+        if let Some(deletes) = self.pos_deletes_by_data_file.get(data_file.file_path()) {
+            deletes
+                .iter()
+                // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
+                .filter(|&delete| {
+                    seq_num
+                        .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
+                        .unwrap_or_else(|| true)
+                        && data_file.partition_spec_id == delete.partition_spec_id
+                })
+                .for_each(|delete| results.push(delete.as_ref().into()));
+        }
+
         if let Some(deletes) = self.pos_deletes_by_partition.get(data_file.partition()) {
             deletes
                 .iter()
@@ -412,6 +430,53 @@ mod tests {
         assert!(actual_paths_to_apply_for_different_spec.is_empty());
     }
 
+    #[test]
+    fn test_delete_file_index_referenced_data_file_filtering() {
+        let data_file_path = "s3://bucket/data-1.parquet";
+        let data_file = DataFileBuilder::default()
+            .file_path(data_file_path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::Data)
+            .record_count(100)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let referenced_match = build_partitioned_pos_delete_with_reference(
+            &Struct::empty(),
+            0,
+            data_file_path,
+        );
+        let referenced_miss = build_partitioned_pos_delete_with_reference(
+            &Struct::empty(),
+            0,
+            "s3://bucket/other.parquet",
+        );
+
+        let delete_contexts: Vec<DeleteFileContext> = vec![
+            build_added_manifest_entry(4, &referenced_match),
+            build_added_manifest_entry(4, &referenced_miss),
+        ]
+        .into_iter()
+        .map(|entry| DeleteFileContext {
+            manifest_entry: entry.into(),
+            partition_spec_id: 0,
+        })
+        .collect();
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
+        let delete_files = delete_file_index.get_deletes_for_data_file(&data_file, Some(0));
+        let delete_paths: Vec<String> =
+            delete_files.into_iter().map(|file| file.file_path).collect();
+
+        assert_eq!(
+            delete_paths,
+            vec![referenced_match.file_path().to_string()]
+        );
+    }
+
     fn build_unpartitioned_eq_delete() -> DataFile {
         build_partitioned_eq_delete(&Struct::empty(), 0)
     }
@@ -440,7 +505,24 @@ mod tests {
             .file_format(DataFileFormat::Parquet)
             .content(DataContentType::PositionDeletes)
             .record_count(1)
-            .referenced_data_file(Some("/some-data-file.parquet".to_string()))
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap()
+    }
+
+    fn build_partitioned_pos_delete_with_reference(
+        partition: &Struct,
+        spec_id: i32,
+        referenced_data_file: &str,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .file_path(format!("{}-pos-delete.parquet", Uuid::new_v4()))
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(Some(referenced_data_file.to_string()))
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)

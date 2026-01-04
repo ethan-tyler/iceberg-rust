@@ -80,11 +80,12 @@ use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::expr::{Predicate, Reference};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
-    DataFile, DataFileFormat, PartitionKey, PartitionSpec, SchemaRef, Struct, TableProperties,
-    Transform, serialize_data_file_to_json,
+    DataFile, DataFileFormat, FormatVersion, PartitionKey, PartitionSpec, SchemaRef, Struct,
+    TableProperties, Transform, serialize_data_file_to_json,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::base_writer::deletion_vector_writer::DeletionVectorWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
 };
@@ -107,6 +108,7 @@ use crate::merge::{
 use crate::partition_utils::{
     FilePartitionInfo, SerializedFileWithSpec, build_file_partition_map, build_partition_type_map,
 };
+use crate::position_delete_task_writer::DeleteWriterBuilder;
 use crate::to_datafusion_error;
 
 /// Internal metadata column name for file path (added during scan)
@@ -359,12 +361,6 @@ type DataFileWriterType = iceberg::writer::base_writer::data_file_writer::DataFi
 type DataFileWriterBuilderType =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
-type PositionDeleteWriterBuilderType = PositionDeleteFileWriterBuilder<
-    ParquetWriterBuilder,
-    DefaultLocationGenerator,
-    DefaultFileNameGenerator,
->;
-
 type IcebergSchemaRef = Arc<iceberg::spec::Schema>;
 
 /// Finds a schema compatible with the given partition spec.
@@ -420,12 +416,13 @@ enum MergeDataWriter {
 /// Position delete writer - always uses FanoutWriter for partition evolution support.
 /// Historical files may have different partition specs than the current default,
 /// so we always route deletes by their actual partition info.
-type MergeDeleteWriter = FanoutWriter<PositionDeleteWriterBuilderType>;
+type MergeDeleteWriter = FanoutWriter<DeleteWriterBuilder>;
 
 impl MergeWriters {
     /// Creates writers for MERGE output, either partitioned or unpartitioned.
     async fn new(table: &Table) -> DFResult<Self> {
         let file_io = table.file_io().clone();
+        let format_version = table.metadata().format_version();
         let partition_spec = table.metadata().default_partition_spec().clone();
         let iceberg_schema = table.metadata().current_schema().clone();
         // Collect all schemas for partition evolution schema compatibility
@@ -490,22 +487,38 @@ impl MergeWriters {
                 .map_err(to_datafusion_error)?,
         );
 
-        let delete_parquet_writer =
-            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema);
+        let delete_file_format = if format_version == FormatVersion::V3 {
+            DataFileFormat::Puffin
+        } else {
+            DataFileFormat::Parquet
+        };
         let delete_file_name_generator = DefaultFileNameGenerator::new(
             format!("merge-delete-{}", Uuid::now_v7()),
             None,
-            DataFileFormat::Parquet,
+            delete_file_format,
         );
-        let delete_rolling_writer = RollingFileWriterBuilder::new(
-            delete_parquet_writer,
-            target_file_size,
-            file_io,
-            location_generator,
-            delete_file_name_generator,
-        );
-        let delete_file_builder =
-            PositionDeleteFileWriterBuilder::new(delete_rolling_writer, delete_config);
+        let delete_writer_builder = if format_version == FormatVersion::V3 {
+            let dv_builder = DeletionVectorWriterBuilder::new(
+                file_io.clone(),
+                location_generator.clone(),
+                delete_file_name_generator,
+                delete_config.clone(),
+            );
+            DeleteWriterBuilder::DeletionVector(dv_builder)
+        } else {
+            let delete_parquet_writer =
+                ParquetWriterBuilder::new(WriterProperties::default(), iceberg_delete_schema);
+            let delete_rolling_writer = RollingFileWriterBuilder::new(
+                delete_parquet_writer,
+                target_file_size,
+                file_io,
+                location_generator,
+                delete_file_name_generator,
+            );
+            let delete_file_builder =
+                PositionDeleteFileWriterBuilder::new(delete_rolling_writer, delete_config);
+            DeleteWriterBuilder::Parquet(delete_file_builder)
+        };
 
         // Create partition splitter if partitioned
         let partition_splitter = if is_partitioned {
@@ -535,7 +548,7 @@ impl MergeWriters {
         };
         // Delete writer always uses FanoutWriter to handle partition evolution:
         // historical files may have different partition specs than the current default
-        let delete_writer: MergeDeleteWriter = FanoutWriter::new(delete_file_builder);
+        let delete_writer: MergeDeleteWriter = FanoutWriter::new(delete_writer_builder);
 
         Ok(Self {
             data_writer,
@@ -2654,6 +2667,8 @@ fn classify_and_count_actions(
         .collect();
 
     for batch in joined_batches {
+        let df_schema = DFSchema::try_from(batch.schema().as_ref().clone())?;
+
         // Find all key column indices
         let key_indices: Vec<(usize, usize)> = prefixed_keys
             .iter()
@@ -2697,7 +2712,10 @@ fn classify_and_count_actions(
                 when_matched,
                 when_not_matched,
                 when_not_matched_by_source,
-            );
+                batch,
+                row_idx,
+                &df_schema,
+            )?;
 
             // Update stats based on action
             match action {
@@ -2732,93 +2750,76 @@ fn classify_and_count_actions(
 /// * `when_matched` - WHEN MATCHED clauses to evaluate
 /// * `when_not_matched` - WHEN NOT MATCHED clauses to evaluate
 /// * `when_not_matched_by_source` - WHEN NOT MATCHED BY SOURCE clauses to evaluate
+/// * `batch` - The record batch containing the row
+/// * `row_idx` - The row index to evaluate
+/// * `batch_schema` - The DFSchema for expression compilation
 ///
 /// # Returns
 /// The action to take for this row.
 ///
-/// # Important Implementation Note
-///
-/// **CURRENT LIMITATION**: This function only handles clauses with `condition: None`.
-/// Clauses with conditions are skipped. The execute() implementation MUST:
-///
-/// 1. Pre-compile all WHEN clause conditions into `Arc<dyn PhysicalExpr>`
-/// 2. For each row, evaluate conditions against the joined batch
-/// 3. Pass evaluated boolean results to determine which clause applies
-///
-/// Example pattern for execute():
-/// ```ignore
-/// // Pre-compile conditions once
-/// let compiled_conditions: Vec<Option<Arc<dyn PhysicalExpr>>> = when_matched
-///     .iter()
-///     .map(|c| c.condition.as_ref().map(|e| compile_expr(e)))
-///     .collect();
-///
-/// // For each row, evaluate conditions
-/// for (idx, clause) in when_matched.iter().enumerate() {
-///     let matches = match &compiled_conditions[idx] {
-///         None => true, // No condition = always matches
-///         Some(expr) => expr.evaluate(&batch)?.value(row_idx),
-///     };
-///     if matches {
-///         return clause.action.clone();
-///     }
-/// }
-/// ```
+/// Conditions are evaluated against the provided batch for the specified row.
 #[allow(dead_code)] // Will be used in MERGE execution implementation
 pub fn evaluate_when_clauses(
     classification: RowClassification,
     when_matched: &[WhenMatchedClause],
     when_not_matched: &[WhenNotMatchedClause],
     when_not_matched_by_source: &[WhenNotMatchedBySourceClause],
-) -> MergeAction {
+    batch: &RecordBatch,
+    row_idx: usize,
+    batch_schema: &DFSchema,
+) -> DFResult<MergeAction> {
+    let row_indices = [row_idx];
+    let condition_matches = |condition: &Option<Expr>| -> DFResult<bool> {
+        if condition.is_none() {
+            return Ok(true);
+        }
+        let passing = evaluate_condition_for_rows(condition, batch, &row_indices, batch_schema)?;
+        Ok(!passing.is_empty())
+    };
+
     match classification {
         RowClassification::Matched => {
             // Try each WHEN MATCHED clause in order
             for clause in when_matched {
-                // TODO: Evaluate condition expression if present
-                // For now, assume all conditions match (will be implemented with physical expr evaluation)
-                if clause.condition.is_none() {
-                    // No additional condition - this clause applies
-                    return match &clause.action {
+                if condition_matches(&clause.condition)? {
+                    return Ok(match &clause.action {
                         MatchedAction::Update(assignments) => {
                             MergeAction::Update(assignments.clone())
                         }
                         MatchedAction::UpdateAll => MergeAction::UpdateAll,
                         MatchedAction::Delete => MergeAction::Delete,
-                    };
+                    });
                 }
-                // If condition exists, we need to evaluate it against the row
-                // This will be implemented in execute_merge when we have the batch context
             }
             // No clause matched - keep row unchanged
-            MergeAction::NoAction
+            Ok(MergeAction::NoAction)
         }
         RowClassification::NotMatched => {
             // Try each WHEN NOT MATCHED clause in order
             for clause in when_not_matched {
-                if clause.condition.is_none() {
-                    return match &clause.action {
+                if condition_matches(&clause.condition)? {
+                    return Ok(match &clause.action {
                         NotMatchedAction::Insert(_) => MergeAction::Insert,
                         NotMatchedAction::InsertAll => MergeAction::Insert,
-                    };
+                    });
                 }
             }
-            MergeAction::NoAction
+            Ok(MergeAction::NoAction)
         }
         RowClassification::NotMatchedBySource => {
             // Try each WHEN NOT MATCHED BY SOURCE clause in order
             for clause in when_not_matched_by_source {
-                if clause.condition.is_none() {
-                    return match &clause.action {
+                if condition_matches(&clause.condition)? {
+                    return Ok(match &clause.action {
                         NotMatchedBySourceAction::Update(assignments) => {
                             MergeAction::Update(assignments.clone())
                         }
                         NotMatchedBySourceAction::Delete => MergeAction::Delete,
-                    };
+                    });
                 }
             }
             // Default for NOT_MATCHED_BY_SOURCE: keep the row unchanged
-            MergeAction::NoAction
+            Ok(MergeAction::NoAction)
         }
     }
 }
@@ -3017,9 +3018,22 @@ fn make_position_delete_batch(
 
 #[cfg(test)]
 mod tests {
-    use datafusion::prelude::lit;
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::prelude::{col, lit};
 
     use super::*;
+
+    fn make_int_batch(name: &str, values: Vec<i32>) -> (RecordBatch, DFSchema) {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            name,
+            DataType::Int32,
+            false,
+        )]));
+        let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let df_schema = DFSchema::try_from(schema.as_ref().clone()).unwrap();
+        (batch, df_schema)
+    }
 
     #[test]
     fn test_output_schema() {
@@ -3094,7 +3108,18 @@ mod tests {
             action: MatchedAction::Update(vec![("col".to_string(), lit(1))]),
         }];
 
-        let action = evaluate_when_clauses(RowClassification::Matched, &when_matched, &[], &[]);
+        let (batch, df_schema) = make_int_batch("col", vec![1]);
+        let action = evaluate_when_clauses(
+            RowClassification::Matched,
+            &when_matched,
+            &[],
+            &[],
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
+
 
         match action {
             MergeAction::Update(assignments) => {
@@ -3112,7 +3137,17 @@ mod tests {
             action: MatchedAction::UpdateAll,
         }];
 
-        let action = evaluate_when_clauses(RowClassification::Matched, &when_matched, &[], &[]);
+        let (batch, df_schema) = make_int_batch("col", vec![1]);
+        let action = evaluate_when_clauses(
+            RowClassification::Matched,
+            &when_matched,
+            &[],
+            &[],
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
 
         assert!(matches!(action, MergeAction::UpdateAll));
     }
@@ -3124,7 +3159,17 @@ mod tests {
             action: MatchedAction::Delete,
         }];
 
-        let action = evaluate_when_clauses(RowClassification::Matched, &when_matched, &[], &[]);
+        let (batch, df_schema) = make_int_batch("col", vec![1]);
+        let action = evaluate_when_clauses(
+            RowClassification::Matched,
+            &when_matched,
+            &[],
+            &[],
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
 
         assert!(matches!(action, MergeAction::Delete));
     }
@@ -3136,8 +3181,17 @@ mod tests {
             action: NotMatchedAction::InsertAll,
         }];
 
-        let action =
-            evaluate_when_clauses(RowClassification::NotMatched, &[], &when_not_matched, &[]);
+        let (batch, df_schema) = make_int_batch("col", vec![1]);
+        let action = evaluate_when_clauses(
+            RowClassification::NotMatched,
+            &[],
+            &when_not_matched,
+            &[],
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
 
         assert!(matches!(action, MergeAction::Insert));
     }
@@ -3149,12 +3203,17 @@ mod tests {
             action: NotMatchedBySourceAction::Delete,
         }];
 
+        let (batch, df_schema) = make_int_batch("col", vec![1]);
         let action = evaluate_when_clauses(
             RowClassification::NotMatchedBySource,
             &[],
             &[],
             &when_not_matched_by_source,
-        );
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
 
         assert!(matches!(action, MergeAction::Delete));
     }
@@ -3162,7 +3221,17 @@ mod tests {
     #[test]
     fn test_evaluate_when_clauses_no_matching_clause() {
         // No clauses defined - should return NoAction
-        let action = evaluate_when_clauses(RowClassification::Matched, &[], &[], &[]);
+        let (batch, df_schema) = make_int_batch("col", vec![1]);
+        let action = evaluate_when_clauses(
+            RowClassification::Matched,
+            &[],
+            &[],
+            &[],
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
 
         assert!(matches!(action, MergeAction::NoAction));
     }
@@ -3181,10 +3250,76 @@ mod tests {
             },
         ];
 
-        let action = evaluate_when_clauses(RowClassification::Matched, &when_matched, &[], &[]);
+        let (batch, df_schema) = make_int_batch("col", vec![1]);
+        let action = evaluate_when_clauses(
+            RowClassification::Matched,
+            &when_matched,
+            &[],
+            &[],
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
 
         // First clause (Delete) should win
         assert!(matches!(action, MergeAction::Delete));
+    }
+
+    #[test]
+    fn test_evaluate_when_clauses_condition_true() {
+        let when_matched = vec![
+            WhenMatchedClause {
+                condition: Some(col("x").gt(lit(1))),
+                action: MatchedAction::Delete,
+            },
+            WhenMatchedClause {
+                condition: None,
+                action: MatchedAction::UpdateAll,
+            },
+        ];
+
+        let (batch, df_schema) = make_int_batch("x", vec![2]);
+        let action = evaluate_when_clauses(
+            RowClassification::Matched,
+            &when_matched,
+            &[],
+            &[],
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
+
+        assert!(matches!(action, MergeAction::Delete));
+    }
+
+    #[test]
+    fn test_evaluate_when_clauses_condition_false_falls_through() {
+        let when_matched = vec![
+            WhenMatchedClause {
+                condition: Some(col("x").gt(lit(1))),
+                action: MatchedAction::Delete,
+            },
+            WhenMatchedClause {
+                condition: None,
+                action: MatchedAction::UpdateAll,
+            },
+        ];
+
+        let (batch, df_schema) = make_int_batch("x", vec![0]);
+        let action = evaluate_when_clauses(
+            RowClassification::Matched,
+            &when_matched,
+            &[],
+            &[],
+            &batch,
+            0,
+            &df_schema,
+        )
+        .unwrap();
+
+        assert!(matches!(action, MergeAction::UpdateAll));
     }
 
     // ============================================================================

@@ -3388,6 +3388,7 @@ dependencies = [
  "bimap",
  "bytes",
  "chrono",
+ "crc32fast",
  "criterion",
  "ctor",
  "derive_builder",
