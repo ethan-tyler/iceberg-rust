@@ -25,8 +25,18 @@ build:
 test:
 	uv run --no-sync pytest
 
-# Install a vendored datafusion python wheel (e.g. from a PR).
-# Override DF_WHEEL if you have a different path.
-DF_WHEEL ?= wheels/df52/datafusion-*-macosx_11_0_arm64.whl
-install-datafusion-wheel:
-	uv run --no-sync python -m pip install --force-reinstall "$(DF_WHEEL)"
+# Download and install a DataFusion python wheel artifact (e.g. from a PR CI run).
+# Defaults target DF52 upgrade PR artifact.
+DF_RUN_ID ?= 21139947370
+DF_REPO ?= apache/datafusion-python
+DF_ARTIFACT ?= dist-macos-latest
+DF_WHEEL_DIR ?= wheels/df52
+
+download-datafusion-wheel:
+	rm -rf "$(DF_WHEEL_DIR)"
+	mkdir -p "$(DF_WHEEL_DIR)"
+	gh run download "$(DF_RUN_ID)" -R "$(DF_REPO)" -n "$(DF_ARTIFACT)" --dir "$(DF_WHEEL_DIR)"
+
+install-datafusion-wheel: download-datafusion-wheel
+	uv run --no-sync python -m ensurepip --upgrade
+	uv run --no-sync python -m pip install --force-reinstall "$(DF_WHEEL_DIR)"/*.whl
