@@ -19,9 +19,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
-use datafusion_execution::TaskContextProvider;
-use datafusion_ffi::execution::FFI_TaskContextProvider;
+use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 use iceberg::TableIdent;
 use iceberg::io::FileIO;
@@ -87,19 +85,46 @@ impl PyIcebergDataFusionTable {
     fn __datafusion_table_provider__<'py>(
         &self,
         py: Python<'py>,
+        session: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
         let capsule_name = CString::new("datafusion_table_provider").unwrap();
 
-        let ctx = Arc::new(SessionContext::new());
-        let task_ctx_provider: Arc<dyn TaskContextProvider> = ctx;
-        let ffi_task_ctx_provider = FFI_TaskContextProvider::from(&task_ctx_provider);
+        // DataFusion 52 requires access to the session's logical extension codec.
+        // datafusion-python passes the SessionContext here.
+        let codec_capsule_any = session
+            .getattr("__datafusion_logical_extension_codec__")?
+            .call0()?;
+        let codec_capsule = codec_capsule_any.downcast::<PyCapsule>()?;
 
-        let ffi_provider = FFI_TableProvider::new(
+        let name = codec_capsule
+            .name()?
+            .and_then(|n| n.to_str().ok())
+            .unwrap_or("");
+        if name != "datafusion_logical_extension_codec" {
+            return Err(PyRuntimeError::new_err(format!(
+                "Expected codec capsule name 'datafusion_logical_extension_codec', got '{name}'",
+            )));
+        }
+
+        let ptr = codec_capsule.pointer();
+        if ptr.is_null() {
+            return Err(PyRuntimeError::new_err(
+                "__datafusion_logical_extension_codec__ returned a null capsule pointer",
+            ));
+        }
+
+        let ffi_codec = unsafe {
+            (ptr as *const FFI_LogicalExtensionCodec)
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("Invalid codec capsule pointer"))?
+                .clone()
+        };
+
+        let ffi_provider = FFI_TableProvider::new_with_ffi_codec(
             self.inner.clone(),
             false,
             Some(runtime()),
-            ffi_task_ctx_provider,
-            None,
+            ffi_codec,
         );
 
         PyCapsule::new(py, ffi_provider, Some(capsule_name))

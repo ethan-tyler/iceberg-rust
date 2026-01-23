@@ -24,3 +24,9 @@ build:
 
 test:
 	uv run --no-sync pytest
+
+# Install a vendored datafusion python wheel (e.g. from a PR).
+# Override DF_WHEEL if you have a different path.
+DF_WHEEL ?= wheels/df52/datafusion-*-macosx_11_0_arm64.whl
+install-datafusion-wheel:
+	uv run --no-sync python -m pip install --force-reinstall "$(DF_WHEEL)"

@@ -25,4 +25,8 @@ dist/*
 *.so
 *.pyc
 *.whl
+
+# Allow vendored DataFusion wheels for DF52 validation
+!bindings/python/wheels/**/*.whl
+
 *.tar.gz
